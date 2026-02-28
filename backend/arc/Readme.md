@@ -2,3 +2,5 @@ Go to VT ARC website, settings, account, api key. Copy it in my_key.txt and in l
 For my_key.txt, do not use "". Just paste as it is.
 
 To run it, first uv sync, then uv run python llm.py
+
+Make sure you have the school VPN on. The cisco one. 
