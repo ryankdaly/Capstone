@@ -1,0 +1,17 @@
+[project]                     # Standard metadata table
+name = "capstone"       # Your project’s name
+version = "0.1.0"             # A version number (can be anything)
+description = "capstone enviornment"
+readme = "README.md"          # Optional: points to your README file
+requires-python = ">=3.12"    # Enforce Python version
+
+dependencies = [              # The actual packages you want installed
+  "openai",
+  "httpx",
+  "python-dotenv",
+  "jupyter",
+  "ipykernel>=7.1.0",
+]
+
+[tool.uv]                     # Optional uv-specific section
+# Right now it’s empty — uv doesn’t need anything extra

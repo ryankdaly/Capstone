@@ -1,0 +1,4 @@
+Go to VT ARC website, settings, account, api key. Copy it here. do not use "". 
+just paste as it is. And get rid of all these words. 
+
+To run it, first uv sync, then uv run python llm.py
