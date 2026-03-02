@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SafetyStandard(str, Enum):
@@ -21,9 +21,9 @@ class TargetLanguage(str, Enum):
 class GenerationRequest(BaseModel):
     """Input contract for the high-assurance generation pipeline."""
 
-    requirement_text: str
-    safety_standard: SafetyStandard
-    target_language: TargetLanguage
+    requirement_text: str = Field(..., min_length=1, description="High-level requirement/specification text")
+    safety_standard: SafetyStandard = Field(..., description="Safety/compliance standard to enforce")
+    target_language: TargetLanguage = Field(..., description="Target implementation language")
 
 
 class GenerationResponse(BaseModel):
@@ -32,4 +32,6 @@ class GenerationResponse(BaseModel):
     generated_code: str
     formal_proof: str
     compliance_status: bool
+    run_id: str
+    artifact_files: list[str]
 
