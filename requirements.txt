@@ -1,3 +1,28 @@
+# Core
 fastapi
 uvicorn[standard]
 pydantic
+pydantic-settings
+pyyaml
+
+# LLM client
+openai
+httpx
+
+# CLI
+typer
+rich
+
+# RAG (optional — system works without these)
+chromadb
+sentence-transformers
+
+# Dashboard (optional)
+streamlit
+
+# Testing
+pytest
+pytest-asyncio
+
+# Environment
+python-dotenv

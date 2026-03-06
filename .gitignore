@@ -5,3 +5,20 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Data / persistence (generated at runtime)
+data/audit.db
+data/chromadb/
+logs/
+
+# Secrets
+*.key
+my_key.txt
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+local/

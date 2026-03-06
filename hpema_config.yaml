@@ -1,0 +1,31 @@
+# HPEMA Pipeline Configuration
+# Boeing (or any org) customizes THIS file — no code changes needed.
+
+models:
+  actor:
+    endpoint: "https://llm-api.arc.vt.edu/api/v1"
+    model: "gpt-oss-120b"
+    api_key_env: "HPEMA_API_KEY"
+  checker:
+    endpoint: "https://llm-api.arc.vt.edu/api/v1"
+    model: "gpt-oss-120b"
+    api_key_env: "HPEMA_API_KEY"
+  policy:
+    endpoint: "https://llm-api.arc.vt.edu/api/v1"
+    model: "gpt-oss-120b"
+    api_key_env: "HPEMA_API_KEY"
+
+policies:
+  standards_dir: "data/standards"
+  default_standard: "DO_178C"
+  embedding_model: "all-MiniLM-L6-v2"
+
+verification:
+  prover: "dafny"
+  timeout_seconds: 120
+  binary_path: "dafny"
+
+pipeline:
+  max_iterations: 3
+  require_human_approval: true
+  audit_log_dir: "logs/audit"
