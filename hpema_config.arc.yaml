@@ -1,0 +1,34 @@
+# HPEMA ARC Configuration — for running on a GPU node via tmux
+# Usage: HPEMA_CONFIG=hpema_config.arc.yaml uvicorn backend.main:app --port 8000
+#
+# MVP: One model (Phi-4) serves all three agent roles.
+# The agents are differentiated by system prompts, not the model.
+
+models:
+  actor:
+    endpoint: "http://localhost:8001/v1"
+    model: "microsoft/Phi-4-Reasoning-Plus"
+    api_key_env: "HPEMA_API_KEY"       # vLLM doesn't need a real key
+  checker:
+    endpoint: "http://localhost:8001/v1"
+    model: "microsoft/Phi-4-Reasoning-Plus"
+    api_key_env: "HPEMA_API_KEY"
+  policy:
+    endpoint: "http://localhost:8001/v1"
+    model: "microsoft/Phi-4-Reasoning-Plus"
+    api_key_env: "HPEMA_API_KEY"
+
+policies:
+  standards_dir: "data/standards"
+  default_standard: "DO_178C"
+  embedding_model: "all-MiniLM-L6-v2"
+
+verification:
+  prover: "dafny"
+  timeout_seconds: 120
+  binary_path: "dafny"
+
+pipeline:
+  max_iterations: 3
+  require_human_approval: false         # disable for initial testing
+  audit_log_dir: "logs/audit"

@@ -63,8 +63,20 @@ class HpemaConfig(BaseModel):
 
 
 def load_config(path: Path | None = None) -> HpemaConfig:
-    """Load config from YAML, falling back to defaults if file is missing."""
-    path = path or DEFAULT_CONFIG_PATH
+    """Load config from YAML, falling back to defaults if file is missing.
+
+    Resolution order:
+      1. Explicit `path` argument
+      2. HPEMA_CONFIG env var (relative to PROJECT_ROOT)
+      3. Default: hpema_config.yaml in project root
+    """
+    if path is None:
+        env_path = os.environ.get("HPEMA_CONFIG")
+        if env_path:
+            path = PROJECT_ROOT / env_path
+        else:
+            path = DEFAULT_CONFIG_PATH
+
     if path.exists():
         raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
         return HpemaConfig(**raw)
