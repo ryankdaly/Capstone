@@ -43,7 +43,7 @@ python -m vllm.entrypoints.openai.api_server \
   --model $MODEL \
   --port $VLLM_PORT \
   --max-model-len 8192 \
-  --guided-decoding-backend outlines \
+  --structured-outputs-config.backend outlines \
   --dtype auto \
   --trust-remote-code" Enter
 

@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
     --port 8001 \
     --tensor-parallel-size 2 \
     --max-model-len 8192 \
-    --guided-decoding-backend outlines &
+    --structured-outputs-config.backend outlines &
 ACTOR_PID=$!
 
 # Checker: Phi-4-Reasoning-Plus (14B, 1x A100)
@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.openai.api_server \
     --model microsoft/Phi-4-Reasoning-Plus \
     --port 8002 \
     --max-model-len 8192 \
-    --guided-decoding-backend outlines &
+    --structured-outputs-config.backend outlines &
 CHECKER_PID=$!
 
 # Policy: Mistral-Small-3.2-24B (1x A100)
@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.openai.api_server \
     --model mistralai/Mistral-Small-3.2-24B-Instruct \
     --port 8003 \
     --max-model-len 8192 \
-    --guided-decoding-backend outlines &
+    --structured-outputs-config.backend outlines &
 POLICY_PID=$!
 
 echo ""
