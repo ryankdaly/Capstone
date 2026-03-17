@@ -190,3 +190,34 @@ python -m cli.main generate --requirement "binary search" --standard DO_178C
 4. **Why dual-write audit (JSONL + SQLite)?** — JSONL is append-only and immutable (good for compliance evidence). SQLite enables fast cross-run queries (good for the dashboard). Belt and suspenders.
 
 5. **Why ChromaDB for RAG?** — Simple, embeds in-process, persists to disk. Right for a capstone. If Boeing needs scale, they swap to Pinecone/Weaviate — same retriever interface.
+
+---
+
+## Commit Message (for when you're ready)
+
+```
+Implement HPEMA skeleton architecture: full pipeline scaffold
+
+Complete architectural skeleton for the HPEMA agentic ML pipeline:
+
+- Config: YAML-based plug-and-play configuration (hpema_config.yaml)
+  with Pydantic settings and env var overrides
+- Schemas: All inter-agent Pydantic models (CodeCandidate, CheckerReport,
+  VerificationResult, PolicyVerdict, FeedbackMessage, PipelineState)
+  ready for constrained decoding via vLLM guided_json
+- Agents: BaseAgent ABC + Actor, Checker, Policy implementations with
+  system prompts; structured output parsing
+- Orchestrator: ~180 line state machine driving Actor→(Checker∥Dafny)→Policy
+  loop with async parallel execution and feedback composition
+- Verification: Async Dafny subprocess runner with timeout and output parsing
+- RAG: ChromaDB retriever for safety standards with metadata filtering
+- Audit: Dual-write logger (JSONL + SQLite) and traceability matrix generator
+- API: FastAPI routes for SSE pipeline streaming, audit queries;
+  wired dependency injection
+- CLI: typer + rich commands (generate, audit, dashboard) with SSE consumption
+- Dashboard: Streamlit audit viewer stub
+- Standards: Sample DO-178C, MISRA C, NASA, Boeing SDP documents for RAG KB
+- SLURM: vLLM model serving script for ARC HPC
+- Tests: 26 unit tests (schemas, feedback, audit, config) — all passing
+- PROGRESS.md: Team-facing status with next steps by role
+```
