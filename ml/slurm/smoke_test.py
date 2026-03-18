@@ -79,8 +79,8 @@ def test_raw_completion() -> bool:
 
 
 def test_constrained_decoding() -> bool:
-    """Test 3: Does guided_json enforce our schema?"""
-    print("[3/5] Constrained decoding (guided_json)...", end=" ")
+    """Test 3: Does response_format json_schema enforce our schema?"""
+    print("[3/5] Constrained decoding (json_schema)...", end=" ")
     try:
         r = httpx.post(
             f"{VLLM_API}/chat/completions",
@@ -98,7 +98,13 @@ def test_constrained_decoding() -> bool:
                 ],
                 "max_tokens": 1024,
                 "temperature": 0.2,
-                "extra_body": {"guided_json": CODE_CANDIDATE_SCHEMA},
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "CodeCandidate",
+                        "schema": CODE_CANDIDATE_SCHEMA,
+                    },
+                },
             },
             timeout=120.0,
         )

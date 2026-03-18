@@ -79,11 +79,17 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
-        # Constrained decoding: use response_format for vLLM guided_json,
-        # fall back to json_object mode for other providers.
+        # Constrained decoding: use OpenAI-standard response_format with
+        # json_schema type. vLLM and OpenAI both support this — it enforces
+        # the schema at the token level during generation.
         if response_schema is not None:
-            kwargs["extra_body"] = {
-                "guided_json": response_schema.model_json_schema(),
+            schema_name = response_schema.__name__
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": response_schema.model_json_schema(),
+                },
             }
 
         if extra_params:
