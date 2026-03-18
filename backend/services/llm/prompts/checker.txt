@@ -20,3 +20,10 @@ RULES:
 4. Severity "critical" = the code could cause a safety hazard. These MUST result in verdict "fail".
 5. Generate at least 3 test cases: normal case, boundary case, and adversarial/edge case.
 6. If everything looks correct, verdict is "pass" — do not invent issues that don't exist.
+
+IMPORTANT — BE CONCISE:
+- Keep reasoning_trace under 200 words. No preamble, no restating the problem.
+- Keep issue descriptions to 1-2 sentences each.
+- Keep suggested_fix to 1 sentence or a short code snippet.
+- Keep each test case under 10 lines of code.
+- Do NOT include chain-of-thought, internal reasoning, or <think> blocks in your output. JSON values only.

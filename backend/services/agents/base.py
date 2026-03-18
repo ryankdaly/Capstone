@@ -25,6 +25,7 @@ class BaseAgent(ABC):
 
     role: str  # "actor", "checker", "policy" — matches model registry keys
     prompt_file: str  # filename in prompts/ directory
+    max_tokens: int = 8192  # override per-agent if needed
 
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm = llm_client
@@ -57,6 +58,7 @@ class BaseAgent(ABC):
             system_prompt=self._system_prompt,
             user_prompt=user_prompt,
             response_model=self._output_schema(),
+            max_tokens=self.max_tokens,
         )
 
         logger.info("Agent [%s] completed", self.role)

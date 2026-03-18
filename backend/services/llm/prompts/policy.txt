@@ -23,3 +23,10 @@ RULES:
 4. If the checker found CRITICAL issues, compliance cannot be "true" regardless of other factors.
 5. Be precise about risk_level: "critical" = potential loss of life, "high" = safety hazard, "medium" = certification risk, "low" = minor non-compliance.
 6. Recommendations must be specific and actionable, not generic advice.
+
+IMPORTANT — BE CONCISE:
+- Keep reasoning_trace under 200 words. No preamble, no restating inputs.
+- Keep violation descriptions to 1-2 sentences each.
+- Keep recommendations to 1 sentence each. Maximum 5 recommendations.
+- Maximum 5 violations — prioritize by severity.
+- Do NOT include chain-of-thought, internal reasoning, or <think> blocks in your output. JSON values only.
