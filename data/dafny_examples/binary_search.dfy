@@ -10,8 +10,8 @@ method BinarySearch(a: array<int>, target: int) returns (index: int)
   var hi := a.Length - 1;
   index := -1;
   while lo <= hi
-    invariant 0 <= lo
-    invariant hi <= a.Length - 1
+    invariant 0 <= lo <= a.Length
+    invariant -1 <= hi <= a.Length - 1
     invariant forall k :: 0 <= k < lo ==> a[k] != target
     invariant forall k :: hi < k < a.Length ==> a[k] != target
     decreases hi - lo + 1
@@ -39,8 +39,8 @@ method BinarySearchBug(a: array<int>, target: int) returns (index: int)
   var hi := a.Length - 1;
   index := -1;
   while lo <= hi
-    invariant 0 <= lo
-    invariant hi <= a.Length - 1
+    invariant 0 <= lo <= a.Length
+    invariant -1 <= hi <= a.Length - 1
     invariant forall k :: 0 <= k < lo ==> a[k] != target
     invariant forall k :: hi < k < a.Length ==> a[k] != target
     decreases hi - lo + 1

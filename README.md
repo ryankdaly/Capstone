@@ -16,17 +16,17 @@ docker build -t hpema .
 docker run --rm hpema dafny --version
 
 # 3. Start the API
-docker run --rm -e HPEMA_API_KEY=your-key -p 8000:8000 hpema
+docker run --rm -e HPEMA_API_KEY=test -p 8000:8000 hpema
 ```
 
 Open `http://localhost:8000` to see the status page confirming the API and Dafny verifier are online.
 
 **Or use Docker Compose** (recommended for persistent logs):
 ```bash
-HPEMA_API_KEY=your-key docker compose up --build
+HPEMA_API_KEY=test docker compose up --build
 
 # Use ARC cluster config
-HPEMA_API_KEY=your-key HPEMA_CONFIG=hpema_config.arc.yaml docker compose up --build
+HPEMA_API_KEY=test HPEMA_CONFIG=hpema_config.arc.yaml docker compose up --build
 ```
 
 Audit logs and standards data are mounted as volumes (`./logs`, `./data`) so they persist across container restarts.
@@ -45,7 +45,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-export HPEMA_API_KEY="your-key"
+export HPEMA_API_KEY="test"
 uvicorn backend.main:app --reload --port 8000
 ```
 
