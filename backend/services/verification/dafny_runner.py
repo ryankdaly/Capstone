@@ -26,9 +26,11 @@ class DafnyRunner:
         self,
         binary_path: str | None = None,
         timeout: int | None = None,
+        solver_path: str | None = None,
     ) -> None:
         self._binary = binary_path or settings.verification.binary_path
         self._timeout = timeout or settings.verification.timeout_seconds
+        self._solver_path = solver_path or settings.verification.solver_path
 
     async def verify(self, dafny_source: str) -> VerificationResult:
         """Write the Dafny source to a temp file and run verification."""
@@ -57,6 +59,8 @@ class DafnyRunner:
 
     async def _run_dafny(self, spec_path: Path) -> VerificationResult:
         cmd = [self._binary, "verify", str(spec_path)]
+        if self._solver_path:
+            cmd += ["--solver-path", self._solver_path]
 
         try:
             proc = await asyncio.create_subprocess_exec(
