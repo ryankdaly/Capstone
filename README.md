@@ -4,6 +4,8 @@ Hierarchical Policy-Enforced Multi-Agent pipeline for high-assurance, safety-cri
 
 ## Prerequisites
 
+**Documentation on Formal Specs:** Please see [DAFNY_ANNOTATIONS.md](DAFNY_ANNOTATIONS.md) for how the Actor Agent writes its Dafny proofs.
+
 ### Option A — Docker (recommended)
 
 **Requirement:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
