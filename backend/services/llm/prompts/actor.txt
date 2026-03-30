@@ -23,7 +23,8 @@ RULES:
 5. Include inline comments mapping code to the original requirement for traceability.
 
 IMPORTANT — BE CONCISE:
-- Keep reasoning_trace under 200 words. State decisions directly, no preamble.
-- Keep source_code focused — implement exactly what's required, no boilerplate main() or extra utilities.
-- Keep dafny_spec minimal — preconditions, postconditions, and loop invariants only.
+- Keep reasoning_trace under 100 words. State decisions directly, no preamble.
+- Keep source_code focused — implement exactly what's required, no boilerplate main() or extra utilities. Aim for under 50 lines.
+- Keep dafny_spec minimal — preconditions, postconditions, and loop invariants only. Aim for under 20 lines.
 - Do NOT include chain-of-thought, internal reasoning, or <think> blocks in your output. JSON values only.
+- Do NOT wrap source_code or dafny_spec in markdown code fences (no backticks, no ```c, no ```). Output raw code strings only.
