@@ -71,6 +71,9 @@ class PipelineOrchestrator:
         self._checker = CheckerAgent(self._llm)
         self._policy = PolicyAgent(self._llm)
 
+        # Exposed after run() completes — the CLI reads this.
+        self.last_state: PipelineState | None = None
+
     async def run(
         self, request: PipelineRequest
     ) -> AsyncGenerator[StreamEvent, None]:
@@ -107,7 +110,13 @@ class PipelineOrchestrator:
                     run_id,
                     StreamEventType.AGENT_OUTPUT,
                     "actor",
-                    {"language": code_candidate.language, "has_dafny": bool(code_candidate.dafny_spec)},
+                    {
+                        "language": code_candidate.language,
+                        "has_dafny": bool(code_candidate.dafny_spec),
+                        "source_code": code_candidate.source_code,
+                        "dafny_spec": code_candidate.dafny_spec,
+                        "reasoning_trace": code_candidate.reasoning_trace,
+                    },
                 )
                 self._audit.log(
                     run_id, "agent_output", agent="actor",
@@ -135,11 +144,22 @@ class PipelineOrchestrator:
 
                 yield self._event(
                     run_id, StreamEventType.AGENT_OUTPUT, "checker",
-                    {"verdict": checker_report.verdict.value, "issues": len(checker_report.issues)},
+                    {
+                        "verdict": checker_report.verdict.value,
+                        "issues": len(checker_report.issues),
+                        "issues_detail": [i.model_dump() for i in checker_report.issues],
+                        "test_cases": checker_report.test_cases,
+                        "reasoning_trace": checker_report.reasoning_trace,
+                    },
                 )
                 yield self._event(
                     run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
-                    {"verified": verification_result.verified},
+                    {
+                        "verified": verification_result.verified,
+                        "solver_output": verification_result.solver_output,
+                        "failing_assertions": verification_result.failing_assertions,
+                        "execution_time_seconds": verification_result.execution_time_seconds,
+                    },
                 )
 
                 self._audit.log(run_id, "agent_output", agent="checker", data=checker_report.model_dump())
@@ -166,7 +186,13 @@ class PipelineOrchestrator:
 
                 yield self._event(
                     run_id, StreamEventType.AGENT_OUTPUT, "policy",
-                    {"compliant": policy_verdict.compliant, "risk_level": policy_verdict.risk_level.value},
+                    {
+                        "compliant": policy_verdict.compliant,
+                        "risk_level": policy_verdict.risk_level.value,
+                        "violations": [v.model_dump() for v in policy_verdict.violations],
+                        "recommendations": policy_verdict.recommendations,
+                        "reasoning_trace": policy_verdict.reasoning_trace,
+                    },
                 )
                 self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
@@ -214,6 +240,7 @@ class PipelineOrchestrator:
             )
 
         state.completed_at = datetime.now(timezone.utc)
+        self.last_state = state
         self._audit.log(run_id, "pipeline_complete", data={
             "status": state.status.value,
             "iterations": len(state.iterations),

@@ -6,10 +6,6 @@
 #SBATCH --output=logs/slurm/vllm-%j.out
 #SBATCH --error=logs/slurm/vllm-%j.err
 
-# HPEMA Model Serving — launches vLLM instances for all agents
-# Usage: sbatch ml/slurm/serve_models.sh
-# Or interactively: salloc --partition=a100_normal_q --gres=gpu:4 --time=2:00:00
-
 set -e
 
 echo "=== HPEMA Model Serving ==="
