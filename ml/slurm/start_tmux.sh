@@ -18,7 +18,7 @@ set -e
 SESSION="hpema"
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CONFIG="hpema_config.arc.yaml"
-MODEL="microsoft/Phi-4-Reasoning-Plus"
+MODEL="Qwen/Qwen2.5-Coder-7B-Instruct"
 VLLM_PORT=8001
 
 echo "=== HPEMA tmux launcher ==="
@@ -40,9 +40,9 @@ tmux send-keys -t "$SESSION:0" "echo '=== PANE 0: vLLM ===' && \
 python -m vllm.entrypoints.openai.api_server \
   --model $MODEL \
   --port $VLLM_PORT \
-  --max-model-len 8192 \
+  --max-model-len 4096 \
   --structured-outputs-config.backend outlines \
-  --dtype auto \
+  --dtype bfloat16 \
   --trust-remote-code" Enter
 
 # Pane 1: CLI (split horizontal)
