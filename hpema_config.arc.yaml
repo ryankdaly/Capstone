@@ -7,15 +7,15 @@
 models:
   actor:
     endpoint: "http://localhost:8001/v1"
-    model: "microsoft/Phi-4-Reasoning-Plus"
-    api_key_env: "HPEMA_API_KEY"       # vLLM doesn't need a real key
+    model: "Qwen/Qwen2.5-Coder-7B-Instruct"
+    api_key_env: "HPEMA_API_KEY" # vLLM doesn't need a real key
   checker:
     endpoint: "http://localhost:8001/v1"
-    model: "microsoft/Phi-4-Reasoning-Plus"
+    model: "Qwen/Qwen2.5-Coder-7B-Instruct"
     api_key_env: "HPEMA_API_KEY"
   policy:
     endpoint: "http://localhost:8001/v1"
-    model: "microsoft/Phi-4-Reasoning-Plus"
+    model: "Qwen/Qwen2.5-Coder-7B-Instruct"
     api_key_env: "HPEMA_API_KEY"
 
 policies:
@@ -30,5 +30,5 @@ verification:
 
 pipeline:
   max_iterations: 3
-  require_human_approval: false         # disable for initial testing
+  require_human_approval: false # disable for initial testing
   audit_log_dir: "logs/audit"
