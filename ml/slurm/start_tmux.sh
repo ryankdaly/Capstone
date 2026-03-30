@@ -40,7 +40,7 @@ tmux send-keys -t "$SESSION:0" "echo '=== PANE 0: vLLM ===' && \
 python -m vllm.entrypoints.openai.api_server \
   --model $MODEL \
   --port $VLLM_PORT \
-  --max-model-len 4096 \
+  --max-model-len 8192 \
   --structured-outputs-config.backend outlines \
   --dtype bfloat16 \
   --trust-remote-code" Enter

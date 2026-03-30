@@ -25,7 +25,7 @@ class BaseAgent(ABC):
 
     role: str  # "actor", "checker", "policy" — matches model registry keys
     prompt_file: str  # filename in prompts/ directory
-    max_tokens: int = 8192  # override per-agent if needed
+    max_tokens: int = 3000  # must leave room for input tokens within vLLM's max-model-len
 
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm = llm_client
