@@ -26,7 +26,7 @@ policies:
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "dafny"
+  binary_path: "/projects/meng/Capstone/dafny/dafny/dafny"
 
 pipeline:
   max_iterations: 3
