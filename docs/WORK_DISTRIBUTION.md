@@ -27,6 +27,8 @@
 | 4 | Test full pipeline with `stage: checker` | TODO | After Dafny install |
 | 5 | Create `demo.sh` canned scenario script | TODO | See [plans/CLI.md](plans/CLI.md) Phase 4.3 |
 | 6 | Prompt iteration for better code quality | TODO | Test with diverse requirements |
+| 7 | Checker Traceability | TODO | Verbose /checker-report to show/store test cases, issues, pytest logs |
+| 8 | CLI movement flexibility | TODO | CLI is vim-leaning. Need to acquire CC/Gemini CLI level cursor movement. |
 
 ### Verification (Person B) — Dafny Integration
 

@@ -17,6 +17,7 @@ from backend.api.schemas.agents import (
     CheckerVerdict,
     CodeCandidate,
     FeedbackMessage,
+    PolicyVerdict,
     VerificationResult,
 )
 from backend.api.schemas.pipeline import (
@@ -98,6 +99,8 @@ class PipelineOrchestrator:
         })
 
         feedback: FeedbackMessage | None = None
+        best_score: float = -1.0
+        best_iteration: int = 0
 
         # Actor-only has no feedback loop. Checker+ can loop on Dafny/Checker feedback.
         effective_max_iterations = (
@@ -143,6 +146,9 @@ class PipelineOrchestrator:
                 # --- CHECKER + DAFNY (parallel) — requires stage >= CHECKER ---
                 checker_report = None
                 verification_result = None
+
+                # Guard: if Actor produced no Dafny spec, note it in feedback
+                has_dafny_spec = bool(code_candidate.dafny_spec and code_candidate.dafny_spec.strip())
 
                 if stage_enabled(PipelineStage.CHECKER, max_stage):
                     yield self._event(run_id, StreamEventType.AGENT_START, "checker")
@@ -235,17 +241,46 @@ class PipelineOrchestrator:
                         verification_result=verification_result,
                         policy_verdict=None,
                     )
+
+                    # Best-so-far tracking — detect regressions
+                    score = (
+                        (1.0 if dafny_ok else 0.0)
+                        + (1.0 if checker_ok else 0.0)
+                        + (0.5 if has_dafny_spec else 0.0)
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_iteration = i
+                    elif i > 1 and score < best_score:
+                        regression_note = (
+                            f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
+                            f"Do NOT regress — preserve what worked before."
+                        )
+                        feedback = FeedbackMessage(
+                            iteration=feedback.iteration,
+                            checker_feedback=feedback.checker_feedback,
+                            verification_feedback=feedback.verification_feedback,
+                            policy_feedback=feedback.policy_feedback,
+                            priority_summary=f"{regression_note} | {feedback.priority_summary}",
+                        )
+
+                    # If no Dafny spec was generated, add explicit feedback
+                    if not has_dafny_spec:
+                        feedback = FeedbackMessage(
+                            iteration=feedback.iteration,
+                            checker_feedback=feedback.checker_feedback,
+                            verification_feedback=feedback.verification_feedback,
+                            policy_feedback=feedback.policy_feedback,
+                            priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
+                        )
+
                     iteration.feedback = feedback
                 else:
                     # Full pipeline — all three must pass
-                    all_pass = (
-                        checker_report is not None
-                        and checker_report.verdict == CheckerVerdict.PASS
-                        and verification_result is not None
-                        and verification_result.verified
-                        and policy_verdict is not None
-                        and policy_verdict.compliant
-                    )
+                    dafny_ok = verification_result is not None and verification_result.verified
+                    checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+                    policy_ok = policy_verdict is not None and policy_verdict.compliant
+                    all_pass = dafny_ok and checker_ok and policy_ok
 
                     feedback = compose_feedback(
                         iteration=i,
@@ -253,6 +288,39 @@ class PipelineOrchestrator:
                         verification_result=verification_result,
                         policy_verdict=policy_verdict,
                     )
+
+                    # Best-so-far tracking
+                    score = (
+                        (1.0 if dafny_ok else 0.0)
+                        + (1.0 if checker_ok else 0.0)
+                        + (1.0 if policy_ok else 0.0)
+                        + (0.5 if has_dafny_spec else 0.0)
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_iteration = i
+                    elif i > 1 and score < best_score:
+                        regression_note = (
+                            f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
+                            f"Do NOT regress — preserve what worked before."
+                        )
+                        feedback = FeedbackMessage(
+                            iteration=feedback.iteration,
+                            checker_feedback=feedback.checker_feedback,
+                            verification_feedback=feedback.verification_feedback,
+                            policy_feedback=feedback.policy_feedback,
+                            priority_summary=f"{regression_note} | {feedback.priority_summary}",
+                        )
+
+                    if not has_dafny_spec:
+                        feedback = FeedbackMessage(
+                            iteration=feedback.iteration,
+                            checker_feedback=feedback.checker_feedback,
+                            verification_feedback=feedback.verification_feedback,
+                            policy_feedback=feedback.policy_feedback,
+                            priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
+                        )
+
                     iteration.feedback = feedback
 
                 iteration.completed_at = datetime.now(timezone.utc)

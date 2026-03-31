@@ -428,6 +428,8 @@ def show_help() -> None:
     table.add_row("/iterations <n>", "Set max pipeline iterations")
     table.add_row("/stage <name>", "Set pipeline stage (actor, checker, policy)")
     table.add_row("/last", "Detailed view of the last run (code, spec, verdicts)")
+    table.add_row("/checker [N]", "Verbose checker report for iteration N (default: last)")
+    table.add_row("/dafny [N]", "Verbose Dafny verification for iteration N (default: last)")
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
     table.add_row("/config", "Show current configuration")
@@ -451,6 +453,116 @@ def show_config(
         console.print(f"  [bold]Model:[/]       {model}")
     stage_color = "yellow" if stage != PipelineStage.POLICY else "green"
     console.print(f"  [bold]Stage:[/]       [{stage_color}]{stage.value}[/]")
+    console.print()
+
+
+def show_checker_detail(iteration: "IterationRecord", iter_num: int) -> None:
+    """Show verbose checker output for an iteration."""
+    from backend.api.schemas.pipeline import IterationRecord  # noqa: F811
+
+    cr = iteration.checker_report
+    if cr is None:
+        console.print(f"\n  [dim]No checker report for iteration {iter_num}.[/]\n")
+        return
+
+    verdict_label, verdict_style = VERDICT_STYLE.get(
+        cr.verdict.value, (cr.verdict.value.upper(), "bold white")
+    )
+
+    parts: list[str] = [
+        f"  [bold]Verdict:[/]  [{verdict_style}]{verdict_label}[/]",
+        f"  [bold]Issues:[/]   {len(cr.issues)}",
+        f"  [bold]Tests:[/]    {len(cr.test_cases)}",
+    ]
+
+    if cr.issues:
+        parts.append("")
+        parts.append("  [bold]Issues:[/]")
+        for i, issue in enumerate(cr.issues, 1):
+            sev = issue.severity.value.upper()
+            sev_color = "red" if sev == "CRITICAL" else "yellow" if sev == "MAJOR" else "dim"
+            line_ref = f" (line {issue.line_reference})" if issue.line_reference else ""
+            parts.append(f"    [{sev_color}]{i}. [{sev}]{line_ref}[/] {issue.description}")
+            if issue.suggested_fix:
+                parts.append(f"       [dim]Fix: {issue.suggested_fix}[/]")
+
+    if cr.test_cases:
+        parts.append("")
+        parts.append("  [bold]Test Cases:[/]")
+        for j, tc in enumerate(cr.test_cases, 1):
+            # Truncate long test cases for display
+            tc_display = tc[:120] + "..." if len(tc) > 120 else tc
+            parts.append(f"    [cyan]{j}.[/] {tc_display}")
+
+    if cr.reasoning_trace:
+        parts.append("")
+        parts.append("  [bold]Reasoning:[/]")
+        parts.append(f"  [dim]{cr.reasoning_trace[:500]}[/]")
+
+    console.print()
+    console.print(Panel(
+        "\n".join(parts),
+        title=f"[bold yellow]Checker Report — Iteration {iter_num}[/]",
+        border_style="yellow",
+        padding=(1, 1),
+    ))
+    console.print()
+
+
+def show_dafny_detail(iteration: "IterationRecord", iter_num: int) -> None:
+    """Show verbose Dafny output for an iteration."""
+    from backend.api.schemas.pipeline import IterationRecord  # noqa: F811
+    from rich.syntax import Syntax as _Syntax
+
+    vr = iteration.verification_result
+    if vr is None:
+        console.print(f"\n  [dim]No Dafny result for iteration {iter_num}.[/]\n")
+        return
+
+    v_color = "green" if vr.verified else "red"
+    v_label = "VERIFIED" if vr.verified else "FAILED"
+
+    parts: list[str] = [
+        f"  [bold]Status:[/]    [{v_color}][bold]{v_label}[/][/]",
+        f"  [bold]Prover:[/]    {vr.prover}",
+        f"  [bold]Time:[/]      {vr.execution_time_seconds:.1f}s",
+    ]
+
+    if vr.failing_assertions:
+        parts.append("")
+        parts.append("  [bold]Failing Assertions:[/]")
+        for fa in vr.failing_assertions:
+            parts.append(f"    [red]{fa}[/]")
+
+    if vr.solver_output:
+        parts.append("")
+        parts.append("  [bold]Solver Output:[/]")
+
+    console.print()
+    console.print(Panel(
+        "\n".join(parts),
+        title=f"[bold magenta]Dafny Verification — Iteration {iter_num}[/]",
+        border_style="magenta",
+        padding=(1, 1),
+    ))
+
+    # Show solver output separately (can be long)
+    if vr.solver_output:
+        # Truncate very long output
+        output = vr.solver_output
+        if len(output.splitlines()) > 40:
+            lines = output.splitlines()
+            output = "\n".join(lines[:40]) + f"\n... ({len(lines) - 40} more lines)"
+        console.print(_Syntax(output, "text", theme="monokai", padding=1))
+
+    # Show the Dafny spec if available
+    if iteration.code_candidate and iteration.code_candidate.dafny_spec:
+        spec = iteration.code_candidate.dafny_spec
+        console.print(f"\n  [bold]Dafny Spec ({len(spec.splitlines())} lines):[/]")
+        console.print(_Syntax(spec, "csharp", theme="monokai", line_numbers=True, padding=1))
+    else:
+        console.print(f"\n  [dim]No Dafny spec was generated this iteration.[/]")
+
     console.print()
 
 

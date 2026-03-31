@@ -102,23 +102,24 @@ class DafnyRunner:
 
     @staticmethod
     def _parse_failing_assertions(output: str) -> list[str]:
-        """Extract failing assertion messages from Dafny output."""
-        # Generalized patterns to catch both Dafny 3.x and 4.x phrasing.
-        # This list is non-exhaustive and should be expanded as Dafny updates, or custom error returns are written.
-        patterns = [
-            r"Error:.*assertion.*",
-            r"Error:.*postcondition.*",
-            r"Error:.*precondition.*",
-            r"Error:.*invariant.*",
-            r"Error:.*decreases.*",
-            r"Error:.*termination.*",
-            r"Error:.*could not be proved.*",
-            r"Error:.*might not hold.*",
-        ]
+        """Extract failing assertion messages from Dafny output.
+
+        Catches Dafny 3.x ("might not hold") and 4.x ("could not be proved")
+        phrasing, plus general Error/Warning lines from the verifier.
+        """
         failures: list[str] = []
+        seen: set[str] = set()
         for line in output.splitlines():
-            for pattern in patterns:
-                if re.search(pattern, line, re.IGNORECASE):
-                    failures.append(line.strip())
-                    break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Match any Dafny error/warning line (file.dfy(line,col): Error: ...)
+            if re.search(r"Error:", stripped, re.IGNORECASE):
+                if stripped not in seen:
+                    failures.append(stripped)
+                    seen.add(stripped)
+            elif re.search(r"Warning:", stripped, re.IGNORECASE) and "deprecated" not in stripped.lower():
+                if stripped not in seen:
+                    failures.append(stripped)
+                    seen.add(stripped)
         return failures

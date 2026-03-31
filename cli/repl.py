@@ -21,7 +21,9 @@ from cli.display import (
     DisplayManager,
     console,
     show_banner,
+    show_checker_detail,
     show_config,
+    show_dafny_detail,
     show_disconnected_warning,
     show_error,
     show_help,
@@ -149,6 +151,12 @@ def _handle_command(line: str, session: Session) -> bool:
                     show_disconnected_warning(session.stage)
             except ValueError:
                 show_error(f"Unknown stage: {arg}. Options: actor, checker, policy")
+
+    elif cmd == "/checker":
+        _show_checker(session, arg)
+
+    elif cmd == "/dafny":
+        _show_dafny(session, arg)
 
     elif cmd == "/audit":
         _show_audit(session)
@@ -416,6 +424,62 @@ def _bar(pct: float, color: str, width: int = 15) -> str:
     filled = int(pct / 100 * width)
     empty = width - filled
     return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * empty}[/dim] {pct:.0f}%"
+
+
+# ---------------------------------------------------------------------------
+# /checker [N] and /dafny [N] — verbose agent inspection
+# ---------------------------------------------------------------------------
+
+def _show_checker(session: Session, arg: str) -> None:
+    """Show verbose checker report for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_checker_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _show_dafny(session: Session, arg: str) -> None:
+    """Show verbose Dafny result for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_dafny_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _parse_iteration_arg(arg: str, total: int) -> int | None:
+    """Parse an optional iteration number argument. Returns 0-based index or None on error."""
+    if not arg:
+        return total - 1  # default: last iteration
+
+    try:
+        n = int(arg)
+    except ValueError:
+        show_error(f"Expected iteration number, got: {arg}")
+        return None
+
+    if n < 1 or n > total:
+        show_error(f"Iteration {n} not found. Last run had {total} iteration(s).")
+        return None
+
+    return n - 1
 
 
 # ---------------------------------------------------------------------------

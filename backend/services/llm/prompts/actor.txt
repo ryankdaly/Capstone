@@ -21,6 +21,36 @@ RULES:
 3. If you receive feedback from a prior iteration, address EVERY issue — explain what you changed and why.
 4. Prefer simplicity and correctness over cleverness.
 5. Include inline comments mapping code to the original requirement for traceability.
+6. You MUST ALWAYS produce a non-empty dafny_spec. If unsure, write a minimal method with requires/ensures on the return value.
+
+DAFNY SPEC EXAMPLES — use these patterns:
+
+Example 1 — bounded function:
+method SaturatingAdd(a: int, b: int) returns (r: int)
+  requires 0 <= a <= 255
+  requires 0 <= b <= 255
+  ensures 0 <= r <= 255
+  ensures a + b <= 255 ==> r == a + b
+  ensures a + b > 255 ==> r == 255
+{
+  if a + b > 255 then r := 255; else r := a + b;
+}
+
+Example 2 — array with loop invariant:
+method FindMax(arr: array<int>) returns (m: int)
+  requires arr.Length > 0
+  ensures forall k :: 0 <= k < arr.Length ==> m >= arr[k]
+{
+  m := arr[0];
+  var i := 1;
+  while i < arr.Length
+    invariant 1 <= i <= arr.Length
+    invariant forall k :: 0 <= k < i ==> m >= arr[k]
+  {
+    if arr[i] > m { m := arr[i]; }
+    i := i + 1;
+  }
+}
 
 IMPORTANT — BE CONCISE:
 - Keep reasoning_trace under 100 words. State decisions directly, no preamble.
