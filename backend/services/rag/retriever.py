@@ -35,18 +35,26 @@ class StandardsRetriever:
         self,
         persist_dir: str = "data/chromadb",
         collection_name: str = COLLECTION_NAME,
+        chunk_size: int = 1200,
+        chunk_overlap: int = 200
     ) -> None:
         self._persist_dir = persist_dir
         self._collection_name = collection_name
         self._collection = None
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
 
         if CHROMADB_AVAILABLE:
-            self._client = chromadb.Client(
-                ChromaSettings(
-                    persist_directory=persist_dir,
-                    anonymized_telemetry=False,
-                )
+            Path(self._persist_dir).mkdir(parents=True, exist_ok=True)
+            self._client = chromadb.PersistentClient(
+                path=self._persist_dir,
+                settings=ChromaSettings(anonymized_telemetry=False),
             )
+            try:
+                self._client.heartbeat()
+                logger.info("ChromaDB initialized at %s", self._persist_dir)
+            except Exception as e:
+                logger.warning("ChromaDB heartbeat failed: %s", e)
         else:
             self._client = None
             logger.warning(
@@ -62,11 +70,35 @@ class StandardsRetriever:
                 metadata={"description": "Safety standards knowledge base"},
             )
         return self._collection
+    
+    def _chunk_text(self, text: str) -> list[str]:
+        """Simple overlapping character chunker"""
+        text = text.strip()
+        if not text:
+            return []
+
+        chunks: list[str] = []
+        start = 0
+        n = len(text)
+
+        while start < n:
+            end = min(start + self._chunk_size, n)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= n:
+                break
+
+            start = max(end - self._chunk_overlap, start + 1)
+
+        return chunks
+
+
 
     def ingest_directory(self, standards_dir: str | None = None) -> int:
         """Ingest all .txt and .md files from the standards directory.
 
-        Returns the number of documents ingested.
+        Returns the number of chunks from documents ingested.
         """
         collection = self._get_collection()
         if collection is None:
@@ -87,24 +119,26 @@ class StandardsRetriever:
             if not text:
                 continue
 
-            # Use relative path as document ID for deduplication
-            doc_id = str(file_path.relative_to(dir_path))
-
             # Extract standard name from parent directory or filename
             standard = file_path.parent.name if file_path.parent != dir_path else "general"
+            rel_path = file_path.relative_to(dir_path)
+            chunks = self._chunk_text(text)
+            for chunk_index, chunk in enumerate(chunks): 
+                chunk_id = f"{rel_path.as_posix()}::chunk_{chunk_index}"
+                collection.upsert(
+                    ids=[chunk_id],
+                    documents=[chunk],
+                    metadatas=[{
+                        "source": str(file_path),
+                        "standard": standard,
+                        "filename": file_path.name,
+                        "chunk_index": chunk_index,
+                        "chunk_count": len(chunks),
+                    }],
+                )
+                count += 1
 
-            collection.upsert(
-                ids=[doc_id],
-                documents=[text],
-                metadatas=[{
-                    "source": str(file_path),
-                    "standard": standard,
-                    "filename": file_path.name,
-                }],
-            )
-            count += 1
-
-        logger.info("Ingested %d documents from %s", count, dir_path)
+        logger.info("Ingested %d chunks from %s", count, dir_path)
         return count
 
     def retrieve(
@@ -143,6 +177,7 @@ class StandardsRetriever:
         sections: list[str] = []
         for doc, meta in zip(documents, metadatas):
             source = meta.get("filename", "unknown")
-            sections.append(f"[Source: {source}]\n{doc}")
+            chunk_index = meta.get("chunk_index", "?")
+            sections.append(f"[Source: {source}][Chunk: {chunk_index}]\n{doc}")
 
         return "\n\n---\n\n".join(sections)

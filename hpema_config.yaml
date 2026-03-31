@@ -24,6 +24,7 @@ verification:
   prover: "dafny"
   timeout_seconds: 120
   binary_path: "dafny"
+  solver_path: null  # set to e.g. /opt/homebrew/bin/z3 when running locally on macOS
 
 pipeline:
   max_iterations: 3

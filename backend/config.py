@@ -43,6 +43,7 @@ class VerificationConfig(BaseModel):
     prover: str = "dafny"
     timeout_seconds: int = 120
     binary_path: str = "dafny"
+    solver_path: str | None = None  # e.g. /opt/homebrew/bin/z3; None = let Dafny find Z3 on PATH
 
 
 class PipelineConfig(BaseModel):
