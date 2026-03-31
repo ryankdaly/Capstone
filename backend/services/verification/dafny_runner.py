@@ -103,12 +103,17 @@ class DafnyRunner:
     @staticmethod
     def _parse_failing_assertions(output: str) -> list[str]:
         """Extract failing assertion messages from Dafny output."""
+        # Generalized patterns to catch both Dafny 3.x and 4.x phrasing.
+        # This list is non-exhaustive and should be expanded as Dafny updates, or custom error returns are written.
         patterns = [
-            r"Error:.*assertion might not hold.*",
-            r"Error:.*postcondition.*might not hold.*",
-            r"Error:.*precondition.*could not be proved.*",
-            r"Error:.*invariant.*might not be maintained.*",
-            r"Error:.*decreases.*might not decrease.*",
+            r"Error:.*assertion.*",
+            r"Error:.*postcondition.*",
+            r"Error:.*precondition.*",
+            r"Error:.*invariant.*",
+            r"Error:.*decreases.*",
+            r"Error:.*termination.*",
+            r"Error:.*could not be proved.*",
+            r"Error:.*might not hold.*",
         ]
         failures: list[str] = []
         for line in output.splitlines():
