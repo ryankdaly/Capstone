@@ -4,7 +4,7 @@
 Run this on the GPU node after vLLM is up:
     python ml/slurm/smoke_test.py
 
-Tests (in order):
+Tests (in order i think):
   1. vLLM health check
   2. Raw chat completion (can the model talk?)
   3. Constrained decoding (does guided_json enforce our schema?)

@@ -6,10 +6,6 @@
 #SBATCH --output=logs/slurm/vllm-%j.out
 #SBATCH --error=logs/slurm/vllm-%j.err
 
-# HPEMA Model Serving — launches vLLM instances for all agents
-# Usage: sbatch ml/slurm/serve_models.sh
-# Or interactively: salloc --partition=a100_normal_q --gres=gpu:4 --time=2:00:00
-
 set -e
 
 echo "=== HPEMA Model Serving ==="
@@ -23,7 +19,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3-Coder-Next \
     --port 8001 \
     --tensor-parallel-size 2 \
-    --max-model-len 8192 \
+    --max-model-len 4096 \
     --structured-outputs-config.backend outlines &
 ACTOR_PID=$!
 
@@ -32,7 +28,7 @@ echo "Starting Checker (Phi-4-Reasoning-Plus) on port 8002..."
 CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.openai.api_server \
     --model microsoft/Phi-4-Reasoning-Plus \
     --port 8002 \
-    --max-model-len 8192 \
+    --max-model-len 4096 \
     --structured-outputs-config.backend outlines &
 CHECKER_PID=$!
 
@@ -41,7 +37,7 @@ echo "Starting Policy (Mistral-Small-3.2-24B) on port 8003..."
 CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.openai.api_server \
     --model mistralai/Mistral-Small-3.2-24B-Instruct \
     --port 8003 \
-    --max-model-len 8192 \
+    --max-model-len 4096 \
     --structured-outputs-config.backend outlines &
 POLICY_PID=$!
 

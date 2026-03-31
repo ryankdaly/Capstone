@@ -50,6 +50,7 @@ class PipelineConfig(BaseModel):
     max_iterations: int = 3
     require_human_approval: bool = True
     audit_log_dir: str = "logs/audit"
+    stage: str = "policy"  # "actor", "checker", "policy" — controls how far the pipeline runs
 
 
 # ---------------------------------------------------------------------------

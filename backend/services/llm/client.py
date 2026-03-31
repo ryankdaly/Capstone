@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Type
 
 from openai import AsyncOpenAI
@@ -122,4 +123,41 @@ class LLMClient:
             response_schema=response_model,
             **kwargs,
         )
+        raw = _fix_code_formatting(raw)
         return response_model.model_validate_json(raw)
+
+
+def _fix_code_formatting(raw_json: str) -> str:
+    """Post-process LLM JSON to fix code formatting issues.
+
+    Handles two common problems with small models:
+    1. Literal '\\n' text in code instead of actual newlines
+    2. Code with no newlines at all (single-line output)
+    """
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return raw_json
+
+    changed = False
+    for field in ("source_code", "dafny_spec"):
+        code = data.get(field, "")
+        if not code:
+            continue
+
+        # Fix 1: Replace literal \n text with actual newlines
+        # The model outputs the two characters '\' 'n' instead of a newline
+        if "\\n" in code:
+            code = code.replace("\\n", "\n")
+            data[field] = code
+            changed = True
+
+        # Fix 2: No newlines at all — insert at statement boundaries
+        if "\n" not in code and (";" in code or "{" in code):
+            code = re.sub(r";\s*", ";\n", code)
+            code = re.sub(r"\{\s*", "{\n", code)
+            code = re.sub(r"\}\s*", "}\n", code)
+            data[field] = code
+            changed = True
+
+    return json.dumps(data) if changed else raw_json

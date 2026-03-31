@@ -1,80 +1,39 @@
-# HPEMA
+# HPEMA — Hierarchical Policy-Enforced Multi-Agent
 
-Hierarchical Policy-Enforced Multi-Agent pipeline for high-assurance, safety-critical code generation.
+High-assurance code generation pipeline for safety-critical aerospace software. Three guarantees: **constrained decoding** (token-level schema enforcement), **formal verification** (Dafny proofs), and **live policy audit** (RAG-backed standard citations).
 
-## Prerequisites
-
-**Documentation on Formal Specs:** Please see [DAFNY_ANNOTATIONS.md](DAFNY_ANNOTATIONS.md) for how the Actor Agent writes its Dafny proofs.
-
-### Option A — Docker (recommended)
-
-**Requirement:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+## Quick Start (ARC GPU Node)
 
 ```bash
-# 1. Build the image
-docker build -t hpema .
-
-# 2. Verify Dafny is working inside the container
-docker run --rm hpema dafny --version
-
-# 3. Start the API
-docker run --rm -e HPEMA_API_KEY=your-key -p 8000:8000 hpema
+salloc --partition=a100_normal_q --gres=gpu:1 --time=2:00:00
+cd /projects/meng/Capstone
+bash ml/slurm/start_tmux.sh
 ```
 
-Open `http://localhost:8000` to see the status page confirming the API and Dafny verifier are online.
+## Documentation
 
-**Or use Docker Compose** (recommended for persistent logs):
-```bash
-HPEMA_API_KEY=your-key docker compose up --build
+| Doc | What |
+|-----|------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Full system architecture and design rationale |
+| [docs/PROGRESS.md](docs/PROGRESS.md) | Current state, what works, known issues |
+| [docs/WORK_DISTRIBUTION.md](docs/WORK_DISTRIBUTION.md) | Task tracking by team member |
+| [docs/plans/CLI.md](docs/plans/CLI.md) | CLI implementation plan (phases 1-3 complete) |
 
-# Use ARC cluster config
-HPEMA_API_KEY=your-key HPEMA_CONFIG=hpema_config.arc.yaml docker compose up --build
+## Project Structure
+
 ```
-
-Audit logs and standards data are mounted as volumes (`./logs`, `./data`) so they persist across container restarts.
-
-### Option B — Local
-
-| Dependency | Version | Install |
-|------------|---------|---------|
-| Python | 3.13+ | [python.org](https://www.python.org/downloads/) |
-| .NET SDK | 8.0+ | `brew install --cask dotnet-sdk` |
-| Dafny | 4.x | `dotnet tool install --global Dafny` |
-| Z3 | any | `brew install z3` |
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-export HPEMA_API_KEY="your-key"
-uvicorn backend.main:app --reload --port 8000
+cli/                    CLI layer (typer + rich REPL)
+backend/
+  api/schemas/          Pydantic data contracts between agents
+  services/
+    agents/             Actor, Checker, Policy agent implementations
+    llm/                Async OpenAI client, model registry, prompts
+    verification/       Dafny subprocess runner
+    rag/                ChromaDB retriever for safety standards
+    audit/              JSONL + SQLite dual-write audit logger
+    orchestrator.py     Pipeline state machine
+data/standards/         Sample safety standard documents for RAG
+ml/slurm/              SLURM scripts and tmux launcher for ARC
+hpema_config.yaml      Default configuration
+hpema_config.arc.yaml  HPC node configuration (vLLM on localhost)
 ```
-
-> **Note:** Dafny requires Z3 at runtime. Pass the solver path when verifying locally:
-> ```bash
-> dafny verify --solver-path $(brew --prefix z3)/bin/z3 <file.dfy>
-> ```
-
-## CLI Usage
-
-```bash
-# Generate code
-python -m cli.main generate \
-    --requirement "Implement a binary search function with bounds checking" \
-    --standard DO_178C \
-    --language C
-
-# Query audit trail
-python -m cli.main audit --run-id <uuid>
-
-# Launch dashboard
-python -m cli.main dashboard
-```
-
-## Supported Standards
-
-- `DO_178C` — Airborne software
-- `NASA` — NASA-STD-8739
-- `BOEING_SDP` — Boeing software design practices
-- `MISRA_C` — MISRA C coding rules
