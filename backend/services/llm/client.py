@@ -128,10 +128,11 @@ class LLMClient:
 
 
 def _fix_code_formatting(raw_json: str) -> str:
-    """Post-process LLM JSON to fix single-line code output.
+    """Post-process LLM JSON to fix code formatting issues.
 
-    Small models sometimes emit code without newlines in JSON strings.
-    This detects that case and inserts newlines at statement boundaries.
+    Handles two common problems with small models:
+    1. Literal '\\n' text in code instead of actual newlines
+    2. Code with no newlines at all (single-line output)
     """
     try:
         data = json.loads(raw_json)
@@ -141,11 +142,18 @@ def _fix_code_formatting(raw_json: str) -> str:
     changed = False
     for field in ("source_code", "dafny_spec"):
         code = data.get(field, "")
-        if not code or "\n" in code:
+        if not code:
             continue
-        # Code has no newlines but has statement-ending characters — reformat
-        if ";" in code or "{" in code:
-            # Insert newlines after ; { } (basic C/Dafny formatting)
+
+        # Fix 1: Replace literal \n text with actual newlines
+        # The model outputs the two characters '\' 'n' instead of a newline
+        if "\\n" in code:
+            code = code.replace("\\n", "\n")
+            data[field] = code
+            changed = True
+
+        # Fix 2: No newlines at all — insert at statement boundaries
+        if "\n" not in code and (";" in code or "{" in code):
             code = re.sub(r";\s*", ";\n", code)
             code = re.sub(r"\{\s*", "{\n", code)
             code = re.sub(r"\}\s*", "}\n", code)
