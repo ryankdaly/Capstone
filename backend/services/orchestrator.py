@@ -22,10 +22,12 @@ from backend.api.schemas.agents import (
 from backend.api.schemas.pipeline import (
     IterationRecord,
     PipelineRequest,
+    PipelineStage,
     PipelineState,
     PipelineStatus,
     StreamEvent,
     StreamEventType,
+    stage_enabled,
 )
 from backend.services.agents.actor import ActorAgent
 from backend.services.agents.checker import CheckerAgent
@@ -77,24 +79,40 @@ class PipelineOrchestrator:
     async def run(
         self, request: PipelineRequest
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Execute the pipeline, yielding SSE events as it progresses."""
+        """Execute the pipeline, yielding SSE events as it progresses.
+
+        Respects `request.stage` — the pipeline stops after the configured stage.
+        Stages: ACTOR → CHECKER → POLICY. If stage=ACTOR, only code generation
+        runs and the result is treated as successful (no checker/dafny/policy).
+        """
+        max_stage = request.stage
         state = PipelineState(
             request=request,
             status=PipelineStatus.RUNNING,
         )
         run_id = state.run_id
 
-        self._audit.log(run_id, "pipeline_start", data=request.model_dump())
+        self._audit.log(run_id, "pipeline_start", data={
+            **request.model_dump(),
+            "stage": max_stage.value,
+        })
 
         feedback: FeedbackMessage | None = None
 
+        # With stage < POLICY, there's no feedback loop — run once.
+        effective_max_iterations = (
+            request.max_iterations
+            if stage_enabled(PipelineStage.POLICY, max_stage)
+            else 1
+        )
+
         try:
-            for i in range(1, request.max_iterations + 1):
+            for i in range(1, effective_max_iterations + 1):
                 state.current_iteration = i
 
                 iteration = IterationRecord(iteration=i)
 
-                # --- ACTOR ---
+                # --- ACTOR (always runs) ---
                 yield self._event(run_id, StreamEventType.AGENT_START, "actor")
                 self._audit.log(run_id, "agent_start", agent="actor", data={"iteration": i})
 
@@ -123,101 +141,115 @@ class PipelineOrchestrator:
                     data=code_candidate.model_dump(),
                 )
 
-                # --- CHECKER + DAFNY (parallel) ---
-                yield self._event(run_id, StreamEventType.AGENT_START, "checker")
-                yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
+                # --- CHECKER + DAFNY (parallel) — requires stage >= CHECKER ---
+                checker_report = None
+                verification_result = None
 
-                checker_task = self._checker.run(
-                    source_code=code_candidate.source_code,
-                    dafny_spec=code_candidate.dafny_spec,
-                    language=request.target_language.value,
-                    standard=request.safety_standard.value,
-                )
-                dafny_task = self._dafny.verify(code_candidate.dafny_spec)
+                if stage_enabled(PipelineStage.CHECKER, max_stage):
+                    yield self._event(run_id, StreamEventType.AGENT_START, "checker")
+                    yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
 
-                checker_report, verification_result = await asyncio.gather(
-                    checker_task, dafny_task
-                )
+                    checker_task = self._checker.run(
+                        source_code=code_candidate.source_code,
+                        dafny_spec=code_candidate.dafny_spec,
+                        language=request.target_language.value,
+                        standard=request.safety_standard.value,
+                    )
+                    dafny_task = self._dafny.verify(code_candidate.dafny_spec)
 
-                iteration.checker_report = checker_report
-                iteration.verification_result = verification_result
+                    checker_report, verification_result = await asyncio.gather(
+                        checker_task, dafny_task
+                    )
 
-                yield self._event(
-                    run_id, StreamEventType.AGENT_OUTPUT, "checker",
-                    {
-                        "verdict": checker_report.verdict.value,
-                        "issues": len(checker_report.issues),
-                        "issues_detail": [i.model_dump() for i in checker_report.issues],
-                        "test_cases": checker_report.test_cases,
-                        "reasoning_trace": checker_report.reasoning_trace,
-                    },
-                )
-                yield self._event(
-                    run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
-                    {
-                        "verified": verification_result.verified,
-                        "solver_output": verification_result.solver_output,
-                        "failing_assertions": verification_result.failing_assertions,
-                        "execution_time_seconds": verification_result.execution_time_seconds,
-                    },
-                )
+                    iteration.checker_report = checker_report
+                    iteration.verification_result = verification_result
 
-                self._audit.log(run_id, "agent_output", agent="checker", data=checker_report.model_dump())
-                self._audit.log(run_id, "verification_result", data=verification_result.model_dump())
+                    yield self._event(
+                        run_id, StreamEventType.AGENT_OUTPUT, "checker",
+                        {
+                            "verdict": checker_report.verdict.value,
+                            "issues": len(checker_report.issues),
+                            "issues_detail": [iss.model_dump() for iss in checker_report.issues],
+                            "test_cases": checker_report.test_cases,
+                            "reasoning_trace": checker_report.reasoning_trace,
+                        },
+                    )
+                    yield self._event(
+                        run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
+                        {
+                            "verified": verification_result.verified,
+                            "solver_output": verification_result.solver_output,
+                            "failing_assertions": verification_result.failing_assertions,
+                            "execution_time_seconds": verification_result.execution_time_seconds,
+                        },
+                    )
 
-                # --- POLICY ---
-                yield self._event(run_id, StreamEventType.AGENT_START, "policy")
+                    self._audit.log(run_id, "agent_output", agent="checker", data=checker_report.model_dump())
+                    self._audit.log(run_id, "verification_result", data=verification_result.model_dump())
 
-                # Retrieve relevant standard clauses via RAG
-                policy_context = self._retriever.retrieve(
-                    query=f"{request.requirement_text} {request.safety_standard.value}",
-                    standard=request.safety_standard.value,
-                )
+                # --- POLICY — requires stage >= POLICY ---
+                policy_verdict = None
 
-                policy_verdict = await self._policy.run(
-                    source_code=code_candidate.source_code,
-                    dafny_spec=code_candidate.dafny_spec,
-                    standard=request.safety_standard.value,
-                    checker_report=checker_report,
-                    verification_result=verification_result,
-                    policy_context=policy_context,
-                )
-                iteration.policy_verdict = policy_verdict
+                if stage_enabled(PipelineStage.POLICY, max_stage):
+                    yield self._event(run_id, StreamEventType.AGENT_START, "policy")
 
-                yield self._event(
-                    run_id, StreamEventType.AGENT_OUTPUT, "policy",
-                    {
-                        "compliant": policy_verdict.compliant,
-                        "risk_level": policy_verdict.risk_level.value,
-                        "violations": [v.model_dump() for v in policy_verdict.violations],
-                        "recommendations": policy_verdict.recommendations,
-                        "reasoning_trace": policy_verdict.reasoning_trace,
-                    },
-                )
-                self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
+                    policy_context = self._retriever.retrieve(
+                        query=f"{request.requirement_text} {request.safety_standard.value}",
+                        standard=request.safety_standard.value,
+                    )
+
+                    policy_verdict = await self._policy.run(
+                        source_code=code_candidate.source_code,
+                        dafny_spec=code_candidate.dafny_spec,
+                        standard=request.safety_standard.value,
+                        checker_report=checker_report,
+                        verification_result=verification_result,
+                        policy_context=policy_context,
+                    )
+                    iteration.policy_verdict = policy_verdict
+
+                    yield self._event(
+                        run_id, StreamEventType.AGENT_OUTPUT, "policy",
+                        {
+                            "compliant": policy_verdict.compliant,
+                            "risk_level": policy_verdict.risk_level.value,
+                            "violations": [v.model_dump() for v in policy_verdict.violations],
+                            "recommendations": policy_verdict.recommendations,
+                            "reasoning_trace": policy_verdict.reasoning_trace,
+                        },
+                    )
+                    self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
                 # --- CONVERGENCE CHECK ---
-                all_pass = (
-                    checker_report.verdict == CheckerVerdict.PASS
-                    and verification_result.verified
-                    and policy_verdict.compliant
-                )
+                if stage_enabled(PipelineStage.POLICY, max_stage):
+                    # Full pipeline — check all agents
+                    all_pass = (
+                        checker_report is not None
+                        and checker_report.verdict == CheckerVerdict.PASS
+                        and verification_result is not None
+                        and verification_result.verified
+                        and policy_verdict is not None
+                        and policy_verdict.compliant
+                    )
 
-                # Compose feedback for next iteration (or final summary)
-                feedback = compose_feedback(
-                    iteration=i,
-                    checker_report=checker_report,
-                    verification_result=verification_result,
-                    policy_verdict=policy_verdict,
-                )
-                iteration.feedback = feedback
+                    feedback = compose_feedback(
+                        iteration=i,
+                        checker_report=checker_report,
+                        verification_result=verification_result,
+                        policy_verdict=policy_verdict,
+                    )
+                    iteration.feedback = feedback
+                else:
+                    # Disconnected mode — whatever ran is considered a pass
+                    all_pass = True
+
                 iteration.completed_at = datetime.now(timezone.utc)
                 state.iterations.append(iteration)
 
                 yield self._event(
                     run_id, StreamEventType.ITERATION_COMPLETE, data={
                         "iteration": i, "all_pass": all_pass,
-                        "summary": feedback.priority_summary,
+                        "summary": feedback.priority_summary if feedback else "",
                     },
                 )
 
@@ -227,9 +259,8 @@ class PipelineOrchestrator:
                     state.final_proof = code_candidate.dafny_spec
                     break
             else:
-                # Max iterations exhausted without convergence
                 state.status = PipelineStatus.FAILED
-                state.error = f"Failed to converge after {request.max_iterations} iterations"
+                state.error = f"Failed to converge after {effective_max_iterations} iterations"
 
         except Exception as e:
             logger.exception("Pipeline error in run %s", run_id)
@@ -244,6 +275,7 @@ class PipelineOrchestrator:
         self._audit.log(run_id, "pipeline_complete", data={
             "status": state.status.value,
             "iterations": len(state.iterations),
+            "stage": max_stage.value,
         })
 
         yield self._event(
@@ -251,6 +283,7 @@ class PipelineOrchestrator:
                 "status": state.status.value,
                 "iterations": len(state.iterations),
                 "run_id": str(run_id),
+                "stage": max_stage.value,
             },
         )
 

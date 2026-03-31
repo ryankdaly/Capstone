@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.api.schemas.pipeline import PipelineRequest, PipelineState
+from backend.api.schemas.pipeline import PipelineRequest, PipelineStage, PipelineState
 from backend.config import load_config
 from backend.services.audit.logger import AuditLogger
 from backend.services.llm.client import LLMClient
@@ -53,6 +53,7 @@ def run_pipeline(
     language: str,
     max_iterations: int,
     display: DisplayManager,
+    stage: PipelineStage = PipelineStage.POLICY,
 ) -> PipelineState | None:
     """Run the full pipeline in-process. Blocking call.
 
@@ -63,6 +64,7 @@ def run_pipeline(
         safety_standard=standard,
         target_language=language,
         max_iterations=max_iterations,
+        stage=stage,
     )
 
     return asyncio.run(_run_async(request, display))

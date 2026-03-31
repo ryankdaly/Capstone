@@ -15,7 +15,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from backend.api.schemas.pipeline import StreamEvent, StreamEventType
+from backend.api.schemas.pipeline import PipelineStage, StreamEvent, StreamEventType
 
 console = Console()
 
@@ -142,9 +142,14 @@ class DisplayManager:
         status = data.get("status", "unknown")
         iterations = data.get("iterations", 0)
         run_id = data.get("run_id", "")
+        stage = data.get("stage", "policy")
         total_time = time.monotonic() - self._pipeline_start
 
         console.print()
+
+        stage_note = ""
+        if stage != "policy":
+            stage_note = f"\n  [yellow]Stage:       {stage} (disconnected)[/]"
 
         if status in ("completed", "awaiting_approval"):
             console.print(
@@ -153,7 +158,8 @@ class DisplayManager:
                     f"  Iterations:  {iterations}\n"
                     f"  Total time:  {total_time:.1f}s\n"
                     f"  Run ID:      {run_id}\n"
-                    f"  Audit log:   logs/audit/{run_id}.jsonl\n\n"
+                    f"  Audit log:   logs/audit/{run_id}.jsonl"
+                    f"{stage_note}\n\n"
                     f"  [dim]Type /last to see full output, /audit for traceability[/]",
                     title="[bold green]Pipeline Complete[/]",
                     border_style="green",
@@ -167,7 +173,8 @@ class DisplayManager:
                     f"  Iterations:  {iterations}\n"
                     f"  Total time:  {total_time:.1f}s\n"
                     f"  Run ID:      {run_id}\n"
-                    f"  Audit log:   logs/audit/{run_id}.jsonl",
+                    f"  Audit log:   logs/audit/{run_id}.jsonl"
+                    f"{stage_note}",
                     title="[bold red]Pipeline Complete[/]",
                     border_style="red",
                     padding=(1, 2),
@@ -320,7 +327,13 @@ class DisplayManager:
         return f"{time.monotonic() - start:.1f}s"
 
 
-def show_banner(config_source: str = "", model: str = "", standard: str = "DO_178C", language: str = "C") -> None:
+def show_banner(
+    config_source: str = "",
+    model: str = "",
+    standard: str = "DO_178C",
+    language: str = "C",
+    stage: PipelineStage = PipelineStage.POLICY,
+) -> None:
     """Show the startup banner."""
     lines = [
         "[bold]HPEMA[/] v0.1.0",
@@ -334,6 +347,19 @@ def show_banner(config_source: str = "", model: str = "", standard: str = "DO_17
     lines.append(f"  Standard: {standard}")
     lines.append(f"  Language: {language}")
     lines.append(f"  Prover:   Dafny")
+
+    # Show stage info
+    stage_labels = {
+        PipelineStage.ACTOR: "Actor only (disconnected)",
+        PipelineStage.CHECKER: "Actor + Checker (disconnected)",
+        PipelineStage.POLICY: "Full pipeline",
+    }
+    stage_label = stage_labels.get(stage, stage.value)
+    if stage != PipelineStage.POLICY:
+        lines.append(f"  Stage:    [bold yellow]{stage_label}[/]")
+    else:
+        lines.append(f"  Stage:    {stage_label}")
+
     lines.append("")
     lines.append("  [dim]Type a requirement to begin, or /help[/]")
 
@@ -341,6 +367,37 @@ def show_banner(config_source: str = "", model: str = "", standard: str = "DO_17
         Panel(
             "\n".join(lines),
             border_style="bright_blue",
+            padding=(1, 2),
+        )
+    )
+
+
+def show_disconnected_warning(stage: PipelineStage) -> None:
+    """Show a large, unmissable warning when running in disconnected mode."""
+    skipped: list[str] = []
+    if stage == PipelineStage.ACTOR:
+        skipped = ["Checker Agent", "Dafny Verifier", "Policy Agent", "Feedback Loop"]
+    elif stage == PipelineStage.CHECKER:
+        skipped = ["Policy Agent", "Feedback Loop"]
+
+    lines = [
+        f"[bold yellow]DISCONNECTED MODE — stage: {stage.value.upper()}[/]",
+        "",
+        "The pipeline will stop after the configured stage.",
+        "Downstream agents are SKIPPED — results are NOT verified.",
+        "",
+        "[bold]Skipped components:[/]",
+    ]
+    for s in skipped:
+        lines.append(f"  [red]x[/] {s}")
+    lines.append("")
+    lines.append("[dim]Set stage: /stage policy  (or edit pipeline.stage in config YAML)[/]")
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="[bold yellow]!! WARNING !![/]",
+            border_style="yellow",
             padding=(1, 2),
         )
     )
@@ -355,6 +412,7 @@ def show_help() -> None:
     table.add_row("/standard <name>", "Set safety standard (DO_178C, MISRA_C, NASA, Boeing_SDP)")
     table.add_row("/language <name>", "Set target language (C, SPARK_Ada)")
     table.add_row("/iterations <n>", "Set max pipeline iterations")
+    table.add_row("/stage <name>", "Set pipeline stage (actor, checker, policy)")
     table.add_row("/last", "Show full output of the last run")
     table.add_row("/audit", "Show traceability matrix for the last run")
     table.add_row("/config", "Show current configuration")
@@ -365,7 +423,10 @@ def show_help() -> None:
     console.print()
 
 
-def show_config(standard: str, language: str, max_iterations: int, model: str = "") -> None:
+def show_config(
+    standard: str, language: str, max_iterations: int, model: str = "",
+    stage: PipelineStage = PipelineStage.POLICY,
+) -> None:
     """Show current config."""
     console.print()
     console.print(f"  [bold]Standard:[/]    {standard}")
@@ -373,6 +434,8 @@ def show_config(standard: str, language: str, max_iterations: int, model: str = 
     console.print(f"  [bold]Iterations:[/]  {max_iterations}")
     if model:
         console.print(f"  [bold]Model:[/]       {model}")
+    stage_color = "yellow" if stage != PipelineStage.POLICY else "green"
+    console.print(f"  [bold]Stage:[/]       [{stage_color}]{stage.value}[/]")
     console.print()
 
 

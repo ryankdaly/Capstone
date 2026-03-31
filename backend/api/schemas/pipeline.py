@@ -28,6 +28,7 @@ class PipelineRequest(BaseModel):
     safety_standard: SafetyStandard = SafetyStandard.DO_178C
     target_language: TargetLanguage = TargetLanguage.C
     max_iterations: int = Field(default=3, ge=1, le=10)
+    stage: PipelineStage = PipelineStage.POLICY  # default: full pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,30 @@ class IterationRecord(BaseModel):
 # ---------------------------------------------------------------------------
 # Pipeline status
 # ---------------------------------------------------------------------------
+
+class PipelineStage(str, Enum):
+    """Ordered pipeline stages — orchestrator runs up to (and including) this stage.
+
+    Add new stages between existing ones to incrementally enable pipeline sections.
+    The integer values define execution order.
+    """
+    ACTOR = "actor"             # Code generation only
+    CHECKER = "checker"         # + Checker review + Dafny verification (parallel)
+    POLICY = "policy"           # + Policy compliance audit (full pipeline)
+
+
+# Execution order for stage comparison
+_STAGE_ORDER = {
+    PipelineStage.ACTOR: 1,
+    PipelineStage.CHECKER: 2,
+    PipelineStage.POLICY: 3,
+}
+
+
+def stage_enabled(current: PipelineStage, max_stage: PipelineStage) -> bool:
+    """Return True if `current` stage should run given the configured `max_stage`."""
+    return _STAGE_ORDER[current] <= _STAGE_ORDER[max_stage]
+
 
 class PipelineStatus(str, Enum):
     PENDING = "pending"

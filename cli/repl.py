@@ -12,13 +12,14 @@ from uuid import UUID
 from rich.console import Console
 from rich.table import Table
 
-from backend.api.schemas.pipeline import PipelineState
+from backend.api.schemas.pipeline import PipelineStage, PipelineState
 from backend.config import load_config
 from cli.display import (
     DisplayManager,
     console,
     show_banner,
     show_config,
+    show_disconnected_warning,
     show_error,
     show_help,
 )
@@ -36,10 +37,19 @@ class Session:
         self.model: str = config.models.actor.model
         self.config_source: str = ""
         self.last_state: PipelineState | None = None
+        # Pipeline stage — controls how far the pipeline runs
+        try:
+            self.stage: PipelineStage = PipelineStage(config.pipeline.stage)
+        except ValueError:
+            self.stage = PipelineStage.POLICY
 
     @property
     def last_run_id(self) -> UUID | None:
         return self.last_state.run_id if self.last_state else None
+
+    @property
+    def is_disconnected(self) -> bool:
+        return self.stage != PipelineStage.POLICY
 
 
 def _handle_command(line: str, session: Session) -> bool:
@@ -56,7 +66,7 @@ def _handle_command(line: str, session: Session) -> bool:
         show_help()
 
     elif cmd == "/config":
-        show_config(session.standard, session.language, session.max_iterations, session.model)
+        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage)
 
     elif cmd == "/standard":
         if not arg:
@@ -86,6 +96,19 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/last":
         _show_last_run(session)
+
+    elif cmd == "/stage":
+        if not arg:
+            console.print(f"  Current stage: [bold]{session.stage.value}[/]")
+            console.print("  [dim]Options: actor, checker, policy (full pipeline)[/]")
+        else:
+            try:
+                session.stage = PipelineStage(arg.lower())
+                console.print(f"  Stage set to: [bold]{session.stage.value}[/]")
+                if session.is_disconnected:
+                    show_disconnected_warning(session.stage)
+            except ValueError:
+                show_error(f"Unknown stage: {arg}. Options: actor, checker, policy")
 
     elif cmd == "/audit":
         _show_audit(session)
@@ -175,7 +198,12 @@ def start_repl() -> None:
         model=session.model,
         standard=session.standard,
         language=session.language,
+        stage=session.stage,
     )
+
+    # Show large warning if running in disconnected (partial pipeline) mode
+    if session.is_disconnected:
+        show_disconnected_warning(session.stage)
 
     # Check LLM connectivity
     config = load_config()
@@ -220,6 +248,7 @@ def start_repl() -> None:
                 language=session.language,
                 max_iterations=session.max_iterations,
                 display=display,
+                stage=session.stage,
             )
             session.last_state = state
         except KeyboardInterrupt:

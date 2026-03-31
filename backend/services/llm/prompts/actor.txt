@@ -28,3 +28,4 @@ IMPORTANT — BE CONCISE:
 - Keep dafny_spec minimal — preconditions, postconditions, and loop invariants only. Aim for under 20 lines.
 - Do NOT include chain-of-thought, internal reasoning, or <think> blocks in your output. JSON values only.
 - Do NOT wrap source_code or dafny_spec in markdown code fences (no backticks, no ```c, no ```). Output raw code strings only.
+- CRITICAL: Use newline characters (\n) in source_code and dafny_spec to separate lines. Each statement, declaration, and brace MUST be on its own line. Never put all code on a single line.

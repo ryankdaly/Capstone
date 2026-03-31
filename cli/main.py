@@ -14,6 +14,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from backend.api.schemas.pipeline import PipelineStage
 from cli.config import (
     DEFAULT_BACKEND_URL,
     DEFAULT_LANGUAGE,
@@ -44,12 +45,23 @@ def generate(
     standard: str = typer.Option(DEFAULT_STANDARD, "--standard", "-s", help="Safety standard"),
     language: str = typer.Option(DEFAULT_LANGUAGE, "--language", "-l", help="Target language (C, SPARK_Ada)"),
     max_iterations: int = typer.Option(DEFAULT_MAX_ITERATIONS, "--max-iterations", "-m", help="Max iterations"),
+    stage: str = typer.Option("policy", "--stage", help="Pipeline stage: actor, checker, policy"),
 ) -> None:
     """Run the pipeline once (non-interactive)."""
     from cli.runner import run_pipeline
 
+    try:
+        pipeline_stage = PipelineStage(stage)
+    except ValueError:
+        show_error(f"Unknown stage: {stage}. Options: actor, checker, policy")
+        raise typer.Exit(1)
+
     console.print(f"\n  [bold]HPEMA Pipeline[/]")
-    console.print(f"  [dim]Standard: {standard}  |  Language: {language}  |  Max iterations: {max_iterations}[/]")
+    console.print(f"  [dim]Standard: {standard}  |  Language: {language}  |  Max iterations: {max_iterations}  |  Stage: {stage}[/]")
+
+    if pipeline_stage != PipelineStage.POLICY:
+        from cli.display import show_disconnected_warning
+        show_disconnected_warning(pipeline_stage)
 
     display = DisplayManager()
 
@@ -60,6 +72,7 @@ def generate(
             language=language,
             max_iterations=max_iterations,
             display=display,
+            stage=pipeline_stage,
         )
     except KeyboardInterrupt:
         console.print("\n  [yellow]Pipeline interrupted.[/]")
