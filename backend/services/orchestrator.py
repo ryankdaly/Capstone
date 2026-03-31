@@ -99,11 +99,10 @@ class PipelineOrchestrator:
 
         feedback: FeedbackMessage | None = None
 
-        # With stage < POLICY, there's no feedback loop — run once.
+        # Actor-only has no feedback loop. Checker+ can loop on Dafny/Checker feedback.
         effective_max_iterations = (
-            request.max_iterations
-            if stage_enabled(PipelineStage.POLICY, max_stage)
-            else 1
+            1 if max_stage == PipelineStage.ACTOR
+            else request.max_iterations
         )
 
         try:
@@ -221,8 +220,24 @@ class PipelineOrchestrator:
                     self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
                 # --- CONVERGENCE CHECK ---
-                if stage_enabled(PipelineStage.POLICY, max_stage):
-                    # Full pipeline — check all agents
+                if max_stage == PipelineStage.ACTOR:
+                    # Actor-only — always pass (single inference, no verification)
+                    all_pass = True
+                elif max_stage == PipelineStage.CHECKER:
+                    # Checker stage — pass requires Dafny verified + Checker pass
+                    dafny_ok = verification_result is not None and verification_result.verified
+                    checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+                    all_pass = dafny_ok and checker_ok
+
+                    feedback = compose_feedback(
+                        iteration=i,
+                        checker_report=checker_report,
+                        verification_result=verification_result,
+                        policy_verdict=None,
+                    )
+                    iteration.feedback = feedback
+                else:
+                    # Full pipeline — all three must pass
                     all_pass = (
                         checker_report is not None
                         and checker_report.verdict == CheckerVerdict.PASS
@@ -239,9 +254,6 @@ class PipelineOrchestrator:
                         policy_verdict=policy_verdict,
                     )
                     iteration.feedback = feedback
-                else:
-                    # Disconnected mode — whatever ran is considered a pass
-                    all_pass = True
 
                 iteration.completed_at = datetime.now(timezone.utc)
                 state.iterations.append(iteration)

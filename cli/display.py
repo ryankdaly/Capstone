@@ -373,34 +373,48 @@ def show_banner(
 
 
 def show_disconnected_warning(stage: PipelineStage) -> None:
-    """Show a large, unmissable warning when running in disconnected mode."""
-    skipped: list[str] = []
+    """Show a warning when running in partial pipeline mode."""
     if stage == PipelineStage.ACTOR:
         skipped = ["Checker Agent", "Dafny Verifier", "Policy Agent", "Feedback Loop"]
-    elif stage == PipelineStage.CHECKER:
-        skipped = ["Policy Agent", "Feedback Loop"]
+        lines = [
+            f"[bold yellow]DISCONNECTED MODE — stage: {stage.value.upper()}[/]",
+            "",
+            "Single inference only. No verification, no feedback loop.",
+            "",
+            "[bold]Skipped components:[/]",
+        ]
+        for s in skipped:
+            lines.append(f"  [red]x[/] {s}")
+        lines.append("")
+        lines.append("[dim]Set stage: /stage checker  or  /stage policy[/]")
 
-    lines = [
-        f"[bold yellow]DISCONNECTED MODE — stage: {stage.value.upper()}[/]",
-        "",
-        "The pipeline will stop after the configured stage.",
-        "Downstream agents are SKIPPED — results are NOT verified.",
-        "",
-        "[bold]Skipped components:[/]",
-    ]
-    for s in skipped:
-        lines.append(f"  [red]x[/] {s}")
-    lines.append("")
-    lines.append("[dim]Set stage: /stage policy  (or edit pipeline.stage in config YAML)[/]")
-
-    console.print(
-        Panel(
-            "\n".join(lines),
-            title="[bold yellow]!! WARNING !![/]",
-            border_style="yellow",
-            padding=(1, 2),
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold yellow]!! WARNING !![/]",
+                border_style="yellow",
+                padding=(1, 2),
+            )
         )
-    )
+    elif stage == PipelineStage.CHECKER:
+        lines = [
+            f"[bold cyan]PARTIAL PIPELINE — stage: {stage.value.upper()}[/]",
+            "",
+            "[green]Active:[/]  Actor + Checker Agent + Dafny Verifier + Feedback Loop",
+            "[yellow]Skipped:[/] Policy Agent (RAG compliance audit)",
+            "",
+            "Dafny failures and Checker issues will feed back to the Actor.",
+            "[dim]Set stage: /stage policy  for full pipeline[/]",
+        ]
+
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Partial Pipeline[/]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
 
 
 def show_help() -> None:

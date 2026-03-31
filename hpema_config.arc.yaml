@@ -26,10 +26,10 @@ policies:
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "dafny"
+  binary_path: "/home/shehryarkhan/.dotnet/tools/dafny"   # update if installed elsewhere
 
 pipeline:
   max_iterations: 3
   require_human_approval: false # disable for initial testing
   audit_log_dir: "logs/audit"
-  stage: "actor"                # disconnected: actor only until Dafny is installed
+  stage: "checker"              # Actor + Dafny verification (no Policy agent yet)
