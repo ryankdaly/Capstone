@@ -6,10 +6,13 @@ Type requirements naturally, use /commands to configure.
 
 from __future__ import annotations
 
-import sys
+import time
+from dataclasses import dataclass, field
 from uuid import UUID
 
 from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 from backend.api.schemas.pipeline import PipelineStage, PipelineState
@@ -26,6 +29,21 @@ from cli.display import (
 from cli.runner import run_pipeline
 
 
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunRecord:
+    """One pipeline run in the session history."""
+    requirement: str
+    state: PipelineState
+    standard: str
+    language: str
+    stage: str
+    elapsed_seconds: float
+
+
 class Session:
     """Holds REPL state across commands."""
 
@@ -36,12 +54,20 @@ class Session:
         self.max_iterations: int = config.pipeline.max_iterations
         self.model: str = config.models.actor.model
         self.config_source: str = ""
-        self.last_state: PipelineState | None = None
+        self.started_at: float = time.monotonic()
+
         # Pipeline stage — controls how far the pipeline runs
         try:
             self.stage: PipelineStage = PipelineStage(config.pipeline.stage)
         except ValueError:
             self.stage = PipelineStage.POLICY
+
+        # Run history (most recent last)
+        self.history: list[RunRecord] = []
+
+    @property
+    def last_state(self) -> PipelineState | None:
+        return self.history[-1].state if self.history else None
 
     @property
     def last_run_id(self) -> UUID | None:
@@ -52,6 +78,10 @@ class Session:
         return self.stage != PipelineStage.POLICY
 
 
+# ---------------------------------------------------------------------------
+# Command handling
+# ---------------------------------------------------------------------------
+
 def _handle_command(line: str, session: Session) -> bool:
     """Handle a /command. Returns True if the REPL should continue."""
     parts = line.strip().split(maxsplit=1)
@@ -59,7 +89,7 @@ def _handle_command(line: str, session: Session) -> bool:
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in ("/quit", "/exit", "/q"):
-        console.print("\n  [dim]Goodbye.[/]\n")
+        _show_goodbye(session)
         return False
 
     elif cmd == "/help":
@@ -97,6 +127,16 @@ def _handle_command(line: str, session: Session) -> bool:
     elif cmd == "/last":
         _show_last_run(session)
 
+    elif cmd == "/history":
+        n = 15
+        if arg:
+            try:
+                n = int(arg)
+            except ValueError:
+                show_error("Usage: /history [N]")
+                return True
+        _show_history(session, n)
+
     elif cmd == "/stage":
         if not arg:
             console.print(f"  Current stage: [bold]{session.stage.value}[/]")
@@ -119,32 +159,268 @@ def _handle_command(line: str, session: Session) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# /last — detailed view of most recent run
+# ---------------------------------------------------------------------------
+
 def _show_last_run(session: Session) -> None:
-    """Show full output of the last pipeline run."""
-    if session.last_state is None:
+    """Show detailed output of the last pipeline run."""
+    if not session.history:
         console.print("  [dim]No runs yet. Type a requirement to start.[/]")
         return
 
-    state = session.last_state
-    console.print(f"\n  [bold]Last Run:[/] {state.run_id}")
-    console.print(f"  Status: {state.status.value}")
-    console.print(f"  Iterations: {len(state.iterations)}")
+    record = session.history[-1]
+    state = record.state
 
+    # Header panel
+    status_color = "green" if state.status.value in ("completed", "awaiting_approval") else "red"
+    header_lines = [
+        f"  [bold]Requirement:[/]  {record.requirement}",
+        f"  [bold]Status:[/]       [{status_color}]{state.status.value.upper()}[/]",
+        f"  [bold]Run ID:[/]       {state.run_id}",
+        f"  [bold]Standard:[/]     {record.standard}",
+        f"  [bold]Language:[/]      {record.language}",
+        f"  [bold]Stage:[/]        {record.stage}",
+        f"  [bold]Iterations:[/]   {len(state.iterations)}",
+        f"  [bold]Time:[/]         {record.elapsed_seconds:.1f}s",
+    ]
+
+    console.print()
+    console.print(Panel(
+        "\n".join(header_lines),
+        title="[bold]Last Run Details[/]",
+        border_style="bright_blue",
+        padding=(1, 1),
+    ))
+
+    # Code output
     if state.final_code:
-        console.print(f"\n  [bold]Final Code:[/]")
-        from rich.syntax import Syntax
         lang_map = {"C": "c", "SPARK_Ada": "ada"}
-        lang = lang_map.get(session.language, "c")
+        lang = lang_map.get(record.language, "c")
+        code_lines = len(state.final_code.splitlines())
+        console.print(f"\n  [bold]Source Code[/] [dim]({code_lines} lines)[/]")
         syntax = Syntax(state.final_code, lang, theme="monokai", line_numbers=True, padding=1)
         console.print(syntax)
 
+    # Dafny spec
     if state.final_proof:
-        console.print(f"\n  [bold]Dafny Specification:[/]")
-        syntax = Syntax(state.final_proof, "csharp", theme="monokai", padding=1)
+        dafny_lines = len(state.final_proof.splitlines())
+        console.print(f"\n  [bold]Dafny Specification[/] [dim]({dafny_lines} lines)[/]")
+        syntax = Syntax(state.final_proof, "csharp", theme="monokai", line_numbers=True, padding=1)
         console.print(syntax)
+    else:
+        console.print(f"\n  [bold]Dafny Specification[/]  [dim]— not generated[/]")
+
+    # Reasoning trace (from the last iteration's actor output)
+    if state.iterations:
+        last_iter = state.iterations[-1]
+        if last_iter.code_candidate and last_iter.code_candidate.reasoning_trace:
+            trace = last_iter.code_candidate.reasoning_trace
+            console.print(f"\n  [bold]Actor Reasoning:[/]")
+            console.print(f"  [dim]{trace[:500]}[/]")
+
+        # Checker verdict
+        if last_iter.checker_report:
+            cr = last_iter.checker_report
+            v_label = cr.verdict.value.upper()
+            v_color = "green" if cr.verdict.value == "pass" else "red"
+            console.print(f"\n  [bold]Checker:[/] [{v_color}]{v_label}[/] — {len(cr.issues)} issue(s), {len(cr.test_cases)} test case(s)")
+
+        # Dafny verification
+        if last_iter.verification_result:
+            vr = last_iter.verification_result
+            v_color = "green" if vr.verified else "red"
+            v_label = "VERIFIED" if vr.verified else "FAILED"
+            console.print(f"  [bold]Dafny:[/]   [{v_color}]{v_label}[/]  ({vr.execution_time_seconds:.1f}s)")
+
+        # Policy verdict
+        if last_iter.policy_verdict:
+            pv = last_iter.policy_verdict
+            v_color = "green" if pv.compliant else "red"
+            v_label = "COMPLIANT" if pv.compliant else "NON-COMPLIANT"
+            console.print(f"  [bold]Policy:[/]  [{v_color}]{v_label}[/] — Risk: {pv.risk_level.value.upper()}, {len(pv.violations)} violation(s)")
 
     console.print()
 
+
+# ---------------------------------------------------------------------------
+# /history N — show recent run summaries
+# ---------------------------------------------------------------------------
+
+def _show_history(session: Session, n: int) -> None:
+    """Show the last N runs as a summary table."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    runs = session.history[-n:]
+
+    table = Table(
+        title=f"Run History (last {len(runs)} of {len(session.history)})",
+        padding=(0, 1),
+        show_lines=True,
+    )
+    table.add_column("#", style="dim", width=3, justify="right")
+    table.add_column("Requirement", max_width=40)
+    table.add_column("Status", width=10, justify="center")
+    table.add_column("Code", width=8, justify="center")
+    table.add_column("Dafny", width=8, justify="center")
+    table.add_column("Checker", width=10, justify="center")
+    table.add_column("Policy", width=12, justify="center")
+    table.add_column("Time", width=6, justify="right")
+
+    offset = len(session.history) - len(runs)
+    for i, record in enumerate(runs, start=1):
+        state = record.state
+        idx = offset + i
+
+        # Status
+        passed = state.status.value in ("completed", "awaiting_approval")
+        status_str = f"[green]OK[/]" if passed else f"[red]FAIL[/]"
+
+        # Code lines
+        code_str = f"{len(state.final_code.splitlines())}L" if state.final_code else "[dim]—[/]"
+
+        # Dafny
+        dafny_str = "[green]Yes[/]" if state.final_proof else "[dim]No[/]"
+
+        # Checker (from last iteration)
+        checker_str = "[dim]—[/]"
+        policy_str = "[dim]—[/]"
+        if state.iterations:
+            last_iter = state.iterations[-1]
+            if last_iter.checker_report:
+                cv = last_iter.checker_report.verdict.value
+                c_color = "green" if cv == "pass" else "red"
+                checker_str = f"[{c_color}]{cv.upper()}[/]"
+            if last_iter.policy_verdict:
+                pc = "PASS" if last_iter.policy_verdict.compliant else "FAIL"
+                p_color = "green" if last_iter.policy_verdict.compliant else "red"
+                policy_str = f"[{p_color}]{pc}[/]"
+
+        # Time
+        time_str = f"{record.elapsed_seconds:.1f}s"
+
+        # Truncate requirement
+        req = record.requirement[:38]
+        if len(record.requirement) > 38:
+            req += ".."
+
+        table.add_row(str(idx), req, status_str, code_str, dafny_str, checker_str, policy_str, time_str)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Goodbye — session statistics
+# ---------------------------------------------------------------------------
+
+def _show_goodbye(session: Session) -> None:
+    """Show session statistics on exit."""
+    session_time = time.monotonic() - session.started_at
+    total_runs = len(session.history)
+
+    if total_runs == 0:
+        console.print()
+        console.print(Panel(
+            "[dim]No runs this session. See you next time.[/]",
+            title="[bold]Goodbye[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        ))
+        console.print()
+        return
+
+    # Compute stats
+    succeeded = sum(
+        1 for r in session.history
+        if r.state.status.value in ("completed", "awaiting_approval")
+    )
+    failed = total_runs - succeeded
+
+    total_code_lines = 0
+    runs_with_dafny = 0
+    runs_with_tests = 0
+    runs_with_checker = 0
+    runs_with_policy = 0
+    total_iterations = 0
+    total_pipeline_time = 0.0
+
+    for record in session.history:
+        state = record.state
+        total_pipeline_time += record.elapsed_seconds
+        total_iterations += len(state.iterations)
+
+        if state.final_code:
+            total_code_lines += len(state.final_code.splitlines())
+        if state.final_proof:
+            runs_with_dafny += 1
+
+        if state.iterations:
+            last_iter = state.iterations[-1]
+            if last_iter.checker_report:
+                runs_with_checker += 1
+                if last_iter.checker_report.test_cases:
+                    runs_with_tests += 1
+            if last_iter.policy_verdict:
+                runs_with_policy += 1
+
+    # Percentages (avoid div by zero)
+    pct_dafny = (runs_with_dafny / total_runs * 100) if total_runs else 0
+    pct_tests = (runs_with_tests / total_runs * 100) if total_runs else 0
+    pct_checker = (runs_with_checker / total_runs * 100) if total_runs else 0
+    pct_policy = (runs_with_policy / total_runs * 100) if total_runs else 0
+    pct_success = (succeeded / total_runs * 100) if total_runs else 0
+
+    # Format session time
+    mins, secs = divmod(int(session_time), 60)
+    if mins > 0:
+        session_str = f"{mins}m {secs}s"
+    else:
+        session_str = f"{secs}s"
+
+    # Build stats table
+    stats = Table(show_header=False, box=None, padding=(0, 2))
+    stats.add_column("Label", style="bold")
+    stats.add_column("Value")
+    stats.add_column("Bar", width=20)
+
+    stats.add_row("Session Duration", session_str, "")
+    stats.add_row("Pipeline Runs", f"{total_runs}", "")
+    stats.add_row("  Succeeded", f"[green]{succeeded}[/]", _bar(pct_success, "green"))
+    stats.add_row("  Failed", f"[red]{failed}[/]" if failed else "[dim]0[/]", _bar(100 - pct_success, "red") if failed else "")
+    stats.add_row("Total Iterations", f"{total_iterations}", "")
+    stats.add_row("Code Generated", f"{total_code_lines} lines", "")
+    stats.add_row("Pipeline Time", f"{total_pipeline_time:.1f}s", "")
+    stats.add_row("", "", "")
+    stats.add_row("Coverage", "", "")
+    stats.add_row("  Dafny Specs", f"{runs_with_dafny}/{total_runs}", _bar(pct_dafny, "magenta"))
+    stats.add_row("  Test Cases", f"{runs_with_tests}/{total_runs}", _bar(pct_tests, "yellow"))
+    stats.add_row("  Checker Review", f"{runs_with_checker}/{total_runs}", _bar(pct_checker, "yellow"))
+    stats.add_row("  Policy Audit", f"{runs_with_policy}/{total_runs}", _bar(pct_policy, "green"))
+
+    console.print()
+    console.print(Panel(
+        stats,
+        title="[bold]Session Summary[/]",
+        border_style="bright_blue",
+        padding=(1, 2),
+    ))
+    console.print()
+
+
+def _bar(pct: float, color: str, width: int = 15) -> str:
+    """Render a simple percentage bar."""
+    filled = int(pct / 100 * width)
+    empty = width - filled
+    return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * empty}[/dim] {pct:.0f}%"
+
+
+# ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
 
 def _show_audit(session: Session) -> None:
     """Show traceability matrix for the last run."""
@@ -183,6 +459,10 @@ def _show_audit(session: Session) -> None:
     console.print(table)
     console.print()
 
+
+# ---------------------------------------------------------------------------
+# REPL entry point
+# ---------------------------------------------------------------------------
 
 def start_repl() -> None:
     """Launch the interactive REPL."""
@@ -224,7 +504,7 @@ def start_repl() -> None:
         try:
             line = console.input("[bold bright_blue]hpema >[/] ").strip()
         except (EOFError, KeyboardInterrupt):
-            console.print("\n  [dim]Goodbye.[/]\n")
+            _show_goodbye(session)
             break
 
         if not line:
@@ -240,6 +520,7 @@ def start_repl() -> None:
         console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
 
         display = DisplayManager()
+        run_start = time.monotonic()
 
         try:
             state = run_pipeline(
@@ -250,7 +531,16 @@ def start_repl() -> None:
                 display=display,
                 stage=session.stage,
             )
-            session.last_state = state
+            elapsed = time.monotonic() - run_start
+            if state is not None:
+                session.history.append(RunRecord(
+                    requirement=line,
+                    state=state,
+                    standard=session.standard,
+                    language=session.language,
+                    stage=session.stage.value,
+                    elapsed_seconds=elapsed,
+                ))
         except KeyboardInterrupt:
             console.print("\n  [yellow]Pipeline interrupted.[/]")
         except Exception as e:
