@@ -27,4 +27,5 @@ print(f'  output: {r1.solver_output[:200]}')
 
 r2 = asyncio.run(runner.verify(bad))
 print(f'Bad spec:  verified={r2.verified}  ({r2.execution_time_seconds}s)')
+print(f'FULL OUTPUT: \n{r2.solver_output}')
 print(f'  failures: {r2.failing_assertions}')
