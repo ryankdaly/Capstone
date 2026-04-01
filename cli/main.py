@@ -43,7 +43,7 @@ def default(ctx: typer.Context) -> None:
 def generate(
     requirement: str = typer.Option(..., "--requirement", "-r", help="Natural language requirement"),
     standard: str = typer.Option(DEFAULT_STANDARD, "--standard", "-s", help="Safety standard"),
-    language: str = typer.Option(DEFAULT_LANGUAGE, "--language", "-l", help="Target language (C, SPARK_Ada)"),
+    language: str = typer.Option(DEFAULT_LANGUAGE, "--language", "-l", help="Target language (Python, C, SPARK_Ada)"),
     max_iterations: int = typer.Option(DEFAULT_MAX_ITERATIONS, "--max-iterations", "-m", help="Max iterations"),
     stage: str = typer.Option("policy", "--stage", help="Pipeline stage: actor, checker, policy"),
 ) -> None:

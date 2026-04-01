@@ -216,7 +216,7 @@ class DisplayManager:
             preview = "\n".join(source_code.splitlines()[:20])
             if code_lines > 20:
                 preview += f"\n... ({code_lines - 20} more lines)"
-            lang_map = {"C": "c", "SPARK_Ada": "ada", "SPARK Ada": "ada"}
+            lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada", "SPARK Ada": "ada"}
             syntax = Syntax(
                 preview,
                 lang_map.get(language, "c"),
@@ -331,7 +331,7 @@ def show_banner(
     config_source: str = "",
     model: str = "",
     standard: str = "DO_178C",
-    language: str = "C",
+    language: str = "Python",
     stage: PipelineStage = PipelineStage.POLICY,
 ) -> None:
     """Show the startup banner."""
@@ -424,7 +424,7 @@ def show_help() -> None:
     table.add_column("Description")
     table.add_row("<requirement>", "Type any requirement to start the pipeline")
     table.add_row("/standard <name>", "Set safety standard (DO_178C, MISRA_C, NASA, Boeing_SDP)")
-    table.add_row("/language <name>", "Set target language (C, SPARK_Ada)")
+    table.add_row("/language <name>", "Set target language (Python, C, SPARK_Ada)")
     table.add_row("/iterations <n>", "Set max pipeline iterations")
     table.add_row("/stage <name>", "Set pipeline stage (actor, checker, policy)")
     table.add_row("/last", "Detailed view of the last run (code, spec, verdicts)")

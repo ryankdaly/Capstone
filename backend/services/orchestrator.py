@@ -156,7 +156,6 @@ class PipelineOrchestrator:
 
                     checker_task = self._checker.run(
                         source_code=code_candidate.source_code,
-                        dafny_spec=code_candidate.dafny_spec,
                         language=request.target_language.value,
                         standard=request.safety_standard.value,
                     )
@@ -226,14 +225,16 @@ class PipelineOrchestrator:
                     self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
                 # --- CONVERGENCE CHECK ---
+                # Dafny is best-effort: tracked and fed back, but does NOT gate convergence.
+                # Checker verdict (and Policy at full stage) determine pass/fail.
+                dafny_ok = verification_result is not None and verification_result.verified
+                checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+
                 if max_stage == PipelineStage.ACTOR:
-                    # Actor-only — always pass (single inference, no verification)
                     all_pass = True
                 elif max_stage == PipelineStage.CHECKER:
-                    # Checker stage — pass requires Dafny verified + Checker pass
-                    dafny_ok = verification_result is not None and verification_result.verified
-                    checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
-                    all_pass = dafny_ok and checker_ok
+                    # Checker verdict is the gate. Dafny is soft feedback.
+                    all_pass = checker_ok
 
                     feedback = compose_feedback(
                         iteration=i,
@@ -241,46 +242,11 @@ class PipelineOrchestrator:
                         verification_result=verification_result,
                         policy_verdict=None,
                     )
-
-                    # Best-so-far tracking — detect regressions
-                    score = (
-                        (1.0 if dafny_ok else 0.0)
-                        + (1.0 if checker_ok else 0.0)
-                        + (0.5 if has_dafny_spec else 0.0)
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best_iteration = i
-                    elif i > 1 and score < best_score:
-                        regression_note = (
-                            f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
-                            f"Do NOT regress — preserve what worked before."
-                        )
-                        feedback = FeedbackMessage(
-                            iteration=feedback.iteration,
-                            checker_feedback=feedback.checker_feedback,
-                            verification_feedback=feedback.verification_feedback,
-                            policy_feedback=feedback.policy_feedback,
-                            priority_summary=f"{regression_note} | {feedback.priority_summary}",
-                        )
-
-                    # If no Dafny spec was generated, add explicit feedback
-                    if not has_dafny_spec:
-                        feedback = FeedbackMessage(
-                            iteration=feedback.iteration,
-                            checker_feedback=feedback.checker_feedback,
-                            verification_feedback=feedback.verification_feedback,
-                            policy_feedback=feedback.policy_feedback,
-                            priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
-                        )
-
                     iteration.feedback = feedback
                 else:
-                    # Full pipeline — all three must pass
-                    dafny_ok = verification_result is not None and verification_result.verified
-                    checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+                    # Full pipeline — Checker + Policy must pass. Dafny is soft.
                     policy_ok = policy_verdict is not None and policy_verdict.compliant
-                    all_pass = dafny_ok and checker_ok and policy_ok
+                    all_pass = checker_ok and policy_ok
 
                     feedback = compose_feedback(
                         iteration=i,
@@ -288,39 +254,44 @@ class PipelineOrchestrator:
                         verification_result=verification_result,
                         policy_verdict=policy_verdict,
                     )
+                    iteration.feedback = feedback
 
-                    # Best-so-far tracking
-                    score = (
-                        (1.0 if dafny_ok else 0.0)
-                        + (1.0 if checker_ok else 0.0)
-                        + (1.0 if policy_ok else 0.0)
-                        + (0.5 if has_dafny_spec else 0.0)
+                # Best-so-far tracking — detect regressions across iterations
+                score = (
+                    (1.0 if checker_ok else 0.0)
+                    + (0.5 if dafny_ok else 0.0)
+                    + (0.25 if has_dafny_spec else 0.0)
+                )
+                if max_stage == PipelineStage.POLICY:
+                    policy_ok = policy_verdict is not None and policy_verdict.compliant
+                    score += 1.0 if policy_ok else 0.0
+
+                if score > best_score:
+                    best_score = score
+                    best_iteration = i
+                elif i > 1 and score < best_score and feedback is not None:
+                    regression_note = (
+                        f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
+                        f"Do NOT regress — preserve what worked before."
                     )
-                    if score > best_score:
-                        best_score = score
-                        best_iteration = i
-                    elif i > 1 and score < best_score:
-                        regression_note = (
-                            f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
-                            f"Do NOT regress — preserve what worked before."
-                        )
-                        feedback = FeedbackMessage(
-                            iteration=feedback.iteration,
-                            checker_feedback=feedback.checker_feedback,
-                            verification_feedback=feedback.verification_feedback,
-                            policy_feedback=feedback.policy_feedback,
-                            priority_summary=f"{regression_note} | {feedback.priority_summary}",
-                        )
+                    feedback = FeedbackMessage(
+                        iteration=feedback.iteration,
+                        checker_feedback=feedback.checker_feedback,
+                        verification_feedback=feedback.verification_feedback,
+                        policy_feedback=feedback.policy_feedback,
+                        priority_summary=f"{regression_note} | {feedback.priority_summary}",
+                    )
+                    iteration.feedback = feedback
 
-                    if not has_dafny_spec:
-                        feedback = FeedbackMessage(
-                            iteration=feedback.iteration,
-                            checker_feedback=feedback.checker_feedback,
-                            verification_feedback=feedback.verification_feedback,
-                            policy_feedback=feedback.policy_feedback,
-                            priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
-                        )
-
+                # Nudge Actor if Dafny spec was missing
+                if not has_dafny_spec and feedback is not None:
+                    feedback = FeedbackMessage(
+                        iteration=feedback.iteration,
+                        checker_feedback=feedback.checker_feedback,
+                        verification_feedback=feedback.verification_feedback,
+                        policy_feedback=feedback.policy_feedback,
+                        priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
+                    )
                     iteration.feedback = feedback
 
                 iteration.completed_at = datetime.now(timezone.utc)

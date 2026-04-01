@@ -53,7 +53,7 @@ def stage_enabled(current: PipelineStage, max_stage: PipelineStage) -> bool:
 class PipelineRequest(BaseModel):
     requirement_text: str
     safety_standard: SafetyStandard = SafetyStandard.DO_178C
-    target_language: TargetLanguage = TargetLanguage.C
+    target_language: TargetLanguage = TargetLanguage.PYTHON
     max_iterations: int = Field(default=3, ge=1, le=10)
     stage: PipelineStage = PipelineStage.POLICY  # default: full pipeline
 

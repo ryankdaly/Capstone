@@ -29,7 +29,7 @@ class CodeCandidate(BaseModel):
         default="",
         description="Actor's chain-of-thought explaining design decisions",
     )
-    language: str = Field(default="C", description="Target language of generated code")
+    language: str = Field(default="Python", description="Target language of generated code")
     annotations: dict[str, str] = Field(
         default_factory=dict,
         description="Metadata annotations (e.g., traceability tags)",

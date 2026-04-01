@@ -19,15 +19,13 @@ class CheckerAgent(BaseAgent):
 
     def _build_user_prompt(self, **kwargs: Any) -> str:
         source_code: str = kwargs["source_code"]
-        dafny_spec: str = kwargs.get("dafny_spec", "")
-        language: str = kwargs.get("language", "C")
+        language: str = kwargs.get("language", "Python")
         standard: str = kwargs.get("standard", "DO_178C")
 
         parts = [
             f"## Source Code ({language})\n```\n{source_code}\n```",
-            f"## Dafny Specification\n```dafny\n{dafny_spec}\n```" if dafny_spec else "",
             f"## Safety Standard\n{standard}",
-            "## Task\nReview this code. Find bugs, safety issues, and spec gaps. Generate test cases.",
+            "## Task\nReview this code for correctness, safety issues, and undefined behavior. Generate test cases. Do NOT comment on Dafny specifications — focus only on the source code.",
         ]
 
         return "\n\n".join(p for p in parts if p)

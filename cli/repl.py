@@ -52,7 +52,7 @@ class Session:
     def __init__(self) -> None:
         config = load_config()
         self.standard: str = config.policies.default_standard
-        self.language: str = "C"
+        self.language: str = "Python"
         self.max_iterations: int = config.pipeline.max_iterations
         self.model: str = config.models.actor.model
         self.config_source: str = ""
@@ -111,7 +111,7 @@ def _handle_command(line: str, session: Session) -> bool:
     elif cmd == "/language":
         if not arg:
             console.print(f"  Current language: [bold]{session.language}[/]")
-            console.print("  [dim]Options: C, SPARK_Ada[/]")
+            console.print("  [dim]Options: Python, C, SPARK_Ada[/]")
         else:
             session.language = arg
             console.print(f"  Language set to: [bold]{arg}[/]")
@@ -203,7 +203,7 @@ def _show_last_run(session: Session) -> None:
 
     # Code output
     if state.final_code:
-        lang_map = {"C": "c", "SPARK_Ada": "ada"}
+        lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada"}
         lang = lang_map.get(record.language, "c")
         code_lines = len(state.final_code.splitlines())
         console.print(f"\n  [bold]Source Code[/] [dim]({code_lines} lines)[/]")
