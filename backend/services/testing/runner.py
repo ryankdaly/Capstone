@@ -189,6 +189,14 @@ class TestRunner:
         )
         logger.debug("pytest combined output:\n%s", combined[:2000])
 
+        # Detect "pytest not installed" — python -m pytest returns exit code 1
+        # with "No module named pytest" when pytest isn't available
+        if "No module named" in combined and "pytest" in combined:
+            return TestRunResult(
+                executed=False,
+                pytest_output="pytest not installed. Run: pip install pytest",
+            )
+
         # pytest exit codes: 0=all passed, 1=some failed, 2=interrupted,
         # 3=internal error, 4=usage error, 5=no tests collected
         if proc.returncode in (3, 4, 5):

@@ -494,6 +494,7 @@ def show_help() -> None:
     table.add_row("/last", "Detailed view of the last run (code, spec, verdicts)")
     table.add_row("/checker [N]", "Verbose checker report for iteration N (default: last)")
     table.add_row("/dafny [N]", "Verbose Dafny verification for iteration N (default: last)")
+    table.add_row("/pytest [N]", "Full pytest output for iteration N (default: last)")
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
     table.add_row("/config", "Show current configuration")
@@ -630,6 +631,77 @@ def show_dafny_detail(iteration: "IterationRecord", iter_num: int) -> None:
         console.print(_Syntax(spec, "csharp", theme="monokai", line_numbers=True, padding=1))
     else:
         console.print(f"\n  [dim]No Dafny spec was generated this iteration.[/]")
+
+    console.print()
+
+
+def show_pytest_detail(iteration: "IterationRecord", iter_num: int) -> None:
+    """Show verbose pytest execution output for an iteration."""
+    from backend.api.schemas.pipeline import IterationRecord  # noqa: F811
+
+    tr = iteration.test_result
+    if tr is None:
+        console.print(f"\n  [dim]No test result for iteration {iter_num}.[/]\n")
+        return
+
+    if not tr.executed:
+        parts = [
+            f"  [bold]Status:[/]  [yellow]NOT EXECUTED[/]",
+            f"  [bold]Reason:[/]  {tr.pytest_output or 'Tests disabled or unavailable'}",
+        ]
+        if iteration.checker_report and iteration.checker_report.test_cases:
+            parts.append(f"\n  [bold]Stored Test Cases ({len(iteration.checker_report.test_cases)}):[/]")
+            for j, tc in enumerate(iteration.checker_report.test_cases, 1):
+                parts.append(f"    [cyan]{j}.[/] {tc[:120]}")
+        console.print()
+        console.print(Panel(
+            "\n".join(parts),
+            title=f"[bold cyan]Pytest — Iteration {iter_num}[/]",
+            border_style="yellow",
+            padding=(1, 1),
+        ))
+        console.print()
+        return
+
+    all_pass = tr.failed == 0 and tr.errors == 0 and tr.total > 0
+    border = "green" if all_pass else "red"
+
+    parts: list[str] = [
+        f"  [bold]Total:[/]   {tr.total}",
+        f"  [bold]Passed:[/]  [green]{tr.passed}[/]",
+        f"  [bold]Failed:[/]  [red]{tr.failed}[/]" if tr.failed else f"  [bold]Failed:[/]  0",
+        f"  [bold]Errors:[/]  [red]{tr.errors}[/]" if tr.errors else f"  [bold]Errors:[/]  0",
+        f"  [bold]Time:[/]    {tr.execution_time_seconds:.2f}s",
+    ]
+
+    if tr.test_results:
+        parts.append("")
+        parts.append("  [bold]Results:[/]")
+        for t in tr.test_results:
+            if t.passed:
+                parts.append(f"    [green]✓[/] {t.name}")
+            else:
+                parts.append(f"    [red]✗[/] {t.name}")
+                if t.error_message:
+                    parts.append(f"      [dim]{t.error_message}[/]")
+
+    console.print()
+    console.print(Panel(
+        "\n".join(parts),
+        title=f"[bold cyan]Pytest — Iteration {iter_num}[/]",
+        border_style=border,
+        padding=(1, 1),
+    ))
+
+    # Show raw pytest output
+    if tr.pytest_output:
+        from rich.syntax import Syntax as _Syntax
+        output = tr.pytest_output
+        if len(output.splitlines()) > 50:
+            lines = output.splitlines()
+            output = "\n".join(lines[:50]) + f"\n... ({len(lines) - 50} more lines)"
+        console.print(f"\n  [bold]Raw pytest output:[/]")
+        console.print(_Syntax(output, "text", theme="monokai", padding=1))
 
     console.print()
 

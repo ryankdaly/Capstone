@@ -27,6 +27,7 @@ from cli.display import (
     show_disconnected_warning,
     show_error,
     show_help,
+    show_pytest_detail,
 )
 from cli.runner import run_pipeline
 
@@ -160,6 +161,9 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/dafny":
         _show_dafny(session, arg)
+
+    elif cmd == "/pytest":
+        _show_pytest(session, arg)
 
     elif cmd == "/run-tests":
         if not arg:
@@ -497,6 +501,23 @@ def _show_dafny(session: Session, arg: str) -> None:
     if iter_idx is None:
         return
     show_dafny_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _show_pytest(session: Session, arg: str) -> None:
+    """Show verbose pytest execution output for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_pytest_detail(state.iterations[iter_idx], iter_idx + 1)
 
 
 def _parse_iteration_arg(arg: str, total: int) -> int | None:
