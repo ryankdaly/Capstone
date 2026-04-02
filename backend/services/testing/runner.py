@@ -134,19 +134,29 @@ class TestRunner:
 
     async def _run_pytest(self, test_dir: Path) -> TestRunResult:
         """Run pytest in the temp directory and parse results."""
+        import os
+        import sys
+
+        # Inherit current environment so pytest can find Python + packages,
+        # but override HOME to prevent project conftest/pyproject interference.
+        env = os.environ.copy()
+        env["HOME"] = str(test_dir)
+        # Ensure the running Python's bin dir is on PATH
+        python_bin = str(Path(sys.executable).parent)
+        env["PATH"] = f"{python_bin}:{env.get('PATH', '')}"
+
         try:
             proc = await asyncio.create_subprocess_exec(
-                "python3", "-m", "pytest",
+                sys.executable, "-m", "pytest",
                 str(test_dir / "test_solution.py"),
                 "-v",
                 "--tb=short",
                 "--no-header",
-                "-q",
+                "--override-ini=addopts=",
                 cwd=str(test_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                # Isolate from any project conftest/pyproject
-                env={"PATH": "/usr/bin:/usr/local/bin:/bin", "HOME": str(test_dir)},
+                env=env,
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=PYTEST_TIMEOUT
@@ -167,6 +177,15 @@ class TestRunner:
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
         combined = f"{stdout}\n{stderr}".strip()
+
+        # pytest exit codes: 0=all passed, 1=some failed, 2=interrupted,
+        # 3=internal error, 4=usage error, 5=no tests collected
+        if proc.returncode in (3, 4, 5):
+            return TestRunResult(
+                executed=True,
+                errors=1,
+                pytest_output=combined,
+            )
 
         # Parse individual test results from verbose output
         test_results = self._parse_test_results(stdout)
@@ -199,23 +218,44 @@ class TestRunner:
     def _parse_test_results(output: str) -> list[TestCaseResult]:
         """Parse pytest -v output for individual test pass/fail lines."""
         results: list[TestCaseResult] = []
+        # First pass: collect test names and statuses from verbose lines
+        # pytest -v format: "test_solution.py::test_case_1 PASSED"
         for line in output.splitlines():
-            # pytest -v format: "test_solution.py::test_case_1 PASSED"
             m = re.match(r".*?::(\w+)\s+(PASSED|FAILED|ERROR)", line)
             if m:
-                name = m.group(1)
-                status = m.group(2)
-                # Extract error if FAILED
-                error_msg = ""
-                if status in ("FAILED", "ERROR"):
-                    # Look for the short traceback after FAILURES section
-                    # We'll capture it from the full output later
-                    error_msg = f"Test {name} {status}"
                 results.append(TestCaseResult(
-                    name=name,
-                    passed=status == "PASSED",
-                    error_message=error_msg,
+                    name=m.group(1),
+                    passed=m.group(2) == "PASSED",
+                    error_message="",
                 ))
+
+        # Second pass: extract failure details from FAILURES section
+        # pytest --tb=short shows: "FAILED test_solution.py::test_case_1 - AssertionError: ..."
+        # or a short traceback block per failing test
+        failure_details: dict[str, str] = {}
+        lines = output.splitlines()
+        for i, line in enumerate(lines):
+            # Match short-form failure: "FAILED test_solution.py::name - reason"
+            m = re.match(r"FAILED\s+.*?::(\w+)\s*-\s*(.*)", line)
+            if m:
+                failure_details[m.group(1)] = m.group(2).strip()
+                continue
+            # Match "E       AssertionError" lines in traceback
+            if line.strip().startswith("E ") and i > 0:
+                # Find which test this belongs to by scanning backwards
+                for j in range(i - 1, max(i - 10, -1), -1):
+                    tm = re.match(r".*?::(\w+)", lines[j])
+                    if tm and tm.group(1) not in failure_details:
+                        failure_details[tm.group(1)] = line.strip()[2:].strip()
+                        break
+
+        # Attach error messages to results
+        for r in results:
+            if not r.passed and r.name in failure_details:
+                r.error_message = failure_details[r.name]
+            elif not r.passed and not r.error_message:
+                r.error_message = f"Test {r.name} failed"
+
         return results
 
     @staticmethod
