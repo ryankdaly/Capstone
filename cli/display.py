@@ -142,12 +142,17 @@ class DisplayManager:
             )
             return
 
-        all_pass = failed == 0 and errors == 0
-        border = "green" if all_pass else "red"
+        all_pass = failed == 0 and errors == 0 and total > 0
+        border = "green" if all_pass else "red" if (failed > 0 or errors > 0) else "yellow"
 
         parts: list[str] = []
-        if all_pass:
+        if total == 0 and errors == 0:
+            parts.append(f"[bold yellow]NO TESTS COLLECTED[/] — check pytest output with /checker")
+            border = "yellow"
+        elif all_pass:
             parts.append(f"[bold green]ALL PASSED[/] — {passed}/{total} tests")
+        elif errors > 0:
+            parts.append(f"[bold red]ERROR[/] — pytest collection or execution failed")
         else:
             parts.append(f"[bold red]{failed} FAILED[/] — {passed} passed, {total} total")
 
