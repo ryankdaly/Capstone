@@ -24,6 +24,7 @@ AGENT_STYLE = {
     "actor": ("Actor", "blue"),
     "checker": ("Checker", "yellow"),
     "dafny_verifier": ("Dafny Verifier", "magenta"),
+    "test_runner": ("Test Runner", "cyan"),
     "policy": ("Policy", "green"),
 }
 
@@ -54,6 +55,7 @@ class DisplayManager:
             StreamEventType.AGENT_START: self._on_agent_start,
             StreamEventType.AGENT_OUTPUT: self._on_agent_output,
             StreamEventType.AGENT_ERROR: self._on_agent_error,
+            StreamEventType.TEST_RUN: self._on_test_run,
             StreamEventType.ITERATION_COMPLETE: self._on_iteration_complete,
             StreamEventType.PIPELINE_COMPLETE: self._on_pipeline_complete,
         }
@@ -80,6 +82,11 @@ class DisplayManager:
         if agent == "dafny_verifier":
             console.print(
                 f"  [{color}]>[/] [bold {color}]{name}[/] verifying specification...",
+            )
+            return
+        if agent == "test_runner":
+            console.print(
+                f"  [{color}]>[/] [bold {color}]{name}[/] executing pytest...",
             )
             return
 
@@ -111,6 +118,57 @@ class DisplayManager:
                 f"[bold red]{error}[/]",
                 title="[bold red]Pipeline Error[/]",
                 border_style="red",
+            )
+        )
+
+    def _on_test_run(self, event: StreamEvent) -> None:
+        data = event.data
+        elapsed = self._elapsed("test_runner")
+        executed = data.get("executed", False)
+        total = data.get("total", 0)
+        passed = data.get("passed", 0)
+        failed = data.get("failed", 0)
+        errors = data.get("errors", 0)
+        test_results = data.get("test_results", [])
+
+        if not executed:
+            console.print(
+                Panel(
+                    f"[dim]{total} test(s) generated but not executed[/]",
+                    title="[bold cyan]Test Runner[/]",
+                    border_style="dim",
+                    padding=(0, 1),
+                )
+            )
+            return
+
+        all_pass = failed == 0 and errors == 0
+        border = "green" if all_pass else "red"
+
+        parts: list[str] = []
+        if all_pass:
+            parts.append(f"[bold green]ALL PASSED[/] — {passed}/{total} tests")
+        else:
+            parts.append(f"[bold red]{failed} FAILED[/] — {passed} passed, {total} total")
+
+        # Show individual test results
+        if test_results:
+            for tr in test_results:
+                name = tr.get("name", "?")
+                if tr.get("passed"):
+                    parts.append(f"  [green]✓[/] {name}")
+                else:
+                    err = tr.get("error_message", "")
+                    parts.append(f"  [red]✗[/] {name}")
+                    if err:
+                        parts.append(f"    [dim]{err[:100]}[/]")
+
+        console.print(
+            Panel(
+                "\n".join(parts),
+                title=f"[bold cyan]Test Runner[/] [dim]{elapsed}[/]",
+                border_style=border,
+                padding=(0, 1),
             )
         )
 
@@ -427,6 +485,7 @@ def show_help() -> None:
     table.add_row("/language <name>", "Set target language (Python, C, SPARK_Ada)")
     table.add_row("/iterations <n>", "Set max pipeline iterations")
     table.add_row("/stage <name>", "Set pipeline stage (actor, checker, policy)")
+    table.add_row("/run-tests <on|off>", "Toggle pytest execution of checker tests (default: on)")
     table.add_row("/last", "Detailed view of the last run (code, spec, verdicts)")
     table.add_row("/checker [N]", "Verbose checker report for iteration N (default: last)")
     table.add_row("/dafny [N]", "Verbose Dafny verification for iteration N (default: last)")
@@ -443,6 +502,7 @@ def show_help() -> None:
 def show_config(
     standard: str, language: str, max_iterations: int, model: str = "",
     stage: PipelineStage = PipelineStage.POLICY,
+    run_tests: bool = True,
 ) -> None:
     """Show current config."""
     console.print()
@@ -453,6 +513,9 @@ def show_config(
         console.print(f"  [bold]Model:[/]       {model}")
     stage_color = "yellow" if stage != PipelineStage.POLICY else "green"
     console.print(f"  [bold]Stage:[/]       [{stage_color}]{stage.value}[/]")
+    tests_color = "green" if run_tests else "red"
+    tests_label = "ON" if run_tests else "OFF"
+    console.print(f"  [bold]Run Tests:[/]   [{tests_color}]{tests_label}[/]")
     console.print()
 
 

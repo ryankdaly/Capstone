@@ -12,6 +12,7 @@ from backend.api.schemas.agents import (
     FeedbackMessage,
     PolicyVerdict,
     Severity,
+    TestRunResult,
     VerificationResult,
 )
 
@@ -21,16 +22,42 @@ def compose_feedback(
     checker_report: CheckerReport | None = None,
     verification_result: VerificationResult | None = None,
     policy_verdict: PolicyVerdict | None = None,
+    test_result: TestRunResult | None = None,
 ) -> FeedbackMessage:
     """Build a prioritized feedback message from all checker outputs.
 
     Priority order:
-    1. Formal verification failures (mathematical proof failed)
-    2. Critical checker issues (safety hazards)
-    3. Policy violations (compliance failures)
-    4. Major/minor checker issues
+    1. Test execution failures (ground truth — code actually crashed)
+    2. Formal verification failures (mathematical proof failed)
+    3. Critical checker issues (safety hazards)
+    4. Policy violations (compliance failures)
+    5. Major/minor checker issues
     """
     priority_parts: list[str] = []
+
+    # Priority 0: Actual test execution failures (highest priority — real evidence)
+    if test_result and test_result.executed and test_result.failed > 0:
+        failing_names = [
+            t.name for t in test_result.test_results if not t.passed
+        ]
+        priority_parts.append(
+            f"PYTEST FAILURES ({test_result.failed}/{test_result.total}): "
+            f"Tests that failed: {', '.join(failing_names[:5])}."
+        )
+        # Include truncated pytest output for context
+        if test_result.pytest_output:
+            # Get the FAILURES section if present
+            output = test_result.pytest_output
+            if "FAILED" in output:
+                # Extract just failure lines (not the full verbose output)
+                fail_lines = [
+                    line for line in output.splitlines()
+                    if "FAILED" in line or "AssertionError" in line or "Error" in line
+                ]
+                if fail_lines:
+                    priority_parts.append(
+                        "Pytest output: " + "; ".join(fail_lines[:5])
+                    )
 
     # Priority 1: Formal verification failures
     if verification_result and not verification_result.verified:

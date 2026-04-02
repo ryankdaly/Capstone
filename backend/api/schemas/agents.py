@@ -115,6 +115,29 @@ class PolicyVerdict(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Test Runner → TestRunResult
+# ---------------------------------------------------------------------------
+
+class TestCaseResult(BaseModel):
+    """Result of a single pytest test case."""
+    name: str = Field(..., description="Test function name")
+    passed: bool
+    error_message: str = ""
+
+
+class TestRunResult(BaseModel):
+    """Result of running pytest against Actor code + Checker tests."""
+    executed: bool = Field(default=False, description="Whether tests were actually run")
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    test_results: list[TestCaseResult] = Field(default_factory=list)
+    pytest_output: str = Field(default="", description="Raw pytest stdout/stderr")
+    execution_time_seconds: float = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Feedback (orchestrator → actor on loop iteration)
 # ---------------------------------------------------------------------------
 

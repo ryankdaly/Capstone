@@ -54,6 +54,7 @@ def run_pipeline(
     max_iterations: int,
     display: DisplayManager,
     stage: PipelineStage = PipelineStage.POLICY,
+    run_tests: bool = True,
 ) -> PipelineState | None:
     """Run the full pipeline in-process. Blocking call.
 
@@ -65,6 +66,7 @@ def run_pipeline(
         target_language=language,
         max_iterations=max_iterations,
         stage=stage,
+        run_tests=run_tests,
     )
 
     return asyncio.run(_run_async(request, display))

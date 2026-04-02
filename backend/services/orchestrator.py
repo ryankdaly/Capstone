@@ -18,6 +18,7 @@ from backend.api.schemas.agents import (
     CodeCandidate,
     FeedbackMessage,
     PolicyVerdict,
+    TestRunResult,
     VerificationResult,
 )
 from backend.api.schemas.pipeline import (
@@ -37,6 +38,7 @@ from backend.services.audit.logger import AuditLogger
 from backend.services.feedback import compose_feedback
 from backend.services.llm.client import LLMClient
 from backend.services.rag.retriever import StandardsRetriever
+from backend.services.testing.runner import TestRunner
 from backend.services.verification.dafny_runner import DafnyRunner
 
 logger = logging.getLogger(__name__)
@@ -63,11 +65,13 @@ class PipelineOrchestrator:
         dafny_runner: DafnyRunner | None = None,
         retriever: StandardsRetriever | None = None,
         audit_logger: AuditLogger | None = None,
+        test_runner: TestRunner | None = None,
     ) -> None:
         self._llm = llm_client or LLMClient()
         self._dafny = dafny_runner or DafnyRunner()
         self._retriever = retriever or StandardsRetriever()
         self._audit = audit_logger or AuditLogger()
+        self._test_runner = test_runner or TestRunner()
 
         # Agents
         self._actor = ActorAgent(self._llm)
@@ -146,6 +150,7 @@ class PipelineOrchestrator:
                 # --- CHECKER + DAFNY (parallel) — requires stage >= CHECKER ---
                 checker_report = None
                 verification_result = None
+                test_result: TestRunResult | None = None
 
                 # Guard: if Actor produced no Dafny spec, note it in feedback
                 has_dafny_spec = bool(code_candidate.dafny_spec and code_candidate.dafny_spec.strip())
@@ -191,6 +196,43 @@ class PipelineOrchestrator:
                     self._audit.log(run_id, "agent_output", agent="checker", data=checker_report.model_dump())
                     self._audit.log(run_id, "verification_result", data=verification_result.model_dump())
 
+                    # --- TEST EXECUTION (if enabled and language is Python) ---
+                    is_python = request.target_language.value == "Python"
+
+                    if (
+                        request.run_tests
+                        and is_python
+                        and checker_report.test_cases
+                    ):
+                        yield self._event(run_id, StreamEventType.AGENT_START, "test_runner")
+                        test_result = await self._test_runner.run(
+                            source_code=code_candidate.source_code,
+                            test_cases=checker_report.test_cases,
+                        )
+                        iteration.test_result = test_result
+
+                        yield self._event(
+                            run_id, StreamEventType.TEST_RUN, "test_runner",
+                            {
+                                "executed": test_result.executed,
+                                "total": test_result.total,
+                                "passed": test_result.passed,
+                                "failed": test_result.failed,
+                                "errors": test_result.errors,
+                                "test_results": [t.model_dump() for t in test_result.test_results],
+                                "pytest_output": test_result.pytest_output,
+                            },
+                        )
+                        self._audit.log(run_id, "test_run", data=test_result.model_dump())
+                    elif not request.run_tests and checker_report.test_cases:
+                        # Tests exist but not executed — store them
+                        test_result = TestRunResult(
+                            executed=False,
+                            total=len(checker_report.test_cases),
+                            pytest_output="Test execution disabled (run_tests=false).",
+                        )
+                        iteration.test_result = test_result
+
                 # --- POLICY — requires stage >= POLICY ---
                 policy_verdict = None
 
@@ -226,39 +268,47 @@ class PipelineOrchestrator:
 
                 # --- CONVERGENCE CHECK ---
                 # Dafny is best-effort: tracked and fed back, but does NOT gate convergence.
-                # Checker verdict (and Policy at full stage) determine pass/fail.
+                # Checker verdict + test results (and Policy at full stage) determine pass/fail.
                 dafny_ok = verification_result is not None and verification_result.verified
                 checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+                tests_ok = (
+                    test_result is None  # no tests = not a blocker
+                    or not test_result.executed  # tests disabled = not a blocker
+                    or test_result.failed == 0  # all tests passed
+                )
 
                 if max_stage == PipelineStage.ACTOR:
                     all_pass = True
                 elif max_stage == PipelineStage.CHECKER:
-                    # Checker verdict is the gate. Dafny is soft feedback.
-                    all_pass = checker_ok
+                    # Checker verdict + test results gate convergence. Dafny is soft.
+                    all_pass = checker_ok and tests_ok
 
                     feedback = compose_feedback(
                         iteration=i,
                         checker_report=checker_report,
                         verification_result=verification_result,
                         policy_verdict=None,
+                        test_result=test_result,
                     )
                     iteration.feedback = feedback
                 else:
-                    # Full pipeline — Checker + Policy must pass. Dafny is soft.
+                    # Full pipeline — Checker + Tests + Policy must pass. Dafny is soft.
                     policy_ok = policy_verdict is not None and policy_verdict.compliant
-                    all_pass = checker_ok and policy_ok
+                    all_pass = checker_ok and tests_ok and policy_ok
 
                     feedback = compose_feedback(
                         iteration=i,
                         checker_report=checker_report,
                         verification_result=verification_result,
                         policy_verdict=policy_verdict,
+                        test_result=test_result,
                     )
                     iteration.feedback = feedback
 
                 # Best-so-far tracking — detect regressions across iterations
                 score = (
                     (1.0 if checker_ok else 0.0)
+                    + (1.0 if tests_ok else 0.0)
                     + (0.5 if dafny_ok else 0.0)
                     + (0.25 if has_dafny_spec else 0.0)
                 )

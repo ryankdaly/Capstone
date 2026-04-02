@@ -64,6 +64,9 @@ class Session:
         except ValueError:
             self.stage = PipelineStage.POLICY
 
+        # Test execution flag
+        self.run_tests: bool = True
+
         # Run history (most recent last)
         self.history: list[RunRecord] = []
 
@@ -98,7 +101,7 @@ def _handle_command(line: str, session: Session) -> bool:
         show_help()
 
     elif cmd == "/config":
-        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage)
+        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage, session.run_tests)
 
     elif cmd == "/standard":
         if not arg:
@@ -157,6 +160,20 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/dafny":
         _show_dafny(session, arg)
+
+    elif cmd == "/run-tests":
+        if not arg:
+            status = "[green]ON[/]" if session.run_tests else "[red]OFF[/]"
+            console.print(f"  Test execution: {status}")
+            console.print("  [dim]Usage: /run-tests on  or  /run-tests off[/]")
+        elif arg.lower() in ("on", "true", "1", "yes"):
+            session.run_tests = True
+            console.print("  Test execution: [green]ON[/] — pytest will run checker tests")
+        elif arg.lower() in ("off", "false", "0", "no"):
+            session.run_tests = False
+            console.print("  Test execution: [red]OFF[/] — tests stored but not executed")
+        else:
+            show_error("Usage: /run-tests on  or  /run-tests off")
 
     elif cmd == "/audit":
         _show_audit(session)
@@ -234,6 +251,15 @@ def _show_last_run(session: Session) -> None:
             v_color = "green" if cr.verdict.value == "pass" else "red"
             console.print(f"\n  [bold]Checker:[/] [{v_color}]{v_label}[/] — {len(cr.issues)} issue(s), {len(cr.test_cases)} test case(s)")
 
+        # Test execution
+        if last_iter.test_result:
+            tr = last_iter.test_result
+            if tr.executed:
+                t_color = "green" if tr.failed == 0 else "red"
+                console.print(f"  [bold]Tests:[/]   [{t_color}]{tr.passed}/{tr.total} passed[/]  ({tr.execution_time_seconds:.1f}s)")
+            else:
+                console.print(f"  [bold]Tests:[/]   [dim]{tr.total} generated (not executed)[/]")
+
         # Dafny verification
         if last_iter.verification_result:
             vr = last_iter.verification_result
@@ -269,12 +295,13 @@ def _show_history(session: Session, n: int) -> None:
         show_lines=True,
     )
     table.add_column("#", style="dim", width=3, justify="right")
-    table.add_column("Requirement", max_width=40)
-    table.add_column("Status", width=10, justify="center")
-    table.add_column("Code", width=8, justify="center")
-    table.add_column("Dafny", width=8, justify="center")
-    table.add_column("Checker", width=10, justify="center")
-    table.add_column("Policy", width=12, justify="center")
+    table.add_column("Requirement", max_width=35)
+    table.add_column("Status", width=6, justify="center")
+    table.add_column("Code", width=6, justify="center")
+    table.add_column("Tests", width=8, justify="center")
+    table.add_column("Dafny", width=6, justify="center")
+    table.add_column("Checker", width=8, justify="center")
+    table.add_column("Policy", width=8, justify="center")
     table.add_column("Time", width=6, justify="right")
 
     offset = len(session.history) - len(runs)
@@ -292,11 +319,19 @@ def _show_history(session: Session, n: int) -> None:
         # Dafny
         dafny_str = "[green]Yes[/]" if state.final_proof else "[dim]No[/]"
 
-        # Checker (from last iteration)
+        # Tests (from last iteration)
+        tests_str = "[dim]—[/]"
         checker_str = "[dim]—[/]"
         policy_str = "[dim]—[/]"
         if state.iterations:
             last_iter = state.iterations[-1]
+            if last_iter.test_result:
+                tr = last_iter.test_result
+                if tr.executed:
+                    t_color = "green" if tr.failed == 0 else "red"
+                    tests_str = f"[{t_color}]{tr.passed}/{tr.total}[/]"
+                else:
+                    tests_str = f"[dim]{tr.total}t[/]"
             if last_iter.checker_report:
                 cv = last_iter.checker_report.verdict.value
                 c_color = "green" if cv == "pass" else "red"
@@ -310,11 +345,11 @@ def _show_history(session: Session, n: int) -> None:
         time_str = f"{record.elapsed_seconds:.1f}s"
 
         # Truncate requirement
-        req = record.requirement[:38]
-        if len(record.requirement) > 38:
+        req = record.requirement[:33]
+        if len(record.requirement) > 33:
             req += ".."
 
-        table.add_row(str(idx), req, status_str, code_str, dafny_str, checker_str, policy_str, time_str)
+        table.add_row(str(idx), req, status_str, code_str, tests_str, dafny_str, checker_str, policy_str, time_str)
 
     console.print()
     console.print(table)
@@ -594,6 +629,7 @@ def start_repl() -> None:
                 max_iterations=session.max_iterations,
                 display=display,
                 stage=session.stage,
+                run_tests=session.run_tests,
             )
             elapsed = time.monotonic() - run_start
             if state is not None:
