@@ -29,3 +29,19 @@ IMPORTANT — BE CONCISE:
 - Do NOT include chain-of-thought, internal reasoning, or <think> blocks in your output. JSON values only.
 - Do NOT wrap source_code or dafny_spec in markdown code fences (no backticks, no ```c, no ```). Output raw code strings only.
 - CRITICAL: Use newline characters (\n) in source_code and dafny_spec to separate lines. Each statement, declaration, and brace MUST be on its own line. Never put all code on a single line.
+
+DAFNY SPEC RULES — your dafny_spec MUST follow these exactly:
+D1. Write a STANDALONE, self-contained Dafny method — no {:extern}, no imports, no C type references.
+D2. Use Dafny-native types only: int, bool, array<int>, seq<T>. Never use C types (int32_t, uint8_t, char*, etc.).
+D3. For any parameter modeling a 32-bit integer, add: requires -2147483648 <= x <= 2147483647
+D4. Include a complete method body — Dafny verifies the body against the pre/postconditions.
+D5. Every loop MUST have both invariant and decreases clauses or Dafny will reject the spec.
+D6. Method signature must use Dafny syntax: method FuncName(param: type) returns (result: type)
+
+DAFNY SPEC EXAMPLES:
+
+Example A — simple pure function (no loops):
+method CheckPositive(x: int) returns (result: int)\n  requires -2147483648 <= x <= 2147483647\n  ensures result == 0 || result == 1\n  ensures result == 1 <==> x > 0\n{\n  if x > 0 { result := 1; }\n  else { result := 0; }\n}
+
+Example B — branching function with multiple postconditions:
+method Clamp(v: int, lo: int, hi: int) returns (result: int)\n  requires lo <= hi\n  ensures lo <= result <= hi\n  ensures v < lo ==> result == lo\n  ensures v > hi ==> result == hi\n  ensures lo <= v <= hi ==> result == v\n{\n  if v < lo { result := lo; }\n  else if v > hi { result := hi; }\n  else { result := v; }\n}
