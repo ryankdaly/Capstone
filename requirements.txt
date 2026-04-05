@@ -14,8 +14,11 @@ typer
 rich
 
 # RAG (optional — system works without these)
-chromadb
-sentence-transformers
+torch==2.2.2
+numpy<2.0
+sentence-transformers==2.5.0
+transformers==4.37.2
+chromadb>=0.4.0
 
 # Dashboard (optional)
 streamlit
