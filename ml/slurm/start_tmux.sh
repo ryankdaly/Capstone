@@ -43,7 +43,7 @@ pip install  -r "$PROJECT_DIR/requirements.txt"
 # vLLM is GPU-only infrastructure, kept separate from requirements.txt.
 if ! python -c "import vllm" 2>/dev/null; then
     echo ">>> vLLM not found — installing (this may take a few minutes)..."
-    pip install -q vllm
+    pip install vllm
     echo ">>> vLLM installed."
 else
     echo ">>> vLLM already installed — skipping."
