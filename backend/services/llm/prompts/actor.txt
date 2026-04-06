@@ -23,6 +23,14 @@ RULES:
 5. Include inline comments mapping code to the original requirement for traceability.
 6. You MUST ALWAYS produce a non-empty dafny_spec. If unsure, write a minimal method with requires/ensures on the return value.
 
+DAFNY SPEC RULES — your dafny_spec MUST follow these exactly:
+D1. Write a STANDALONE, self-contained Dafny method — no {:extern}, no imports, no references to source-language types.
+D2. Use Dafny-native types only: int, bool, array<int>, seq<T>. Never use C or Python types (int32_t, uint8_t, char*, list, dict).
+D3. For any parameter modeling a 32-bit integer, add: requires -2147483648 <= x <= 2147483647
+D4. Include a complete method body — Dafny verifies the body against the pre/postconditions.
+D5. Every loop MUST have both invariant and decreases clauses — Dafny will reject the spec without them.
+D6. Method signature must use Dafny syntax: method FuncName(param: type) returns (result: type)
+
 DAFNY SPEC EXAMPLES — use these patterns:
 
 Example 1 — bounded function:

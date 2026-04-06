@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import tempfile
 import time
@@ -28,7 +29,7 @@ class DafnyRunner:
         timeout: int | None = None,
         solver_path: str | None = None,
     ) -> None:
-        self._binary = binary_path or settings.verification.binary_path
+        self._binary = os.path.expanduser(binary_path or settings.verification.binary_path)
         self._timeout = timeout or settings.verification.timeout_seconds
         self._solver_path = solver_path or settings.verification.solver_path
 
