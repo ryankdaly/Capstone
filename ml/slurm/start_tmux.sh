@@ -31,6 +31,25 @@ if command -v nvidia-smi &>/dev/null; then
 fi
 echo ""
 
+# -----------------------------------------------------------
+# Dependency setup (runs once before tmux session starts)
+# -----------------------------------------------------------
+
+# Install app requirements if any are missing
+echo ">>> Installing app dependencies..."
+pip install  -r "$PROJECT_DIR/requirements.txt"
+
+# Install vLLM if not already present.
+# vLLM is GPU-only infrastructure, kept separate from requirements.txt.
+if ! python -c "import vllm" 2>/dev/null; then
+    echo ">>> vLLM not found — installing (this may take a few minutes)..."
+    pip install -q vllm
+    echo ">>> vLLM installed."
+else
+    echo ">>> vLLM already installed — skipping."
+fi
+echo ""
+
 # Kill existing session if any
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
