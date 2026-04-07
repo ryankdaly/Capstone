@@ -10,7 +10,9 @@ import time
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -48,6 +50,29 @@ class DisplayManager:
         self.last_checker_output: dict[str, Any] = {}
         self.last_dafny_output: dict[str, Any] = {}
         self.last_policy_output: dict[str, Any] = {}
+        # Live spinner — active between AGENT_START and the first output event
+        self._live: Live | None = None
+
+    # ------------------------------------------------------------------
+    # Spinner helpers
+    # ------------------------------------------------------------------
+
+    def _start_spinner(self, label: str, color: str) -> None:
+        """Start an animated spinner line. Replaces any existing spinner."""
+        self._stop_spinner()
+        spinner = Spinner("dots", text=Text.from_markup(f"  [bold {color}]{label}[/]"), style=color)
+        self._live = Live(spinner, refresh_per_second=12, transient=True, console=console)
+        self._live.start()
+
+    def _stop_spinner(self) -> None:
+        """Stop and erase the current spinner. No-op if none is running."""
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def cleanup(self) -> None:
+        """Force-stop any running spinner. Call from exception handlers."""
+        self._stop_spinner()
 
     def handle_event(self, event: StreamEvent) -> None:
         """Route a stream event to the appropriate display method."""
@@ -73,29 +98,22 @@ class DisplayManager:
         self._agent_start_times[agent] = time.monotonic()
 
         if agent == "checker":
-            # Checker and Dafny start together (parallel) — show combined
+            # Checker and Dafny run in parallel — one spinner covers both
             console.print()
-            console.print(
-                f"  [{color}]>[/] [bold {color}]{name}[/] reviewing code...",
-            )
+            self._start_spinner("Checker  +  Dafny Verifier  working...", "yellow")
             return
         if agent == "dafny_verifier":
-            console.print(
-                f"  [{color}]>[/] [bold {color}]{name}[/] verifying specification...",
-            )
+            # Spinner already running from checker start — nothing to do
             return
         if agent == "test_runner":
-            console.print(
-                f"  [{color}]>[/] [bold {color}]{name}[/] executing pytest...",
-            )
+            self._start_spinner("Test Runner  executing pytest...", "cyan")
             return
 
         console.print()
-        console.print(
-            f"  [{color}]>[/] [bold {color}]{name}[/] working...",
-        )
+        self._start_spinner(f"{name}  working...", color)
 
     def _on_agent_output(self, event: StreamEvent) -> None:
+        self._stop_spinner()
         agent = event.agent or "unknown"
         data = event.data
         name, color = AGENT_STYLE.get(agent, (agent, "white"))
@@ -111,6 +129,7 @@ class DisplayManager:
             self._render_policy(name, color, data, elapsed)
 
     def _on_agent_error(self, event: StreamEvent) -> None:
+        self._stop_spinner()
         error = event.data.get("error", "Unknown error")
         console.print()
         console.print(
@@ -122,6 +141,7 @@ class DisplayManager:
         )
 
     def _on_test_run(self, event: StreamEvent) -> None:
+        self._stop_spinner()
         data = event.data
         elapsed = self._elapsed("test_runner")
         executed = data.get("executed", False)
@@ -178,6 +198,7 @@ class DisplayManager:
         )
 
     def _on_iteration_complete(self, event: StreamEvent) -> None:
+        self._stop_spinner()
         data = event.data
         iteration = data.get("iteration", "?")
         all_pass = data.get("all_pass", False)
@@ -201,6 +222,7 @@ class DisplayManager:
             console.print(f"  [dim]Composing feedback for next iteration...[/]")
 
     def _on_pipeline_complete(self, event: StreamEvent) -> None:
+        self._stop_spinner()
         data = event.data
         status = data.get("status", "unknown")
         iterations = data.get("iterations", 0)

@@ -17,6 +17,78 @@ from rich.table import Table
 
 from backend.api.schemas.pipeline import PipelineStage, PipelineState
 from backend.config import load_config
+
+# ---------------------------------------------------------------------------
+# prompt_toolkit — optional, degrades gracefully to plain input if missing
+# ---------------------------------------------------------------------------
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import InMemoryHistory
+    _PT_AVAILABLE = True
+except ImportError:
+    _PT_AVAILABLE = False
+
+
+# One-line description shown next to each command in the completion menu
+_CMD_META: dict[str, str] = {
+    "/standard":   "set safety standard",
+    "/language":   "set target language",
+    "/stage":      "set pipeline stage",
+    "/run-tests":  "toggle pytest execution",
+    "/iterations": "set max iterations",
+    "/last":       "show last run details",
+    "/checker":    "verbose checker report [N]",
+    "/dafny":      "verbose Dafny output [N]",
+    "/pytest":     "full pytest output [N]",
+    "/history":    "show run history [N]",
+    "/audit":      "traceability matrix",
+    "/config":     "show current config",
+    "/help":       "show all commands",
+    "/quit":       "exit HPEMA",
+    "/exit":       "exit HPEMA",
+}
+
+_CMD_ARGS: dict[str, list[str]] = {
+    "/standard":  ["DO_178C", "MISRA_C", "NASA", "Boeing_SDP"],
+    "/language":  ["Python", "C", "SPARK_Ada"],
+    "/stage":     ["actor", "checker", "policy"],
+    "/run-tests": ["on", "off"],
+}
+
+
+if _PT_AVAILABLE:
+    class _HpemaCompleter(Completer):
+        """Tab/ghost-text completer for HPEMA slash commands."""
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("/"):
+                return  # free-text requirement — no completions
+
+            parts = text.split(maxsplit=1)
+
+            if len(parts) == 1:
+                # Complete the command name itself
+                word = parts[0]
+                for cmd in sorted(_CMD_META):
+                    if cmd.startswith(word) and cmd != word:
+                        yield Completion(
+                            cmd[len(word):],
+                            display=cmd,
+                            display_meta=_CMD_META.get(cmd, ""),
+                        )
+            elif len(parts) == 2:
+                # Complete the argument
+                cmd, arg_prefix = parts[0].lower(), parts[1]
+                for opt in _CMD_ARGS.get(cmd, []):
+                    if opt.lower().startswith(arg_prefix.lower()):
+                        yield Completion(opt[len(arg_prefix):], display=opt)
+
+
 from cli.display import (
     DisplayManager,
     console,
@@ -619,10 +691,24 @@ def start_repl() -> None:
         console.print(f"  [red]LLM not reachable[/] at {endpoint}")
         console.print(f"  [dim]Start vLLM first, or check hpema_config[/]\n")
 
+    # Build input function — prompt_toolkit if available, plain fallback otherwise
+    if _PT_AVAILABLE:
+        _pt_session: PromptSession = PromptSession(
+            completer=_HpemaCompleter(),
+            history=InMemoryHistory(),
+            auto_suggest=AutoSuggestFromHistory(),
+            complete_while_typing=True,
+        )
+        def _get_input() -> str:
+            return _pt_session.prompt(HTML("<b><ansibrightblue>hpema ></ansibrightblue></b> "))
+    else:
+        def _get_input() -> str:  # type: ignore[misc]
+            return console.input("[bold bright_blue]hpema >[/] ")
+
     # REPL loop
     while True:
         try:
-            line = console.input("[bold bright_blue]hpema >[/] ").strip()
+            line = _get_input().strip()
         except (EOFError, KeyboardInterrupt):
             _show_goodbye(session)
             break
@@ -663,6 +749,8 @@ def start_repl() -> None:
                     elapsed_seconds=elapsed,
                 ))
         except KeyboardInterrupt:
+            display.cleanup()
             console.print("\n  [yellow]Pipeline interrupted.[/]")
         except Exception as e:
+            display.cleanup()
             show_error(str(e))
