@@ -435,15 +435,8 @@ class DisplayManager:
         return f"{time.monotonic() - start:.1f}s"
 
 
-def show_banner(
-    config_source: str = "",
-    model: str = "",
-    standard: str = "DO_178C",
-    language: str = "Python",
-    stage: PipelineStage = PipelineStage.POLICY,
-) -> None:
-    """Show the startup banner with gradient HPEMA logo."""
-    # --- Gradient logo ---
+def show_logo() -> None:
+    """Print the HPEMA block-letter gradient logo centered on screen."""
     logo = Text(justify="center")
     for i, (line, color) in enumerate(zip(_LOGO_LINES, _LOGO_COLORS)):
         logo.append(line, style=f"bold {color}")
@@ -451,12 +444,31 @@ def show_banner(
             logo.append("\n")
 
     subtitle = Text(
-        "Hierarchical Policy-Enforced Multi-Agent  ·  v0.1.0",
+        "Hierarchical Policy-Enforced Multi-Agent  ·  v0.2.0",
         style="dim",
         justify="center",
     )
 
-    # --- Info block ---
+    console.print()
+    console.print(Panel(
+        Group(
+            Align.center(logo),
+            Align.center(subtitle),
+        ),
+        border_style="bright_blue",
+        padding=(1, 3),
+    ))
+    console.print()
+
+
+def show_startup_info(
+    config_source: str = "",
+    model: str = "",
+    standard: str = "DO_178C",
+    language: str = "Python",
+    stage: PipelineStage = PipelineStage.POLICY,
+) -> None:
+    """Print configuration info block (shown after the logo)."""
     stage_labels = {
         PipelineStage.ACTOR:   "Actor only",
         PipelineStage.CHECKER: "Actor + Checker",
@@ -488,15 +500,29 @@ def show_banner(
 
     console.print()
     console.print(Panel(
-        Group(
-            Align.center(logo),
-            Align.center(subtitle),
-            info,
-        ),
+        info,
         border_style="bright_blue",
         padding=(1, 3),
     ))
     console.print()
+
+
+def show_banner(
+    config_source: str = "",
+    model: str = "",
+    standard: str = "DO_178C",
+    language: str = "Python",
+    stage: PipelineStage = PipelineStage.POLICY,
+) -> None:
+    """Show the startup banner (logo + info). Kept for backward compat."""
+    show_logo()
+    show_startup_info(
+        config_source=config_source,
+        model=model,
+        standard=standard,
+        language=language,
+        stage=stage,
+    )
 
 
 def show_disconnected_warning(stage: PipelineStage) -> None:
@@ -771,18 +797,25 @@ def show_pytest_detail(iteration: "IterationRecord", iter_num: int) -> None:
 
 
 def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300) -> None:
-    """Animate health checks for every LLM layer until all are ready or Ctrl+C.
+    """Animate health checks for every LLM layer until all are ready or Ctrl+S.
 
-    - Local endpoints (localhost / vLLM): polled via /health until 200 OK.
-    - External API endpoints (OpenAI, Groq, Nvidia …): marked ready immediately
-      — no polling needed, keys are validated at inference time.
+    - Local endpoints (localhost / vLLM): polled in parallel via /health until 200 OK.
+      Unreachable layers keep retrying — they do not permanently fail.
+    - External API endpoints (OpenAI, Groq, Nvidia …): marked ready immediately.
     - Policy layer when stage < POLICY: shown as Disconnected, skipped.
 
-    Press Ctrl+C at any time to skip and proceed to the REPL.
+    Press Ctrl+S to skip and begin prompting immediately.
     """
-    import httpx
+    import concurrent.futures
+    import os
+    import select
+    import sys
+    import termios
+    import threading
 
     _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    # Poll unreachable local endpoints every N seconds (not every second)
+    _POLL_INTERVAL = 5.0
 
     layer_cfgs = [
         ("Actor",   config.models.actor),
@@ -790,7 +823,8 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
         ("Policy",  config.models.policy),
     ]
 
-    # None = pending, True = ready, False = unreachable, "disconnected" = skipped
+    # None = first check pending, True = ready, False = unreachable (will retry),
+    # "disconnected" = intentionally skipped
     statuses: dict[str, Any] = {}
     for name, _ in layer_cfgs:
         if name == "Policy" and stage != PipelineStage.POLICY:
@@ -803,8 +837,9 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
 
     def _check(ep: str) -> bool:
         if not _is_local(ep):
-            return True  # external API — assume reachable
+            return True  # external API — validated at inference time
         try:
+            import httpx
             base = ep.rstrip("/").rsplit("/v1", 1)[0]
             r = httpx.get(f"{base}/health", timeout=3.0)
             return r.status_code == 200
@@ -813,21 +848,27 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
 
     def _build_panel(frame: str, elapsed: float) -> Panel:
         table = Table(box=None, show_header=False, padding=(0, 2))
-        table.add_column(width=3,  justify="center")  # icon
-        table.add_column(width=9)                      # name
-        table.add_column(width=40)                     # endpoint
-        table.add_column(width=18)                     # state
+        table.add_column(width=3,  justify="center")
+        table.add_column(width=9)
+        table.add_column(width=40)
+        table.add_column(width=18)
 
         for name, cfg in layer_cfgs:
             ep     = cfg.endpoint
             status = statuses[name]
 
             if status == "disconnected":
-                icon, ep_s, state = "[dim]○[/]", f"[dim]{ep}[/]", "[dim]Disconnected[/]"
+                icon  = "[dim]○[/]"
+                ep_s  = f"[dim]{ep}[/]"
+                state = "[dim]Disconnected[/]"
             elif status is True:
-                icon, ep_s, state = "[bold green]✓[/]", ep, "[bold green]Ready[/]"
+                icon  = "[bold green]✓[/]"
+                ep_s  = ep
+                state = "[bold green]Ready[/]"
             elif status is False:
-                icon, ep_s, state = "[bold red]✗[/]", f"[red]{ep}[/]", "[bold red]Unreachable[/]"
+                icon  = f"[bold yellow]{frame}[/]"
+                ep_s  = f"[yellow]{ep}[/]"
+                state = "[yellow]Retrying...[/]"
             else:
                 icon  = f"[bold blue]{frame}[/]"
                 ep_s  = ep
@@ -835,7 +876,7 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
 
             table.add_row(icon, f"[bold]{name}[/]", ep_s, state)
 
-        hint = Text("\n  Press Ctrl+C to skip and proceed", style="dim")
+        hint = Text("\n  Press Ctrl+S to skip and begin prompting", style="dim")
         elapsed_s = f"{elapsed:.0f}s"
 
         return Panel(
@@ -845,9 +886,37 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
             padding=(1, 2),
         )
 
-    start    = time.monotonic()
-    frame_i  = 0
-    all_done = False
+    # --- Ctrl+S background listener ---
+    skip_event = threading.Event()
+    stop_event = threading.Event()
+
+    def _listen_for_skip() -> None:
+        if not sys.stdin.isatty():
+            return
+        try:
+            fd = sys.stdin.fileno()
+            old_attrs = termios.tcgetattr(fd)
+            new_attrs = list(old_attrs)
+            new_attrs[0] = new_attrs[0] & ~termios.IXON          # disable XON/XOFF (Ctrl+S/Q)
+            new_attrs[3] = new_attrs[3] & ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+            try:
+                while not stop_event.is_set():
+                    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if r:
+                        ch = os.read(fd, 1)
+                        if ch == b'\x13':  # Ctrl+S
+                            skip_event.set()
+                            break
+            finally:
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+        except Exception:
+            pass  # non-tty stdin (redirected / CI) — silently disabled
+
+    threading.Thread(target=_listen_for_skip, daemon=True).start()
+
+    start   = time.monotonic()
+    frame_i = 0
 
     try:
         with Live(console=console, refresh_per_second=8) as live:
@@ -856,28 +925,34 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
                 frame   = _FRAMES[frame_i % len(_FRAMES)]
                 frame_i += 1
 
-                # Check every pending layer
-                for name, cfg in layer_cfgs:
-                    if statuses[name] is None:
-                        statuses[name] = _check(cfg.endpoint)
+                # Parallel health checks for every layer that isn't settled yet
+                pending = [n for n, s in statuses.items() if s is None or s is False]
+                if pending:
+                    cfg_map = {name: cfg for name, cfg in layer_cfgs}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(pending), 1)) as pool:
+                        futures = {pool.submit(_check, cfg_map[n].endpoint): n for n in pending}
+                        for fut in concurrent.futures.as_completed(futures):
+                            statuses[futures[fut]] = fut.result()
 
                 live.update(_build_panel(frame, elapsed))
 
-                pending  = [n for n, s in statuses.items() if s is None]
-                all_done = not pending
-
-                if all_done or elapsed > max_wait:
+                all_done = all(s is True or s == "disconnected" for s in statuses.values())
+                if all_done or elapsed > max_wait or skip_event.is_set():
                     break
 
-                time.sleep(2.0)
+                # Sleep in small increments so Ctrl+S is noticed quickly
+                waited = 0.0
+                while waited < _POLL_INTERVAL and not skip_event.is_set():
+                    time.sleep(0.25)
+                    waited += 0.25
+                    frame_i += 1
+                    live.update(_build_panel(_FRAMES[frame_i % len(_FRAMES)], time.monotonic() - start))
 
-    except KeyboardInterrupt:
+    finally:
+        stop_event.set()
+
+    if skip_event.is_set():
         console.print("\n  [yellow]Connectivity check skipped — proceeding.[/]\n")
-        return
-
-    # Print the final resolved state (stays visible after Live exits)
-    console.print(_build_panel("✓", time.monotonic() - start))
-    console.print()
 
 
 def show_error(message: str) -> None:

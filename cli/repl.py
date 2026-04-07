@@ -99,7 +99,9 @@ from cli.display import (
     show_disconnected_warning,
     show_error,
     show_help,
+    show_logo,
     show_pytest_detail,
+    show_startup_info,
     wait_for_layers_ready,
 )
 from cli.runner import run_pipeline
@@ -659,6 +661,9 @@ def _show_audit(session: Session) -> None:
 
 def start_repl() -> None:
     """Launch the interactive REPL."""
+    # Rule 1: clear terminal noise from previous session
+    console.clear()
+
     session = Session()
 
     # Detect config source
@@ -666,7 +671,10 @@ def start_repl() -> None:
     env_config = os.environ.get("HPEMA_CONFIG", "hpema_config.yaml")
     session.config_source = env_config
 
-    show_banner(
+    # Rule 2: logo first, 1.5s pause, then config info
+    show_logo()
+    time.sleep(1.5)
+    show_startup_info(
         config_source=env_config,
         model=session.model,
         standard=session.standard,
@@ -678,7 +686,8 @@ def start_repl() -> None:
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
 
-    # Animated layer connectivity check — polls until all layers ready or Ctrl+C
+    # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
+    # Chat bar is naturally blocked until this returns.
     config = load_config()
     wait_for_layers_ready(config, session.stage)
 
