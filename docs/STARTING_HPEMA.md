@@ -56,7 +56,13 @@ You should see an L40S (or similar) listed. If this command errors, you are not 
 
 ---
 
-## 4. Activate the Project Environment
+## 4. Load Python3.11 and Activate the Project Environment
+
+```bash
+module load Python/3.11.5-GCCcore-13.2.0
+```
+
+This is needed to make sure some Python 3.10+ syntax works. Next:
 
 ```bash
 cd /projects/meng/Capstone
