@@ -17,6 +17,23 @@ set -e
 
 SESSION="hpema"
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# -----------------------------------------------------------
+# Load secrets from .env (gitignored — never committed)
+# Variables exported here are inherited by all tmux panes.
+# -----------------------------------------------------------
+ENV_FILE="$PROJECT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    echo ">>> Loading secrets from .env"
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+else
+    echo ">>> WARNING: .env not found at $ENV_FILE"
+    echo "    Copy .env.example to .env and fill in your keys."
+    echo ""
+fi
 CONFIG="hpema_config.arc.yaml"
 MODEL="Qwen/Qwen2.5-Coder-7B-Instruct"
 VLLM_PORT=8001
@@ -67,12 +84,9 @@ python -m vllm.entrypoints.openai.api_server \
 # Pane 1: CLI (split horizontal)
 tmux split-window -h -t "$SESSION:0" -c "$PROJECT_DIR"
 tmux send-keys -t "$SESSION:0.1" "echo '=== PANE 1: HPEMA CLI ===' && \
-echo 'Waiting 10s for the sake of 10s...' && \
+echo 'Waiting 10s for vLLM to start...' && \
 sleep 10 && \
 export HPEMA_CONFIG=$CONFIG && \
-export HPEMA_API_KEY=unused && \
-export NVIDIA_API_KEY=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 && \
-export ANONYMIZED_TELEMETRY=False && \
 python -m cli.main" Enter
 
 # Attach
