@@ -9,7 +9,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from rich.console import Console
+from rich.align import Align
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.spinner import Spinner
@@ -20,6 +21,28 @@ from rich.text import Text
 from backend.api.schemas.pipeline import PipelineStage, StreamEvent, StreamEventType
 
 console = Console()
+
+# ---------------------------------------------------------------------------
+# HPEMA logo — ANSI Shadow block-letter style, blue top-to-bottom gradient
+# ---------------------------------------------------------------------------
+
+_LOGO_LINES = [
+    "██╗  ██╗██████╗ ███████╗███╗   ███╗ █████╗ ",
+    "██║  ██║██╔══██╗██╔════╝████╗ ████║██╔══██╗",
+    "███████║██████╔╝█████╗  ██╔████╔██║███████║",
+    "██╔══██║██╔═══╝ ██╔══╝  ██║╚██╔╝██║██╔══██║",
+    "██║  ██║██║     ███████╗██║ ╚═╝ ██║██║  ██║",
+    "╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝",
+]
+# True-color gradient: light sky blue → royal blue → navy shadow
+_LOGO_COLORS = [
+    "#87CEFF",
+    "#6AAFD6",
+    "#4D92BE",
+    "#3175A6",
+    "#1C5A8E",
+    "#112E55",
+]
 
 # Agent role → (display name, color)
 AGENT_STYLE = {
@@ -419,42 +442,61 @@ def show_banner(
     language: str = "Python",
     stage: PipelineStage = PipelineStage.POLICY,
 ) -> None:
-    """Show the startup banner."""
-    lines = [
-        "[bold]HPEMA[/] v0.1.0",
-        "[dim]Hierarchical Policy-Enforced Multi-Agent[/]",
-        "",
-    ]
-    if model:
-        lines.append(f"  Model:    {model}")
-    if config_source:
-        lines.append(f"  Config:   {config_source}")
-    lines.append(f"  Standard: {standard}")
-    lines.append(f"  Language: {language}")
-    lines.append(f"  Prover:   Dafny")
+    """Show the startup banner with gradient HPEMA logo."""
+    # --- Gradient logo ---
+    logo = Text(justify="center")
+    for i, (line, color) in enumerate(zip(_LOGO_LINES, _LOGO_COLORS)):
+        logo.append(line, style=f"bold {color}")
+        if i < len(_LOGO_LINES) - 1:
+            logo.append("\n")
 
-    # Show stage info
+    subtitle = Text(
+        "Hierarchical Policy-Enforced Multi-Agent  ·  v0.1.0",
+        style="dim",
+        justify="center",
+    )
+
+    # --- Info block ---
     stage_labels = {
-        PipelineStage.ACTOR: "Actor only (disconnected)",
-        PipelineStage.CHECKER: "Actor + Checker (disconnected)",
-        PipelineStage.POLICY: "Full pipeline",
+        PipelineStage.ACTOR:   "Actor only",
+        PipelineStage.CHECKER: "Actor + Checker",
+        PipelineStage.POLICY:  "Full pipeline",
     }
     stage_label = stage_labels.get(stage, stage.value)
-    if stage != PipelineStage.POLICY:
-        lines.append(f"  Stage:    [bold yellow]{stage_label}[/]")
-    else:
-        lines.append(f"  Stage:    {stage_label}")
+    stage_style = "yellow" if stage != PipelineStage.POLICY else "green"
 
-    lines.append("")
-    lines.append("  [dim]Type a requirement to begin, or /help[/]")
+    info = Text(justify="left")
+    info.append("\n")
+    if model:
+        info.append("  Model    ", style="dim")
+        info.append(f"{model}\n")
+    if config_source:
+        info.append("  Config   ", style="dim")
+        info.append(f"{config_source}\n")
+    info.append("  Standard ", style="dim")
+    info.append(f"{standard}  ", style="bold")
+    info.append("  Language ", style="dim")
+    info.append(f"{language}  ", style="bold")
+    info.append("  Prover ", style="dim")
+    info.append("Dafny\n", style="bold")
+    info.append("  Stage    ", style="dim")
+    info.append(f"{stage_label}\n", style=f"bold {stage_style}")
+    info.append("\n  ")
+    info.append("Type a requirement to begin", style="dim")
+    info.append("  or  ", style="dim")
+    info.append("/help", style="bold cyan")
 
-    console.print(
-        Panel(
-            "\n".join(lines),
-            border_style="bright_blue",
-            padding=(1, 2),
-        )
-    )
+    console.print()
+    console.print(Panel(
+        Group(
+            Align.center(logo),
+            Align.center(subtitle),
+            info,
+        ),
+        border_style="bright_blue",
+        padding=(1, 3),
+    ))
+    console.print()
 
 
 def show_disconnected_warning(stage: PipelineStage) -> None:
@@ -725,6 +767,116 @@ def show_pytest_detail(iteration: "IterationRecord", iter_num: int) -> None:
         console.print(f"\n  [bold]Raw pytest output:[/]")
         console.print(_Syntax(output, "text", theme="monokai", padding=1))
 
+    console.print()
+
+
+def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300) -> None:
+    """Animate health checks for every LLM layer until all are ready or Ctrl+C.
+
+    - Local endpoints (localhost / vLLM): polled via /health until 200 OK.
+    - External API endpoints (OpenAI, Groq, Nvidia …): marked ready immediately
+      — no polling needed, keys are validated at inference time.
+    - Policy layer when stage < POLICY: shown as Disconnected, skipped.
+
+    Press Ctrl+C at any time to skip and proceed to the REPL.
+    """
+    import httpx
+
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    layer_cfgs = [
+        ("Actor",   config.models.actor),
+        ("Checker", config.models.checker),
+        ("Policy",  config.models.policy),
+    ]
+
+    # None = pending, True = ready, False = unreachable, "disconnected" = skipped
+    statuses: dict[str, Any] = {}
+    for name, _ in layer_cfgs:
+        if name == "Policy" and stage != PipelineStage.POLICY:
+            statuses[name] = "disconnected"
+        else:
+            statuses[name] = None
+
+    def _is_local(ep: str) -> bool:
+        return any(h in ep for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+
+    def _check(ep: str) -> bool:
+        if not _is_local(ep):
+            return True  # external API — assume reachable
+        try:
+            base = ep.rstrip("/").rsplit("/v1", 1)[0]
+            r = httpx.get(f"{base}/health", timeout=3.0)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _build_panel(frame: str, elapsed: float) -> Panel:
+        table = Table(box=None, show_header=False, padding=(0, 2))
+        table.add_column(width=3,  justify="center")  # icon
+        table.add_column(width=9)                      # name
+        table.add_column(width=40)                     # endpoint
+        table.add_column(width=18)                     # state
+
+        for name, cfg in layer_cfgs:
+            ep     = cfg.endpoint
+            status = statuses[name]
+
+            if status == "disconnected":
+                icon, ep_s, state = "[dim]○[/]", f"[dim]{ep}[/]", "[dim]Disconnected[/]"
+            elif status is True:
+                icon, ep_s, state = "[bold green]✓[/]", ep, "[bold green]Ready[/]"
+            elif status is False:
+                icon, ep_s, state = "[bold red]✗[/]", f"[red]{ep}[/]", "[bold red]Unreachable[/]"
+            else:
+                icon  = f"[bold blue]{frame}[/]"
+                ep_s  = ep
+                state = "[blue]Connecting...[/]"
+
+            table.add_row(icon, f"[bold]{name}[/]", ep_s, state)
+
+        hint = Text("\n  Press Ctrl+C to skip and proceed", style="dim")
+        elapsed_s = f"{elapsed:.0f}s"
+
+        return Panel(
+            Group(table, hint),
+            title=f"[bold bright_blue]Layer Status[/]  [dim]{elapsed_s}[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+
+    start    = time.monotonic()
+    frame_i  = 0
+    all_done = False
+
+    try:
+        with Live(console=console, refresh_per_second=8) as live:
+            while True:
+                elapsed = time.monotonic() - start
+                frame   = _FRAMES[frame_i % len(_FRAMES)]
+                frame_i += 1
+
+                # Check every pending layer
+                for name, cfg in layer_cfgs:
+                    if statuses[name] is None:
+                        statuses[name] = _check(cfg.endpoint)
+
+                live.update(_build_panel(frame, elapsed))
+
+                pending  = [n for n, s in statuses.items() if s is None]
+                all_done = not pending
+
+                if all_done or elapsed > max_wait:
+                    break
+
+                time.sleep(2.0)
+
+    except KeyboardInterrupt:
+        console.print("\n  [yellow]Connectivity check skipped — proceeding.[/]\n")
+        return
+
+    # Print the final resolved state (stays visible after Live exits)
+    console.print(_build_panel("✓", time.monotonic() - start))
     console.print()
 
 

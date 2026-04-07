@@ -100,6 +100,7 @@ from cli.display import (
     show_error,
     show_help,
     show_pytest_detail,
+    wait_for_layers_ready,
 )
 from cli.runner import run_pipeline
 
@@ -677,19 +678,9 @@ def start_repl() -> None:
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
 
-    # Check LLM connectivity
+    # Animated layer connectivity check — polls until all layers ready or Ctrl+C
     config = load_config()
-    endpoint = config.models.actor.endpoint
-    try:
-        import httpx
-        r = httpx.get(f"{endpoint.rstrip('/').rsplit('/v1', 1)[0]}/health", timeout=3.0)
-        if r.status_code == 200:
-            console.print(f"  [green]LLM connected[/] at {endpoint}\n")
-        else:
-            console.print(f"  [yellow]LLM responded with {r.status_code}[/] at {endpoint}\n")
-    except Exception:
-        console.print(f"  [red]LLM not reachable[/] at {endpoint}")
-        console.print(f"  [dim]Start vLLM first, or check hpema_config[/]\n")
+    wait_for_layers_ready(config, session.stage)
 
     # Build input function — prompt_toolkit if available, plain fallback otherwise
     if _PT_AVAILABLE:
