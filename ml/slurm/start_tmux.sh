@@ -67,8 +67,8 @@ python -m vllm.entrypoints.openai.api_server \
 # Pane 1: CLI (split horizontal)
 tmux split-window -h -t "$SESSION:0" -c "$PROJECT_DIR"
 tmux send-keys -t "$SESSION:0.1" "echo '=== PANE 1: HPEMA CLI ===' && \
-echo 'Waiting 60s for vLLM to load model...' && \
-sleep 60 && \
+echo 'Waiting 10s for the sake of 10s...' && \
+sleep 10 && \
 export HPEMA_CONFIG=$CONFIG && \
 export HPEMA_API_KEY=unused && \
 export NVIDIA_API_KEY=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 && \
