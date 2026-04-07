@@ -71,6 +71,7 @@ echo 'Waiting 60s for vLLM to load model...' && \
 sleep 60 && \
 export HPEMA_CONFIG=$CONFIG && \
 export HPEMA_API_KEY=unused && \
+export ANONYMIZED_TELEMETRY=False && \
 python -m cli.main" Enter
 
 # Attach
