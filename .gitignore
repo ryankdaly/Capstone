@@ -23,3 +23,5 @@ my_key.txt
 # Misc
 local/
 CLAUDE.md
+envs/
+dafny/

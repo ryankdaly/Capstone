@@ -1,6 +1,6 @@
 # HPEMA Work Distribution
 
-**Last updated:** 2026-03-30
+**Last updated:** 2026-04-04
 
 ---
 
@@ -28,16 +28,16 @@
 | 5 | Create `demo.sh` canned scenario script | TODO | See [plans/CLI.md](plans/CLI.md) Phase 4.3 |
 | 6 | Prompt iteration for better code quality | TODO | Test with diverse requirements |
 
-### Verification (Person B) — Dafny Integration
+### Verification (Nathan Chatpolarak) — Dafny Integration
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 1 | Install Dafny on ARC | TODO | Option A: `dotnet tool install --global dafny`. Option B: pre-built binary from GitHub releases |
-| 2 | Write 3-5 sample `.dfy` specs | TODO | Binary search, altitude controller, array bounds. Put in `tests/fixtures/dafny/` |
-| 3 | Smoke test `dafny_runner.py` standalone | TODO | `python -c "from backend.services.verification.dafny_runner import DafnyRunner; ..."` |
-| 4 | Test Actor-generated Dafny specs | TODO | Run pipeline with `stage: checker`, check if specs parse |
-| 5 | Tune Actor prompt for better Dafny output | TODO | May need examples in the prompt |
-| 6 | Update `hpema_config.arc.yaml` binary_path | TODO | Point to installed Dafny binary |
+| 1 | Install Dafny on ARC | DONE | Option A: `dotnet tool install --global dafny`. Option B: pre-built binary from GitHub releases |
+| 2 | Write 3-5 sample `.dfy` specs | DONE | Binary search, altitude controller, array bounds. Put in `tests/fixtures/dafny/` |
+| 3 | Smoke test `dafny_runner.py` standalone | DONE | `python -c "from backend.services.verification.dafny_runner import DafnyRunner; ..."` |
+| 4 | Test Actor-generated Dafny specs | DONE | Run pipeline with `stage: checker`, check if specs parse |
+| 5 | Tune Actor prompt for better Dafny output | DONE | May need examples in the prompt |
+| 6 | Update `hpema_config.arc.yaml` binary_path | DONE | Point to installed Dafny binary |
 
 ### RAG + Policy (Person C) — Knowledge Base
 
