@@ -913,7 +913,8 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
         except Exception:
             pass  # non-tty stdin (redirected / CI) — silently disabled
 
-    threading.Thread(target=_listen_for_skip, daemon=True).start()
+    listener_thread = threading.Thread(target=_listen_for_skip, daemon=True)
+    listener_thread.start()
 
     start   = time.monotonic()
     frame_i = 0
@@ -949,7 +950,12 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
                     live.update(_build_panel(_FRAMES[frame_i % len(_FRAMES)], time.monotonic() - start))
 
     finally:
+        # Signal the listener to stop, then wait for it to restore terminal attrs
+        # before the REPL prompt appears. Without the join, the terminal can still
+        # be in raw mode (no ICANON/ECHO) when prompt_toolkit starts, causing
+        # doubled input characters.
         stop_event.set()
+        listener_thread.join(timeout=0.5)
 
     if skip_event.is_set():
         console.print("\n  [yellow]Connectivity check skipped — proceeding.[/]\n")
