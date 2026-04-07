@@ -201,20 +201,126 @@ class LLMClient:
             "Could not parse structured response from %s. Attempting partial parse.", role
         )
         data = _extract_json_dict(raw)
-        return response_model.model_validate(data)
+
+        # Detect schema echo — model returned the JSON Schema itself instead of
+        # an instance (common with small models given a raw JSON Schema prompt).
+        if _is_schema_echo(data):
+            logger.error(
+                "Model %s echoed the schema instead of producing an instance. "
+                "Raw response snippet: %.200s", role, raw
+            )
+            raise ValueError(
+                f"Model returned the JSON schema instead of a response instance. "
+                f"Raw output (first 300 chars): {raw[:300]}"
+            )
+
+        try:
+            return response_model.model_validate(data)
+        except ValidationError as exc:
+            raise ValueError(
+                f"All structured-parse attempts failed for {role}. "
+                f"Last error: {exc}. "
+                f"Raw output (first 300 chars): {raw[:300]}"
+            ) from exc
 
 
 def _json_prompt_suffix(schema: Type[BaseModel]) -> str:
     """Return a system prompt suffix that instructs the model to output JSON.
 
-    Used when the provider doesn't support response_format=json_schema.
+    Uses a concrete example instance rather than the raw JSON Schema, because
+    small models frequently echo the schema back instead of producing an instance
+    when given a schema document.
     """
-    schema_str = json.dumps(schema.model_json_schema(), indent=2)
-    return (
-        "\n\n---\nIMPORTANT: You MUST respond with a single valid JSON object and "
-        "nothing else. No markdown fences, no prose, no explanation — only raw JSON.\n"
-        f"The JSON must conform to this schema:\n{schema_str}"
-    )
+    example = _example_from_model(schema)
+    example_str = json.dumps(example, indent=2)
+    required = [n for n, f in schema.model_fields.items() if f.is_required()]
+    optional = [n for n, f in schema.model_fields.items() if not f.is_required()]
+
+    lines = [
+        "\n\n---",
+        "IMPORTANT: Respond with a single valid JSON object ONLY.",
+        "No markdown fences, no prose, no explanation — raw JSON only.",
+    ]
+    if required:
+        lines.append(f"Required fields: {', '.join(required)}")
+    if optional:
+        lines.append(f"Optional fields (include if relevant): {', '.join(optional)}")
+    lines.append("Example (replace placeholder values with your actual output):")
+    lines.append(example_str)
+    return "\n".join(lines)
+
+
+def _example_from_model(model: Type[BaseModel]) -> dict:
+    """Build a human-readable placeholder example from a Pydantic model's fields.
+
+    Produces string placeholders for str fields, proper defaults for others.
+    This is far more effective than a raw JSON Schema for small/instruction models.
+    """
+    import inspect
+
+    example: dict = {}
+    for name, field_info in model.model_fields.items():
+        ann = field_info.annotation
+        desc = (field_info.description or "").strip()
+        placeholder = f"<{desc}>" if desc else f"<{name}>"
+
+        # Unwrap Optional[X] → X
+        origin = getattr(ann, "__origin__", None)
+        args = getattr(ann, "__args__", ())
+        if origin is type(None):
+            ann = str
+        elif origin is not None and type(None) in args:
+            # Optional[X] — use the non-None arg
+            ann = next((a for a in args if a is not type(None)), str)
+
+        if ann is str:
+            # Use the default if it's non-empty, else a placeholder
+            default = field_info.default
+            if default and isinstance(default, str):
+                example[name] = default
+            else:
+                example[name] = placeholder
+        elif ann is int:
+            example[name] = field_info.default if field_info.default is not None else 0
+        elif ann is bool:
+            example[name] = field_info.default if field_info.default is not None else False
+        elif ann is float:
+            example[name] = field_info.default if field_info.default is not None else 0.0
+        elif inspect.isclass(ann) and issubclass(ann, list):
+            example[name] = []
+        elif inspect.isclass(ann) and issubclass(ann, dict):
+            example[name] = {}
+        elif origin is list:
+            example[name] = []
+        elif origin is dict:
+            example[name] = {}
+        else:
+            # Enum or nested model — use default or a string placeholder
+            default = field_info.default
+            if default is not None and default is not ...:
+                example[name] = default.value if hasattr(default, "value") else default
+            else:
+                example[name] = placeholder
+
+    return example
+
+
+def _is_schema_echo(data: dict) -> bool:
+    """Return True if the dict looks like a JSON Schema rather than an instance.
+
+    Small models sometimes return the schema document they were shown instead of
+    an instance that conforms to it.
+    """
+    if not data:
+        return False
+    # JSON Schema top-level markers
+    schema_keys = {"properties", "definitions", "$schema", "$defs", "allOf", "anyOf"}
+    if schema_keys & data.keys():
+        return True
+    # A schema root with type:object and no meaningful instance fields
+    if data.get("type") == "object" and "title" in data:
+        return True
+    return False
 
 
 def _extract_json(text: str) -> str | None:
