@@ -1,8 +1,5 @@
 # HPEMA ARC Configuration — for running on a GPU node via tmux
 # Usage: HPEMA_CONFIG=hpema_config.arc.yaml uvicorn backend.main:app --port 8000
-#
-# MVP: One model (Phi-4) serves all three agent roles.
-# The agents are differentiated by system prompts, not the model.
 
 models:
   actor:
