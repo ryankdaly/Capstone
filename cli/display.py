@@ -172,53 +172,21 @@ class DisplayManager:
         passed = data.get("passed", 0)
         failed = data.get("failed", 0)
         errors = data.get("errors", 0)
-        test_results = data.get("test_results", [])
 
         if not executed:
-            console.print(
-                Panel(
-                    f"[dim]{total} test(s) generated but not executed[/]",
-                    title="[bold cyan]Test Runner[/]",
-                    border_style="dim",
-                    padding=(0, 1),
-                )
-            )
+            console.print(f"  [cyan]- Test Runner[/] [dim]{elapsed}[/] — {total} test(s) generated but not executed")
             return
 
         all_pass = failed == 0 and errors == 0 and total > 0
-        border = "green" if all_pass else "red" if (failed > 0 or errors > 0) else "yellow"
 
-        parts: list[str] = []
         if total == 0 and errors == 0:
-            parts.append(f"[bold yellow]NO TESTS COLLECTED[/] — check pytest output with /checker")
-            border = "yellow"
+            console.print(f"  [yellow]⚠ Test Runner[/] [dim]{elapsed}[/] — NO TESTS COLLECTED (check pytest output with /checker)")
         elif all_pass:
-            parts.append(f"[bold green]ALL PASSED[/] — {passed}/{total} tests")
+            console.print(f"  [cyan]✓ Test Runner[/] [dim]{elapsed}[/] — [green]ALL PASSED[/] ({passed}/{total} tests)")
         elif errors > 0:
-            parts.append(f"[bold red]ERROR[/] — pytest collection or execution failed")
+            console.print(f"  [cyan]✗ Test Runner[/] [dim]{elapsed}[/] — [red]ERROR[/] (pytest collection or execution failed)")
         else:
-            parts.append(f"[bold red]{failed} FAILED[/] — {passed} passed, {total} total")
-
-        # Show individual test results
-        if test_results:
-            for tr in test_results:
-                name = tr.get("name", "?")
-                if tr.get("passed"):
-                    parts.append(f"  [green]✓[/] {name}")
-                else:
-                    err = tr.get("error_message", "")
-                    parts.append(f"  [red]✗[/] {name}")
-                    if err:
-                        parts.append(f"    [dim]{err[:100]}[/]")
-
-        console.print(
-            Panel(
-                "\n".join(parts),
-                title=f"[bold cyan]Test Runner[/] [dim]{elapsed}[/]",
-                border_style=border,
-                padding=(0, 1),
-            )
-        )
+            console.print(f"  [cyan]✗ Test Runner[/] [dim]{elapsed}[/] — [red]{failed} FAILED[/] ({passed} passed, {total} total)")
 
     def _on_iteration_complete(self, event: StreamEvent) -> None:
         self._stop_spinner()
@@ -290,7 +258,7 @@ class DisplayManager:
             )
 
     # ------------------------------------------------------------------
-    # Agent-specific renderers
+    # Agent-specific renderers (Concise Mode)
     # ------------------------------------------------------------------
 
     def _render_actor(self, name: str, color: str, data: dict, elapsed: str) -> None:
@@ -298,131 +266,41 @@ class DisplayManager:
         language = data.get("language", "C")
         has_dafny = data.get("has_dafny", False)
         source_code = data.get("source_code", "")
-        dafny_spec = data.get("dafny_spec", "")
-        reasoning = data.get("reasoning_trace", "")
-
-        # Count lines
         code_lines = len(source_code.splitlines()) if source_code else 0
-
-        parts: list[str] = []
         dafny_label = " + Dafny spec" if has_dafny else ""
-        parts.append(f"[bold]Generated {code_lines} lines of {language}{dafny_label}[/]")
-
-        content = "\n".join(parts)
-
-        console.print(
-            Panel(
-                content,
-                title=f"[bold {color}]{name}[/] [dim]{elapsed}[/]",
-                border_style=color,
-                padding=(0, 1),
-            )
-        )
-
-        # Show syntax-highlighted code preview (truncated to 20 lines)
-        if source_code:
-            preview = "\n".join(source_code.splitlines()[:20])
-            if code_lines > 20:
-                preview += f"\n... ({code_lines - 20} more lines)"
-            lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada", "SPARK Ada": "ada"}
-            syntax = Syntax(
-                preview,
-                lang_map.get(language, "c"),
-                theme="monokai",
-                line_numbers=True,
-                padding=1,
-            )
-            console.print(syntax)
+        
+        console.print(f"  [{color}]✓ {name}[/] [dim]{elapsed}[/] — Generated {code_lines} lines of {language}{dafny_label}")
 
     def _render_checker(self, name: str, color: str, data: dict, elapsed: str) -> None:
         self.last_checker_output = data
         verdict_val = data.get("verdict", "unknown")
         issues_count = data.get("issues", 0)
-        issues_list = data.get("issues_detail", [])
-        test_cases = data.get("test_cases", [])
-
+        
         verdict_label, verdict_style = VERDICT_STYLE.get(
             verdict_val, (verdict_val.upper(), "bold white")
         )
-
-        parts: list[str] = []
-        parts.append(f"[{verdict_style}]{verdict_label}[/] — {issues_count} issue(s)")
-
-        if issues_list:
-            for issue in issues_list[:5]:
-                sev = issue.get("severity", "info").upper()
-                desc = issue.get("description", "")
-                sev_color = "red" if sev == "CRITICAL" else "yellow" if sev == "MAJOR" else "dim"
-                parts.append(f"  [{sev_color}][{sev}][/] {desc}")
-
-        if test_cases:
-            parts.append(f"\n  Test cases generated: {len(test_cases)}")
-
-        console.print(
-            Panel(
-                "\n".join(parts),
-                title=f"[bold {color}]{name}[/] [dim]{elapsed}[/]",
-                border_style="green" if verdict_val == "pass" else "red",
-                padding=(0, 1),
-            )
-        )
+        
+        icon = "✓" if verdict_val == "pass" else "✗"
+        console.print(f"  [{color}]{icon} {name}[/] [dim]{elapsed}[/] — [{verdict_style}]{verdict_label}[/] ({issues_count} issues)")
 
     def _render_dafny(self, name: str, color: str, data: dict, elapsed: str) -> None:
         self.last_dafny_output = data
         verified = data.get("verified", False)
-        failing = data.get("failing_assertions", [])
-
-        if verified:
-            content = "[bold green]VERIFIED[/] — all assertions hold"
-        else:
-            parts = ["[bold red]FAILED[/]"]
-            if failing:
-                for fa in failing[:3]:
-                    parts.append(f"  [red]{fa}[/]")
-            content = "\n".join(parts)
-
-        console.print(
-            Panel(
-                content,
-                title=f"[bold {color}]{name}[/] [dim]{elapsed}[/]",
-                border_style="green" if verified else "red",
-                padding=(0, 1),
-            )
-        )
+        
+        icon = "✓" if verified else "✗"
+        label = "[bold green]VERIFIED[/]" if verified else "[bold red]FAILED[/]"
+        console.print(f"  [{color}]{icon} {name}[/] [dim]{elapsed}[/] — {label}")
 
     def _render_policy(self, name: str, color: str, data: dict, elapsed: str) -> None:
         self.last_policy_output = data
         compliant = data.get("compliant", False)
         risk_level = data.get("risk_level", "unknown")
-        violations = data.get("violations", [])
-        recommendations = data.get("recommendations", [])
-
-        if compliant:
-            parts = [f"[bold green]COMPLIANT[/] — Risk: [green]{risk_level.upper()}[/]"]
-        else:
-            parts = [f"[bold red]NON-COMPLIANT[/] — Risk: [red]{risk_level.upper()}[/]"]
-
-        if violations:
-            parts.append("")
-            for v in violations[:5]:
-                rule = v.get("rule_id", "")
-                desc = v.get("description", "")
-                parts.append(f"  [red][{rule}][/] {desc}")
-
-        if recommendations:
-            parts.append("")
-            parts.append("[dim]Recommendations:[/]")
-            for rec in recommendations[:3]:
-                parts.append(f"  [dim]- {rec}[/]")
-
-        console.print(
-            Panel(
-                "\n".join(parts),
-                title=f"[bold {color}]{name}[/] [dim]{elapsed}[/]",
-                border_style="green" if compliant else "red",
-                padding=(0, 1),
-            )
-        )
+        
+        icon = "✓" if compliant else "✗"
+        label = "[bold green]COMPLIANT[/]" if compliant else "[bold red]NON-COMPLIANT[/]"
+        color_risk = "green" if compliant else "red"
+        
+        console.print(f"  [{color}]{icon} {name}[/] [dim]{elapsed}[/] — {label} (Risk: [{color_risk}]{risk_level.upper()}[/])")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -431,7 +309,7 @@ class DisplayManager:
     def _elapsed(self, agent: str) -> str:
         start = self._agent_start_times.get(agent)
         if start is None:
-            return ""
+            return "0.0s"
         return f"{time.monotonic() - start:.1f}s"
 
 
@@ -587,6 +465,7 @@ def show_help() -> None:
     table.add_row("/pytest [N]", "Full pytest output for iteration N (default: last)")
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
+    table.add_row("/scroll", "Scroll through session output (↑↓ navigate, Ctrl+C exit)")
     table.add_row("/config", "Show current configuration")
     table.add_row("/help", "Show this help")
     table.add_row("/quit", "Exit")

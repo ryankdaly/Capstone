@@ -9,7 +9,20 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()  # Auto-load variables from .env
+
+# Silence ChromaDB / PostHog telemetry warnings completely
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["POSTHOG_DISABLED"] = "1"
+
+# Monkey-patch posthog to intercept ChromaDB's broken telemetry call securely
+import posthog
+def _mock_capture(*args, **kwargs): pass
+posthog.capture = _mock_capture
 
 import typer
 from rich.console import Console

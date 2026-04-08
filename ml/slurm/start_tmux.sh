@@ -15,6 +15,9 @@
 
 set -e
 
+# Load tmux from the HPC module system just in case
+module load tmux 2>/dev/null || true
+
 SESSION="hpema"
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 

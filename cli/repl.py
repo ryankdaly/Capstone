@@ -6,6 +6,7 @@ Type requirements naturally, use /commands to configure.
 
 from __future__ import annotations
 
+import io
 import time
 from dataclasses import dataclass, field
 from uuid import UUID
@@ -46,6 +47,7 @@ _CMD_META: dict[str, str] = {
     "/pytest":     "full pytest output [N]",
     "/history":    "show run history [N]",
     "/audit":      "traceability matrix",
+    "/scroll":     "scroll through output (Ctrl+C to exit)",
     "/config":     "show current config",
     "/help":       "show all commands",
     "/quit":       "exit HPEMA",
@@ -256,6 +258,9 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/audit":
         _show_audit(session)
+
+    elif cmd == "/scroll":
+        _scroll_mode(session)
 
     else:
         show_error(f"Unknown command: {cmd}. Type /help for options.")
@@ -653,6 +658,93 @@ def _show_audit(session: Session) -> None:
     console.print()
     console.print(table)
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# /scroll — tmux-style scrollback viewer
+# ---------------------------------------------------------------------------
+
+def _scroll_mode(session: Session) -> None:
+    """Enter a tmux-style scroll mode over the session's output history.
+
+    Navigation:
+        ↑ / ↓       scroll one line
+        PgUp / PgDn scroll one page
+        Home / End  jump to top / bottom
+        Ctrl+C      exit scroll mode
+    """
+    # Capture a Rich-rendered snapshot of the full session history into plain text
+    buf = io.StringIO()
+    capture_console = Console(file=buf, width=console.width, force_terminal=True, color_system="truecolor")
+
+    if not session.history:
+        console.print("  [dim]Nothing to scroll — no runs yet.[/]")
+        return
+
+    # Render every run into the capture buffer
+    for idx, record in enumerate(session.history, start=1):
+        state = record.state
+        status_color = "green" if state.status.value in ("completed", "awaiting_approval") else "red"
+        capture_console.print(f"\n{'─' * 60}")
+        capture_console.print(f"  [bold]Run #{idx}[/]  [{status_color}]{state.status.value.upper()}[/]")
+        capture_console.print(f"  [dim]{record.requirement}[/]")
+        capture_console.print(f"  Standard: {record.standard}  |  Language: {record.language}  |  Stage: {record.stage}  |  Time: {record.elapsed_seconds:.1f}s")
+
+        if state.final_code:
+            lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada"}
+            lang = lang_map.get(record.language, "c")
+            code_lines = len(state.final_code.splitlines())
+            capture_console.print(f"\n  [bold]Source Code[/] [dim]({code_lines} lines)[/]")
+            syntax = Syntax(state.final_code, lang, theme="monokai", line_numbers=True, padding=1)
+            capture_console.print(syntax)
+
+        if state.final_proof:
+            dafny_lines = len(state.final_proof.splitlines())
+            capture_console.print(f"\n  [bold]Dafny Specification[/] [dim]({dafny_lines} lines)[/]")
+            syntax = Syntax(state.final_proof, "csharp", theme="monokai", line_numbers=True, padding=1)
+            capture_console.print(syntax)
+
+        if state.iterations:
+            last_iter = state.iterations[-1]
+            if last_iter.checker_report:
+                cr = last_iter.checker_report
+                v_label = cr.verdict.value.upper()
+                v_color = "green" if cr.verdict.value == "pass" else "red"
+                capture_console.print(f"  [bold]Checker:[/] [{v_color}]{v_label}[/] — {len(cr.issues)} issue(s), {len(cr.test_cases)} test case(s)")
+            if last_iter.test_result:
+                tr = last_iter.test_result
+                if tr.executed:
+                    t_color = "green" if tr.failed == 0 else "red"
+                    capture_console.print(f"  [bold]Tests:[/]   [{t_color}]{tr.passed}/{tr.total} passed[/]")
+            if last_iter.policy_verdict:
+                pv = last_iter.policy_verdict
+                v_color = "green" if pv.compliant else "red"
+                v_label = "COMPLIANT" if pv.compliant else "NON-COMPLIANT"
+                capture_console.print(f"  [bold]Policy:[/]  [{v_color}]{v_label}[/]")
+
+    capture_console.print(f"\n{'─' * 60}")
+    raw_output = buf.getvalue()
+    lines = raw_output.splitlines()
+
+    if not lines:
+        console.print("  [dim]Nothing to scroll.[/]")
+        return
+
+    if not lines:
+        console.print("  [dim]Nothing to scroll.[/]")
+        return
+
+    import subprocess
+    # -R preserves colors
+    # -K makes Ctrl+C exit 'less'
+    # -X leaves the text on the screen when you exit
+    try:
+        subprocess.run(["less", "-RKX"], input=raw_output.encode())
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C to exit less, catch it so we don't boot them from the REPL
+        pass
+    except Exception as e:
+        console.print(f"  [red]Failed to launch 'less': {e}[/]")
 
 
 # ---------------------------------------------------------------------------

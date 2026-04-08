@@ -1,0 +1,42 @@
+# HPEMA — NVIDIA NIM API Configuration
+# Usage: HPEMA_CONFIG=hpema_config.nvidia.yaml python -m cli.main
+#
+# Prerequisites:
+#   1. Get a free API key from https://build.nvidia.com
+#   2. Add it to your .env file: NVIDIA_API_KEY=nvapi-...
+#
+# Notes:
+#   - NVIDIA NIM endpoints are OpenAI-compatible
+#   - meta/llama-3.1-70b-instruct is a strong free-tier model for code generation
+#   - You can swap models at https://build.nvidia.com/explore/discover
+
+models:
+  actor:
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "meta/llama-3.1-70b-instruct"
+    api_key_env: "NVIDIA_API_KEY"
+  checker:
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "meta/llama-3.1-70b-instruct"
+    api_key_env: "NVIDIA_API_KEY"
+  policy:
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "meta/llama-3.1-70b-instruct"
+    api_key_env: "NVIDIA_API_KEY"
+
+policies:
+  standards_dir: "data/standards"
+  default_standard: "DO_178C"
+  embedding_model: "all-MiniLM-L6-v2"
+
+verification:
+  prover: "dafny"
+  timeout_seconds: 120
+  binary_path: "dafny"
+  solver_path: null
+
+pipeline:
+  max_iterations: 3
+  require_human_approval: false
+  audit_log_dir: "logs/audit"
+  stage: "checker"
