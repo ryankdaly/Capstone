@@ -9,10 +9,44 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
+
+
+def _configure_logging() -> None:
+    """Route all log output to a file; keep the terminal clean.
+
+    By default Python prints WARNING+ to stderr, which mangles the Rich TUI.
+    We redirect everything to logs/hpema.log and silence the console entirely.
+    Chromadb's broken telemetry logger is suppressed here too.
+    """
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        filename=log_dir / "hpema.log",
+        filemode="a",
+    )
+
+    # Remove any console (StreamHandler) handlers added by basicConfig or
+    # third-party libraries so nothing leaks to stderr.
+    root = logging.getLogger()
+    root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+
+    # Silence chromadb's broken telemetry — it prints even with telemetry=False
+    # in chromadb 0.4–0.5 due to a bug in the telemetry client's capture() API.
+    logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
+
+
+_configure_logging()
 
 from backend.api.schemas.pipeline import PipelineStage
 from cli.config import (

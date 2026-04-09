@@ -32,8 +32,20 @@ class AuditLogger:
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
         self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        self._db_enabled = False  # set True only if SQLite init succeeds
+
+        try:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+            self._db_enabled = True
+        except (sqlite3.OperationalError, OSError) as exc:
+            # Common on shared ARC filesystems: the DB was created by another
+            # user and this user lacks write permission. Fall back to JSONL-only.
+            logger.warning(
+                "SQLite audit DB unavailable (%s) — falling back to JSONL-only. "
+                "JSONL files in %s are unaffected.",
+                exc, self._log_dir,
+            )
 
     def _init_db(self) -> None:
         """Create the audit table if it doesn't exist."""
@@ -74,19 +86,24 @@ class AuditLogger:
         with open(jsonl_path, "a") as f:
             f.write(entry.model_dump_json() + "\n")
 
-        # 2. Insert into SQLite
-        with sqlite3.connect(str(self._db_path)) as conn:
-            conn.execute(
-                "INSERT INTO audit_log (run_id, timestamp, event_type, agent, data) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(entry.run_id),
-                    entry.timestamp.isoformat(),
-                    entry.event_type,
-                    entry.agent,
-                    json.dumps(entry.data, default=str),
-                ),
-            )
+        # 2. Insert into SQLite (skipped if DB is unavailable)
+        if self._db_enabled:
+            try:
+                with sqlite3.connect(str(self._db_path)) as conn:
+                    conn.execute(
+                        "INSERT INTO audit_log (run_id, timestamp, event_type, agent, data) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(entry.run_id),
+                            entry.timestamp.isoformat(),
+                            entry.event_type,
+                            entry.agent,
+                            json.dumps(entry.data, default=str),
+                        ),
+                    )
+            except sqlite3.OperationalError as exc:
+                logger.warning("SQLite write failed (%s) — JSONL record is intact.", exc)
+                self._db_enabled = False  # stop retrying for this session
 
         return entry
 

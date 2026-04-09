@@ -51,6 +51,17 @@ class LLMClient:
             )
         return self._clients[model.endpoint]
 
+    async def aclose(self) -> None:
+        """Close all httpx connection pools while the event loop is still open.
+
+        Must be called before asyncio.run() returns. Without this, Python 3.10+
+        prints 'Event loop is closed' noise when the GC finalizes the
+        AsyncOpenAI clients after the loop has already been shut down.
+        """
+        for client in self._clients.values():
+            await client.close()
+        self._clients.clear()
+
     async def generate(
         self,
         role: str,
@@ -130,10 +141,10 @@ class LLMClient:
             if response_schema is not None and any(
                 kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
             ):
-                logger.warning(
-                    "Endpoint %s rejected constrained decoding (%s). "
-                    "Falling back to prompt-only JSON enforcement.",
-                    resolved.endpoint, exc,
+                logger.info(
+                    "Endpoint %s does not support constrained decoding — "
+                    "using prompt-only JSON enforcement instead.",
+                    resolved.endpoint,
                 )
                 self._no_constrained_decoding.add(resolved.endpoint)
                 # Retry without response_format, schema injected into system prompt

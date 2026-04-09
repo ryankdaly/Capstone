@@ -40,11 +40,15 @@ async def _run_async(
     display: DisplayManager,
 ) -> PipelineState | None:
     orchestrator = _build_orchestrator()
-
-    async for event in orchestrator.run(request):
-        display.handle_event(event)
-
-    return orchestrator.last_state
+    try:
+        async for event in orchestrator.run(request):
+            display.handle_event(event)
+        return orchestrator.last_state
+    finally:
+        # Close httpx connection pools while the event loop is still alive.
+        # Without this, Python 3.10+ logs "Event loop is closed" when the GC
+        # finalizes AsyncOpenAI clients after asyncio.run() shuts down the loop.
+        await orchestrator._llm_client.aclose()
 
 
 def run_pipeline(
