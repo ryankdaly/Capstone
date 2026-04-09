@@ -48,7 +48,7 @@ async def _run_async(
         # Close httpx connection pools while the event loop is still alive.
         # Without this, Python 3.10+ logs "Event loop is closed" when the GC
         # finalizes AsyncOpenAI clients after asyncio.run() shuts down the loop.
-        await orchestrator._llm_client.aclose()
+        await orchestrator._llm.aclose()
 
 
 def run_pipeline(
