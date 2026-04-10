@@ -268,6 +268,12 @@ def _example_from_model(model: Type[BaseModel]) -> dict:
     This is far more effective than a raw JSON Schema for small/instruction models.
     """
     import inspect
+    from pydantic_core import PydanticUndefinedType
+
+    def _default(fi) -> object:
+        """Return field default, or None if it is PydanticUndefined (required field)."""
+        d = fi.default
+        return None if isinstance(d, PydanticUndefinedType) else d
 
     example: dict = {}
     for name, field_info in model.model_fields.items():
@@ -281,34 +287,25 @@ def _example_from_model(model: Type[BaseModel]) -> dict:
         if origin is type(None):
             ann = str
         elif origin is not None and type(None) in args:
-            # Optional[X] — use the non-None arg
             ann = next((a for a in args if a is not type(None)), str)
 
+        default = _default(field_info)
+
         if ann is str:
-            # Use the default if it's non-empty, else a placeholder
-            default = field_info.default
-            if default and isinstance(default, str):
-                example[name] = default
-            else:
-                example[name] = placeholder
+            example[name] = default if isinstance(default, str) and default else placeholder
         elif ann is int:
-            example[name] = field_info.default if field_info.default is not None else 0
+            example[name] = default if isinstance(default, int) else 0
         elif ann is bool:
-            example[name] = field_info.default if field_info.default is not None else False
+            example[name] = default if isinstance(default, bool) else False
         elif ann is float:
-            example[name] = field_info.default if field_info.default is not None else 0.0
-        elif inspect.isclass(ann) and issubclass(ann, list):
+            example[name] = default if isinstance(default, float) else 0.0
+        elif origin is list or (inspect.isclass(ann) and issubclass(ann, list)):
             example[name] = []
-        elif inspect.isclass(ann) and issubclass(ann, dict):
-            example[name] = {}
-        elif origin is list:
-            example[name] = []
-        elif origin is dict:
+        elif origin is dict or (inspect.isclass(ann) and issubclass(ann, dict)):
             example[name] = {}
         else:
-            # Enum or nested model — use default or a string placeholder
-            default = field_info.default
-            if default is not None and default is not ...:
+            # Enum or nested model
+            if default is not None:
                 example[name] = default.value if hasattr(default, "value") else default
             else:
                 example[name] = placeholder
