@@ -1,15 +1,16 @@
-# HPEMA ARC Configuration — for running on a GPU node via tmux
-# Usage: HPEMA_CONFIG=hpema_config.arc.yaml uvicorn backend.main:app --port 8000
+# HPEMA ARC Configuration - for running locally.
+# You need a local dafny install
+# You need API-ONLY LLMs hooked up
 
 models:
   actor:
     endpoint: "https://integrate.api.nvidia.com/v1"
     model: "tiiuae/falcon3-7b-instruct"
-    api_key_env: "NVIDIA_API_KEY" # vLLM doesn't need a real key
+    api_key_env: "NVIDIA_API_KEY"
   checker:
-    endpoint: "http://localhost:8001/v1"
-    model: "Qwen/Qwen2.5-Coder-7B-Instruct"
-    api_key_env: "HPEMA_API_KEY"
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "tiiuae/falcon3-7b-instruct"
+    api_key_env: "NVIDIA_API_KEY"
   policy:
     endpoint: "http://localhost:8001/v1"
     model: "Qwen/Qwen2.5-Coder-7B-Instruct"
@@ -23,7 +24,7 @@ policies:
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "/projects/meng/Capstone/dafny/dafny/dafny"
+  binary_path: "LOCAL_DAFNY_INSTALL"
 
 pipeline:
   max_iterations: 3
