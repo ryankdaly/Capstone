@@ -1,6 +1,6 @@
 # HPEMA Work Distribution
 
-**Last updated:** 2026-03-30
+**Last updated:** 2026-04-08
 
 ---
 
@@ -15,7 +15,60 @@
 
 ---
 
-## Active Sprint (Week of 2026-03-30)
+## Active Sprint (Week of 2026-04-08)
+
+### ML Lead — CLI Hardening & Pipeline Engine
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 1 | Scrollable output in REPL | TODO | Long code/checker output should scroll — consider Rich `Pager` or paged `/last` view |
+| 2 | QA pass — break-test the CLI end-to-end | TODO | Deliberately trigger edge cases: empty response, timeout, malformed JSON, stage skips |
+| 3 | Regression test for double-input terminal bug | TODO | Verify `termios` restore works on natural layer-ready path (not just Ctrl+S skip) |
+| 4 | Bypass Layer mechanism in `PipelineStage` engine | TODO | Allow individual layers to be force-skipped at runtime without changing config — e.g. `/bypass dafny` |
+| 5 | Bypass flag propagation through orchestrator | TODO | `PipelineRequest` carries a `bypass_layers: set[str]` field; orchestrator skips those agent calls |
+| 6 | API model fallback robustness | TODO | Ongoing — test prompt-only JSON enforcement across providers (Falcon, Nemotron, etc.) |
+| 7 | `.env` key management | DONE | `start_tmux.sh` sources `.env`; keys no longer in script |
+
+### Verification (Person B) — Dafny (Open Problem)
+
+> **Note:** Dafny remains an open research problem for this system. Small instruction models produce syntactically plausible but semantically incorrect specs. Tasks here are exploratory — fewer deliverables, more investigation.
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 1 | Characterize failure modes of Actor-generated specs | TODO | Categorise: wrong types, missing invariants, unbounded loops, extern refs |
+| 2 | Evaluate prompt scaffolding approaches | TODO | Try chain-of-thought, few-shot Dafny examples, decomposed spec generation |
+| 3 | Identify a minimal verifiable subset | TODO | Find the simplest class of requirements (pure functions, no loops) where Dafny consistently passes |
+| 4 | Document findings for report | TODO | Even negative results are a contribution — document what doesn't work and why |
+
+### RAG + Policy (Person C) — Independent Layer Readiness
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 1 | Standalone RAG retrieval test harness | TODO | Script that queries ChromaDB with sample aerospace terms and checks relevance of returned chunks |
+| 2 | Expand `data/standards/` coverage | TODO | Target 30+ rules per standard; prioritise DO-178C and MISRA C for demo |
+| 3 | Ingestion script with idempotent upsert | TODO | Re-running ingestion should not duplicate chunks |
+| 4 | Retriever quality metrics | TODO | Precision@K on a small manually-curated query set |
+| 5 | Policy agent smoke test (isolated) | TODO | Call Policy agent directly with a hardcoded context — no full pipeline dependency |
+| 6 | Prepare RAG for Layer 2 inflow | TODO | Policy agent must accept checker output as additional context for compliance check |
+| 7 | Citation quality check | TODO | Policy verdicts should cite specific clause IDs (e.g. DO-178C §6.3.2) |
+
+### Backend + Testing (Person D) — Aggressive Layer Testing & Human-in-the-Loop
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 1 | Actor layer stress test | TODO | 20+ diverse requirements; log pass/fail, code quality, JSON parse success rate |
+| 2 | Checker layer stress test | TODO | Feed Actor outputs directly to Checker; measure verdict consistency |
+| 3 | Integration test: Actor → Checker → feedback loop | TODO | At least 3 iterations; assert code improves or status changes |
+| 4 | Human-in-the-loop: approval prompt | TODO | After pipeline completes, show final code and ask: Approve / Reject-Rerun / Reject-GiveUp |
+| 5 | Human-in-the-loop: Approve path | TODO | Write approved code to a timestamped output file (e.g. `output/<run_id>.py`) |
+| 6 | Human-in-the-loop: Reject-Rerun path | TODO | Collect user feedback, append all prior test-case failures to the next Actor prompt, re-enter pipeline |
+| 7 | Human-in-the-loop: Reject-GiveUp path | TODO | Print final state summary, hand back to REPL without saving |
+| 8 | Timeout + retry hardening in `client.py` | TODO | Catch transient errors (502, connection reset); retry with backoff up to 3× |
+| 9 | Streamlit dashboard basic run history view | TODO | Read JSONL audit logs, display per-run status, verdict, code lines |
+
+---
+
+## Deprecated Sprint (Week of 2026-03-30)
 
 ### ML Lead — CLI Demo Polish
 
