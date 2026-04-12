@@ -20,6 +20,22 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _resolve_binary(raw: str) -> str:
+    """Resolve a binary path that may be a literal path, $VAR, or bare VAR name.
+
+    YAML doesn't expand env vars, so config values like 'LOCAL_DAFNY_INSTALL'
+    or '$LOCAL_DAFNY_INSTALL' need to be resolved here.
+    """
+    # 1. Expand $VAR / ${VAR} syntax
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    if expanded != raw:
+        return expanded
+    # 2. Bare env var name (no path separators, all caps) — look it up directly
+    if os.sep not in raw and os.environ.get(raw):
+        return os.path.expanduser(os.environ[raw])
+    return expanded
+
+
 class DafnyRunner:
     """Async wrapper around the Dafny CLI."""
 
@@ -29,7 +45,7 @@ class DafnyRunner:
         timeout: int | None = None,
         solver_path: str | None = None,
     ) -> None:
-        self._binary = os.path.expanduser(binary_path or settings.verification.binary_path)
+        self._binary = _resolve_binary(binary_path or settings.verification.binary_path)
         self._timeout = timeout or settings.verification.timeout_seconds
         self._solver_path = solver_path or settings.verification.solver_path
 
@@ -74,6 +90,7 @@ class DafnyRunner:
             )
         except FileNotFoundError:
             logger.warning("Dafny binary not found at %s", self._binary)
+            logger.warning("Spec Path is %s", spec_path)
             return VerificationResult(
                 verified=False,
                 prover="dafny",
@@ -103,18 +120,24 @@ class DafnyRunner:
 
     @staticmethod
     def _parse_failing_assertions(output: str) -> list[str]:
-        """Extract failing assertion messages from Dafny output."""
-        patterns = [
-            r"Error:.*assertion might not hold.*",
-            r"Error:.*postcondition.*might not hold.*",
-            r"Error:.*precondition.*could not be proved.*",
-            r"Error:.*invariant.*might not be maintained.*",
-            r"Error:.*decreases.*might not decrease.*",
-        ]
+        """Extract failing assertion messages from Dafny output.
+
+        Catches Dafny 3.x ("might not hold") and 4.x ("could not be proved")
+        phrasing, plus general Error/Warning lines from the verifier.
+        """
         failures: list[str] = []
+        seen: set[str] = set()
         for line in output.splitlines():
-            for pattern in patterns:
-                if re.search(pattern, line, re.IGNORECASE):
-                    failures.append(line.strip())
-                    break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Match any Dafny error/warning line (file.dfy(line,col): Error: ...)
+            if re.search(r"Error:", stripped, re.IGNORECASE):
+                if stripped not in seen:
+                    failures.append(stripped)
+                    seen.add(stripped)
+            elif re.search(r"Warning:", stripped, re.IGNORECASE) and "deprecated" not in stripped.lower():
+                if stripped not in seen:
+                    failures.append(stripped)
+                    seen.add(stripped)
         return failures

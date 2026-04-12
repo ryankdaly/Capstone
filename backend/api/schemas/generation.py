@@ -14,6 +14,7 @@ class SafetyStandard(str, Enum):
 class TargetLanguage(str, Enum):
     """Supported target implementation languages for generated artifacts."""
 
+    PYTHON = "Python"
     C = "C"
     SPARK_ADA = "SPARK_Ada"
 

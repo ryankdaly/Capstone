@@ -19,7 +19,7 @@ class ActorAgent(BaseAgent):
 
     def _build_user_prompt(self, **kwargs: Any) -> str:
         requirement: str = kwargs["requirement"]
-        language: str = kwargs.get("language", "C")
+        language: str = kwargs.get("language", "Python")
         standard: str = kwargs.get("standard", "DO_178C")
         feedback: FeedbackMessage | None = kwargs.get("feedback")
 

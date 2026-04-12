@@ -17,6 +17,23 @@ set -e
 
 SESSION="hpema"
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# -----------------------------------------------------------
+# Load secrets from .env (gitignored — never committed)
+# Variables exported here are inherited by all tmux panes.
+# -----------------------------------------------------------
+ENV_FILE="$PROJECT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    echo ">>> Loading secrets from .env"
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+else
+    echo ">>> WARNING: .env not found at $ENV_FILE"
+    echo "    Copy .env.example to .env and fill in your keys."
+    echo ""
+fi
 CONFIG="hpema_config.arc.yaml"
 MODEL="Qwen/Qwen2.5-Coder-7B-Instruct"
 VLLM_PORT=8001
@@ -28,6 +45,25 @@ echo "Model:   $MODEL"
 echo "Node:    $(hostname)"
 if command -v nvidia-smi &>/dev/null; then
     echo "GPUs:    $(nvidia-smi -L 2>/dev/null | wc -l) detected"
+fi
+echo ""
+
+# -----------------------------------------------------------
+# Dependency setup (runs once before tmux session starts)
+# -----------------------------------------------------------
+
+# Install app requirements if any are missing
+echo ">>> Installing app dependencies..."
+pip install  -r "$PROJECT_DIR/requirements.txt"
+
+# Install vLLM if not already present.
+# vLLM is GPU-only infrastructure, kept separate from requirements.txt.
+if ! python -c "import vllm" 2>/dev/null; then
+    echo ">>> vLLM not found — installing (this may take a few minutes)..."
+    pip install vllm
+    echo ">>> vLLM installed."
+else
+    echo ">>> vLLM already installed — skipping."
 fi
 echo ""
 
@@ -48,10 +84,9 @@ python -m vllm.entrypoints.openai.api_server \
 # Pane 1: CLI (split horizontal)
 tmux split-window -h -t "$SESSION:0" -c "$PROJECT_DIR"
 tmux send-keys -t "$SESSION:0.1" "echo '=== PANE 1: HPEMA CLI ===' && \
-echo 'Waiting 60s for vLLM to load model...' && \
-sleep 60 && \
+echo 'Waiting 10s for vLLM to start...' && \
+sleep 10 && \
 export HPEMA_CONFIG=$CONFIG && \
-export HPEMA_API_KEY=unused && \
 python -m cli.main" Enter
 
 # Attach

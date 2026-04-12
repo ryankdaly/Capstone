@@ -17,14 +17,92 @@ from rich.table import Table
 
 from backend.api.schemas.pipeline import PipelineStage, PipelineState
 from backend.config import load_config
+
+# ---------------------------------------------------------------------------
+# prompt_toolkit — optional, degrades gracefully to plain input if missing
+# ---------------------------------------------------------------------------
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import InMemoryHistory
+    _PT_AVAILABLE = True
+except ImportError:
+    _PT_AVAILABLE = False
+
+
+# One-line description shown next to each command in the completion menu
+_CMD_META: dict[str, str] = {
+    "/standard":   "set safety standard",
+    "/language":   "set target language",
+    "/stage":      "set pipeline stage",
+    "/run-tests":  "toggle pytest execution",
+    "/iterations": "set max iterations",
+    "/last":       "show last run details",
+    "/checker":    "verbose checker report [N]",
+    "/dafny":      "verbose Dafny output [N]",
+    "/pytest":     "full pytest output [N]",
+    "/history":    "show run history [N]",
+    "/audit":      "traceability matrix",
+    "/config":     "show current config",
+    "/help":       "show all commands",
+    "/quit":       "exit HPEMA",
+    "/exit":       "exit HPEMA",
+}
+
+_CMD_ARGS: dict[str, list[str]] = {
+    "/standard":  ["DO_178C", "MISRA_C", "NASA", "Boeing_SDP"],
+    "/language":  ["Python", "C", "SPARK_Ada"],
+    "/stage":     ["actor", "checker", "policy"],
+    "/run-tests": ["on", "off"],
+}
+
+
+if _PT_AVAILABLE:
+    class _HpemaCompleter(Completer):
+        """Tab/ghost-text completer for HPEMA slash commands."""
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("/"):
+                return  # free-text requirement — no completions
+
+            parts = text.split(maxsplit=1)
+
+            if len(parts) == 1:
+                # Complete the command name itself
+                word = parts[0]
+                for cmd in sorted(_CMD_META):
+                    if cmd.startswith(word) and cmd != word:
+                        yield Completion(
+                            cmd[len(word):],
+                            display=cmd,
+                            display_meta=_CMD_META.get(cmd, ""),
+                        )
+            elif len(parts) == 2:
+                # Complete the argument
+                cmd, arg_prefix = parts[0].lower(), parts[1]
+                for opt in _CMD_ARGS.get(cmd, []):
+                    if opt.lower().startswith(arg_prefix.lower()):
+                        yield Completion(opt[len(arg_prefix):], display=opt)
+
+
 from cli.display import (
     DisplayManager,
     console,
     show_banner,
+    show_checker_detail,
     show_config,
+    show_dafny_detail,
     show_disconnected_warning,
     show_error,
     show_help,
+    show_logo,
+    show_pytest_detail,
+    show_startup_info,
+    wait_for_layers_ready,
 )
 from cli.runner import run_pipeline
 
@@ -50,7 +128,7 @@ class Session:
     def __init__(self) -> None:
         config = load_config()
         self.standard: str = config.policies.default_standard
-        self.language: str = "C"
+        self.language: str = "Python"
         self.max_iterations: int = config.pipeline.max_iterations
         self.model: str = config.models.actor.model
         self.config_source: str = ""
@@ -61,6 +139,9 @@ class Session:
             self.stage: PipelineStage = PipelineStage(config.pipeline.stage)
         except ValueError:
             self.stage = PipelineStage.POLICY
+
+        # Test execution flag
+        self.run_tests: bool = True
 
         # Run history (most recent last)
         self.history: list[RunRecord] = []
@@ -96,7 +177,7 @@ def _handle_command(line: str, session: Session) -> bool:
         show_help()
 
     elif cmd == "/config":
-        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage)
+        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage, session.run_tests)
 
     elif cmd == "/standard":
         if not arg:
@@ -109,7 +190,7 @@ def _handle_command(line: str, session: Session) -> bool:
     elif cmd == "/language":
         if not arg:
             console.print(f"  Current language: [bold]{session.language}[/]")
-            console.print("  [dim]Options: C, SPARK_Ada[/]")
+            console.print("  [dim]Options: Python, C, SPARK_Ada[/]")
         else:
             session.language = arg
             console.print(f"  Language set to: [bold]{arg}[/]")
@@ -149,6 +230,29 @@ def _handle_command(line: str, session: Session) -> bool:
                     show_disconnected_warning(session.stage)
             except ValueError:
                 show_error(f"Unknown stage: {arg}. Options: actor, checker, policy")
+
+    elif cmd == "/checker":
+        _show_checker(session, arg)
+
+    elif cmd == "/dafny":
+        _show_dafny(session, arg)
+
+    elif cmd == "/pytest":
+        _show_pytest(session, arg)
+
+    elif cmd == "/run-tests":
+        if not arg:
+            status = "[green]ON[/]" if session.run_tests else "[red]OFF[/]"
+            console.print(f"  Test execution: {status}")
+            console.print("  [dim]Usage: /run-tests on  or  /run-tests off[/]")
+        elif arg.lower() in ("on", "true", "1", "yes"):
+            session.run_tests = True
+            console.print("  Test execution: [green]ON[/] — pytest will run checker tests")
+        elif arg.lower() in ("off", "false", "0", "no"):
+            session.run_tests = False
+            console.print("  Test execution: [red]OFF[/] — tests stored but not executed")
+        else:
+            show_error("Usage: /run-tests on  or  /run-tests off")
 
     elif cmd == "/audit":
         _show_audit(session)
@@ -195,7 +299,7 @@ def _show_last_run(session: Session) -> None:
 
     # Code output
     if state.final_code:
-        lang_map = {"C": "c", "SPARK_Ada": "ada"}
+        lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada"}
         lang = lang_map.get(record.language, "c")
         code_lines = len(state.final_code.splitlines())
         console.print(f"\n  [bold]Source Code[/] [dim]({code_lines} lines)[/]")
@@ -225,6 +329,15 @@ def _show_last_run(session: Session) -> None:
             v_label = cr.verdict.value.upper()
             v_color = "green" if cr.verdict.value == "pass" else "red"
             console.print(f"\n  [bold]Checker:[/] [{v_color}]{v_label}[/] — {len(cr.issues)} issue(s), {len(cr.test_cases)} test case(s)")
+
+        # Test execution
+        if last_iter.test_result:
+            tr = last_iter.test_result
+            if tr.executed:
+                t_color = "green" if tr.failed == 0 else "red"
+                console.print(f"  [bold]Tests:[/]   [{t_color}]{tr.passed}/{tr.total} passed[/]  ({tr.execution_time_seconds:.1f}s)")
+            else:
+                console.print(f"  [bold]Tests:[/]   [dim]{tr.total} generated (not executed)[/]")
 
         # Dafny verification
         if last_iter.verification_result:
@@ -261,12 +374,13 @@ def _show_history(session: Session, n: int) -> None:
         show_lines=True,
     )
     table.add_column("#", style="dim", width=3, justify="right")
-    table.add_column("Requirement", max_width=40)
-    table.add_column("Status", width=10, justify="center")
-    table.add_column("Code", width=8, justify="center")
-    table.add_column("Dafny", width=8, justify="center")
-    table.add_column("Checker", width=10, justify="center")
-    table.add_column("Policy", width=12, justify="center")
+    table.add_column("Requirement", max_width=35)
+    table.add_column("Status", width=6, justify="center")
+    table.add_column("Code", width=6, justify="center")
+    table.add_column("Tests", width=8, justify="center")
+    table.add_column("Dafny", width=6, justify="center")
+    table.add_column("Checker", width=8, justify="center")
+    table.add_column("Policy", width=8, justify="center")
     table.add_column("Time", width=6, justify="right")
 
     offset = len(session.history) - len(runs)
@@ -284,11 +398,19 @@ def _show_history(session: Session, n: int) -> None:
         # Dafny
         dafny_str = "[green]Yes[/]" if state.final_proof else "[dim]No[/]"
 
-        # Checker (from last iteration)
+        # Tests (from last iteration)
+        tests_str = "[dim]—[/]"
         checker_str = "[dim]—[/]"
         policy_str = "[dim]—[/]"
         if state.iterations:
             last_iter = state.iterations[-1]
+            if last_iter.test_result:
+                tr = last_iter.test_result
+                if tr.executed:
+                    t_color = "green" if tr.failed == 0 else "red"
+                    tests_str = f"[{t_color}]{tr.passed}/{tr.total}[/]"
+                else:
+                    tests_str = f"[dim]{tr.total}t[/]"
             if last_iter.checker_report:
                 cv = last_iter.checker_report.verdict.value
                 c_color = "green" if cv == "pass" else "red"
@@ -302,11 +424,11 @@ def _show_history(session: Session, n: int) -> None:
         time_str = f"{record.elapsed_seconds:.1f}s"
 
         # Truncate requirement
-        req = record.requirement[:38]
-        if len(record.requirement) > 38:
+        req = record.requirement[:33]
+        if len(record.requirement) > 33:
             req += ".."
 
-        table.add_row(str(idx), req, status_str, code_str, dafny_str, checker_str, policy_str, time_str)
+        table.add_row(str(idx), req, status_str, code_str, tests_str, dafny_str, checker_str, policy_str, time_str)
 
     console.print()
     console.print(table)
@@ -419,6 +541,79 @@ def _bar(pct: float, color: str, width: int = 15) -> str:
 
 
 # ---------------------------------------------------------------------------
+# /checker [N] and /dafny [N] — verbose agent inspection
+# ---------------------------------------------------------------------------
+
+def _show_checker(session: Session, arg: str) -> None:
+    """Show verbose checker report for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_checker_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _show_dafny(session: Session, arg: str) -> None:
+    """Show verbose Dafny result for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_dafny_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _show_pytest(session: Session, arg: str) -> None:
+    """Show verbose pytest execution output for an iteration of the last run."""
+    if not session.history:
+        console.print("  [dim]No runs yet.[/]")
+        return
+
+    state = session.history[-1].state
+    if not state.iterations:
+        console.print("  [dim]No iterations in last run.[/]")
+        return
+
+    iter_idx = _parse_iteration_arg(arg, len(state.iterations))
+    if iter_idx is None:
+        return
+    show_pytest_detail(state.iterations[iter_idx], iter_idx + 1)
+
+
+def _parse_iteration_arg(arg: str, total: int) -> int | None:
+    """Parse an optional iteration number argument. Returns 0-based index or None on error."""
+    if not arg:
+        return total - 1  # default: last iteration
+
+    try:
+        n = int(arg)
+    except ValueError:
+        show_error(f"Expected iteration number, got: {arg}")
+        return None
+
+    if n < 1 or n > total:
+        show_error(f"Iteration {n} not found. Last run had {total} iteration(s).")
+        return None
+
+    return n - 1
+
+
+# ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
 
@@ -466,6 +661,9 @@ def _show_audit(session: Session) -> None:
 
 def start_repl() -> None:
     """Launch the interactive REPL."""
+    # Rule 1: clear terminal noise from previous session
+    console.clear()
+
     session = Session()
 
     # Detect config source
@@ -473,7 +671,10 @@ def start_repl() -> None:
     env_config = os.environ.get("HPEMA_CONFIG", "hpema_config.yaml")
     session.config_source = env_config
 
-    show_banner(
+    # Rule 2: logo first, 1.5s pause, then config info
+    show_logo()
+    time.sleep(1.5)
+    show_startup_info(
         config_source=env_config,
         model=session.model,
         standard=session.standard,
@@ -485,24 +686,29 @@ def start_repl() -> None:
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
 
-    # Check LLM connectivity
+    # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
+    # Chat bar is naturally blocked until this returns.
     config = load_config()
-    endpoint = config.models.actor.endpoint
-    try:
-        import httpx
-        r = httpx.get(f"{endpoint.rstrip('/').rsplit('/v1', 1)[0]}/health", timeout=3.0)
-        if r.status_code == 200:
-            console.print(f"  [green]LLM connected[/] at {endpoint}\n")
-        else:
-            console.print(f"  [yellow]LLM responded with {r.status_code}[/] at {endpoint}\n")
-    except Exception:
-        console.print(f"  [red]LLM not reachable[/] at {endpoint}")
-        console.print(f"  [dim]Start vLLM first, or check hpema_config[/]\n")
+    wait_for_layers_ready(config, session.stage)
+
+    # Build input function — prompt_toolkit if available, plain fallback otherwise
+    if _PT_AVAILABLE:
+        _pt_session: PromptSession = PromptSession(
+            completer=_HpemaCompleter(),
+            history=InMemoryHistory(),
+            auto_suggest=AutoSuggestFromHistory(),
+            complete_while_typing=True,
+        )
+        def _get_input() -> str:
+            return _pt_session.prompt(HTML("<b><ansibrightblue>hpema ></ansibrightblue></b> "))
+    else:
+        def _get_input() -> str:  # type: ignore[misc]
+            return console.input("[bold bright_blue]hpema >[/] ")
 
     # REPL loop
     while True:
         try:
-            line = console.input("[bold bright_blue]hpema >[/] ").strip()
+            line = _get_input().strip()
         except (EOFError, KeyboardInterrupt):
             _show_goodbye(session)
             break
@@ -530,6 +736,7 @@ def start_repl() -> None:
                 max_iterations=session.max_iterations,
                 display=display,
                 stage=session.stage,
+                run_tests=session.run_tests,
             )
             elapsed = time.monotonic() - run_start
             if state is not None:
@@ -542,6 +749,8 @@ def start_repl() -> None:
                     elapsed_seconds=elapsed,
                 ))
         except KeyboardInterrupt:
+            display.cleanup()
             console.print("\n  [yellow]Pipeline interrupted.[/]")
         except Exception as e:
+            display.cleanup()
             show_error(str(e))
