@@ -47,6 +47,7 @@ _LOGO_COLORS = [
 # Agent role → (display name, color)
 AGENT_STYLE = {
     "actor": ("Actor", "blue"),
+    "dafny_architect": ("Dafny Architect", "magenta"),
     "checker": ("Checker", "yellow"),
     "dafny_verifier": ("Dafny Verifier", "magenta"),
     "test_runner": ("Test Runner", "cyan"),
@@ -144,6 +145,8 @@ class DisplayManager:
 
         if agent == "actor":
             self._render_actor(name, color, data, elapsed)
+        elif agent == "dafny_architect":
+            self._render_dafny_architect(name, color, data, elapsed)
         elif agent == "checker":
             self._render_checker(name, color, data, elapsed)
         elif agent == "dafny_verifier":
@@ -366,6 +369,33 @@ class DisplayManager:
                 padding=(0, 1),
             )
         )
+
+    def _render_dafny_architect(self, name: str, color: str, data: dict, elapsed: str) -> None:
+        dafny_spec = data.get("dafny_spec", "").strip()
+        reasoning = data.get("reasoning_trace", "").strip()
+
+        spec_lines = len(dafny_spec.splitlines()) if dafny_spec else 0
+        summary = (
+            f"[bold]Generated {spec_lines}-line Dafny spec[/]"
+            if dafny_spec
+            else "[red]No Dafny spec produced[/]"
+        )
+        if reasoning:
+            summary += f"\n[dim]{reasoning}[/]"
+
+        console.print(
+            Panel(
+                summary,
+                title=f"[bold {color}]{name}[/] [dim]{elapsed}[/]",
+                border_style=color,
+                padding=(0, 1),
+            )
+        )
+
+        if dafny_spec:
+            console.print(
+                Syntax(dafny_spec, "text", theme="monokai", line_numbers=True, padding=1)
+            )
 
     def _render_dafny(self, name: str, color: str, data: dict, elapsed: str) -> None:
         self.last_dafny_output = data

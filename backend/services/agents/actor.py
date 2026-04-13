@@ -1,4 +1,9 @@
-"""Actor agent — generates code + Dafny formal specification."""
+"""Actor agent — generates safety-critical source code.
+
+Dafny formal specification is handled exclusively by the DafnyArchitect
+agent which runs after this one. The Actor focuses solely on producing
+correct, defensively-written source code.
+"""
 
 from __future__ import annotations
 
@@ -43,11 +48,6 @@ class ActorAgent(BaseAgent):
                     parts.append(f"  - [{issue.severity.value}] {issue.description}")
                     if issue.suggested_fix:
                         parts.append(f"    Fix: {issue.suggested_fix}")
-            if feedback.verification_feedback:
-                vf = feedback.verification_feedback
-                parts.append(f"Formal Verification: {'PASSED' if vf.verified else 'FAILED'}")
-                for fa in vf.failing_assertions:
-                    parts.append(f"  - Failing: {fa}")
             if feedback.policy_feedback:
                 pf = feedback.policy_feedback
                 parts.append(f"Policy Compliance: {'COMPLIANT' if pf.compliant else 'NON-COMPLIANT'}")

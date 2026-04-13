@@ -5,12 +5,16 @@ models:
   actor:
     endpoint: "https://integrate.api.nvidia.com/v1"
     model: "tiiuae/falcon3-7b-instruct"
-    api_key_env: "NVIDIA_API_KEY" # vLLM doesn't need a real key
+    api_key_env: "NVIDIA_API_KEY"
   checker:
     endpoint: "http://localhost:8001/v1"
     model: "Qwen/Qwen2.5-Coder-7B-Instruct"
     api_key_env: "HPEMA_API_KEY"
   policy:
+    endpoint: "http://localhost:8001/v1"
+    model: "Qwen/Qwen2.5-Coder-7B-Instruct"
+    api_key_env: "HPEMA_API_KEY"
+  dafny_architect:
     endpoint: "http://localhost:8001/v1"
     model: "Qwen/Qwen2.5-Coder-7B-Instruct"
     api_key_env: "HPEMA_API_KEY"

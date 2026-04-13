@@ -37,6 +37,20 @@ class CodeCandidate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# DafnyArchitect → DafnySpec
+# ---------------------------------------------------------------------------
+
+class DafnySpec(BaseModel):
+    """Output of the DafnyArchitect agent: a standalone, self-contained Dafny method."""
+
+    dafny_source: str = Field(..., description="Complete Dafny method ready for `dafny verify`")
+    reasoning_trace: str = Field(
+        default="",
+        description="≤50-word explanation of postcondition choices",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Checker → CheckerReport
 # ---------------------------------------------------------------------------
 

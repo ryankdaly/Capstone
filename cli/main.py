@@ -21,24 +21,24 @@ from rich.console import Console
 def _configure_logging() -> None:
     """Route all log output to a file; keep the terminal clean.
 
-    By default Python prints WARNING+ to stderr, which mangles the Rich TUI.
-    We redirect everything to logs/hpema.log and silence the console entirely.
-    Chromadb's broken telemetry logger is suppressed here too.
+    logging.basicConfig() is a no-op when any library (e.g. chromadb) has
+    already touched the root logger before this function runs. We therefore
+    configure the handler explicitly — this is always safe to call.
     """
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        filename=log_dir / "hpema.log",
-        filemode="a",
+    file_handler = logging.FileHandler(log_dir / "hpema.log", mode="a")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     )
 
-    # Remove any console (StreamHandler) handlers added by basicConfig or
-    # third-party libraries so nothing leaks to stderr.
     root = logging.getLogger()
-    root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+    root.setLevel(logging.DEBUG)
+    # Replace whatever handlers exist (console noise from third-party libs)
+    # with exactly one: our file handler.
+    root.handlers = [file_handler]
 
     # Silence chromadb's broken telemetry — it prints even with telemetry=False
     # in chromadb 0.4–0.5 due to a bug in the telemetry client's capture() API.
