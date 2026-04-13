@@ -58,6 +58,16 @@ class DafnyRunner:
                 solver_output="No Dafny specification provided.",
             )
 
+        precheck_errors = self._syntax_precheck(dafny_source)
+        if precheck_errors:
+            logger.warning("Dafny pre-check failed (%d errors) — skipping subprocess", len(precheck_errors))
+            return VerificationResult(
+                verified=False,
+                prover="dafny",
+                solver_output="Pre-verification structural check failed. Dafny subprocess not invoked.",
+                failing_assertions=precheck_errors,
+            )
+
         start = time.monotonic()
 
         with tempfile.NamedTemporaryFile(
@@ -117,6 +127,53 @@ class DafnyRunner:
             solver_output=combined,
             failing_assertions=failing,
         )
+
+    @staticmethod
+    def _syntax_precheck(source: str) -> list[str]:
+        """Catch structural LLM mistakes before invoking the Dafny subprocess.
+
+        Returns a list of human-readable error strings. When non-empty the
+        subprocess is skipped entirely — the errors feed directly into the
+        DafnyArchitect retry via failing_assertions.
+        """
+        errors: list[str] = []
+
+        # Must have at least one method or function declaration
+        if not re.search(r"\b(method|function)\b", source):
+            errors.append(
+                "Spec must contain at least one 'method' or 'function' declaration"
+            )
+
+        # Must have at least one postcondition — otherwise nothing is verified
+        if not re.search(r"\bensures\b", source):
+            errors.append(
+                "Spec must have at least one 'ensures' postcondition — "
+                "without it Dafny cannot prove anything about the code"
+            )
+
+        # External library references — Dafny has no stdlib
+        extern_calls = re.findall(r"\b(?:math|Math|std|System|os|numpy|scipy)\.\w+", source)
+        if extern_calls:
+            errors.append(
+                f"Dafny has no external libraries. Found: {extern_calls}. "
+                "Express all logic inline — there is no math.exp, math.sqrt, etc."
+            )
+
+        # {:extern} — spec must be self-contained
+        if re.search(r"\{:extern\}", source):
+            errors.append("Spec must be self-contained — remove {:extern} attributes")
+
+        # C / Python types that are not valid Dafny
+        bad_types = re.findall(
+            r"\b(int32_t|uint8_t|uint32_t|int64_t|size_t|float|double)\b", source
+        )
+        if bad_types:
+            errors.append(
+                f"Found non-Dafny types: {sorted(set(bad_types))}. "
+                "Use Dafny types: int, bool, real, array<int>, seq<T>"
+            )
+
+        return errors
 
     @staticmethod
     def _parse_failing_assertions(output: str) -> list[str]:

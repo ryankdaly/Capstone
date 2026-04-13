@@ -33,6 +33,7 @@ from backend.api.schemas.pipeline import (
 )
 from backend.services.agents.actor import ActorAgent
 from backend.services.agents.checker import CheckerAgent
+from backend.services.agents.dafny_architect import DafnyArchitectAgent
 from backend.services.agents.policy import PolicyAgent
 from backend.services.audit.logger import AuditLogger
 from backend.services.feedback import compose_feedback
@@ -75,6 +76,7 @@ class PipelineOrchestrator:
 
         # Agents
         self._actor = ActorAgent(self._llm)
+        self._dafny_architect = DafnyArchitectAgent(self._llm)
         self._checker = CheckerAgent(self._llm)
         self._policy = PolicyAgent(self._llm)
 
@@ -147,15 +149,39 @@ class PipelineOrchestrator:
                     data=code_candidate.model_dump(),
                 )
 
-                # --- CHECKER + DAFNY (parallel) — requires stage >= CHECKER ---
+                # --- DAFNY ARCHITECT + CHECKER + DAFNY VERIFIER ---
+                # Requires stage >= CHECKER. DafnyArchitect runs first (sequential),
+                # then Checker and DafnyRunner run in parallel against its output.
                 checker_report = None
                 verification_result = None
                 test_result: TestRunResult | None = None
-
-                # Guard: if Actor produced no Dafny spec, note it in feedback
-                has_dafny_spec = bool(code_candidate.dafny_spec and code_candidate.dafny_spec.strip())
+                has_dafny_spec = False
 
                 if stage_enabled(PipelineStage.CHECKER, max_stage):
+                    # DafnyArchitect: translate Actor source code → Dafny spec
+                    yield self._event(run_id, StreamEventType.AGENT_START, "dafny_architect")
+                    self._audit.log(run_id, "agent_start", agent="dafny_architect", data={"iteration": i})
+
+                    prior_verification = feedback.verification_feedback if feedback else None
+                    dafny_result = await self._dafny_architect.run(
+                        source_code=code_candidate.source_code,
+                        requirement=request.requirement_text,
+                        language=request.target_language.value,
+                        verification_feedback=prior_verification,
+                    )
+                    code_candidate.dafny_spec = dafny_result.dafny_source
+                    has_dafny_spec = bool(code_candidate.dafny_spec.strip())
+
+                    yield self._event(
+                        run_id, StreamEventType.AGENT_OUTPUT, "dafny_architect",
+                        {
+                            "dafny_spec": dafny_result.dafny_source,
+                            "reasoning_trace": dafny_result.reasoning_trace,
+                        },
+                    )
+                    self._audit.log(run_id, "agent_output", agent="dafny_architect",
+                                    data=dafny_result.model_dump())
+
                     yield self._event(run_id, StreamEventType.AGENT_START, "checker")
                     yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
 
@@ -330,17 +356,6 @@ class PipelineOrchestrator:
                         verification_feedback=feedback.verification_feedback,
                         policy_feedback=feedback.policy_feedback,
                         priority_summary=f"{regression_note} | {feedback.priority_summary}",
-                    )
-                    iteration.feedback = feedback
-
-                # Nudge Actor if Dafny spec was missing
-                if not has_dafny_spec and feedback is not None:
-                    feedback = FeedbackMessage(
-                        iteration=feedback.iteration,
-                        checker_feedback=feedback.checker_feedback,
-                        verification_feedback=feedback.verification_feedback,
-                        policy_feedback=feedback.policy_feedback,
-                        priority_summary=f"MISSING DAFNY SPEC: You MUST generate a dafny_spec with requires/ensures clauses. | {feedback.priority_summary}",
                     )
                     iteration.feedback = feedback
 

@@ -8,12 +8,13 @@ the json_schema response_format (Groq, Anthropic, older endpoints, etc.).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from typing import Any, Type
 
-from openai import AsyncOpenAI, BadRequestError
+from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
@@ -21,7 +22,6 @@ from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
 logger = logging.getLogger(__name__)
 
 # Error substrings that indicate the provider rejected the response_format param.
-# This list covers common provider error messages.
 _CONSTRAINED_DECODING_ERRORS = (
     "response_format",
     "json_schema",
@@ -31,6 +31,24 @@ _CONSTRAINED_DECODING_ERRORS = (
     "invalid_request_error",
 )
 
+# Error substrings that indicate the provider doesn't support the system role
+# (e.g. Gemma family models via NVIDIA API, some Mistral endpoints).
+_NO_SYSTEM_ROLE_ERRORS = (
+    "system role not supported",
+    "system role is not supported",
+    "does not support system",
+    "system messages are not supported",
+)
+
+# 400 errors that are transient platform failures, not capability gaps.
+# These should be retried like a 500, not treated as permanent incompatibilities.
+_TRANSIENT_REQUEST_ERRORS = (
+    "degraded",
+    "function cannot be invoked",
+    "service unavailable",
+    "temporarily unavailable",
+)
+
 
 class LLMClient:
     """Async client that talks to any OpenAI-compatible endpoint."""
@@ -38,9 +56,10 @@ class LLMClient:
     def __init__(self, registry: ModelRegistry | None = None) -> None:
         self._registry = registry or ModelRegistry()
         self._clients: dict[str, AsyncOpenAI] = {}
-        # Track which endpoints don't support constrained decoding so we skip
-        # the first attempt on subsequent calls.
+        # Track capability gaps per endpoint so we skip the overhead of a
+        # failing first attempt on subsequent calls to the same endpoint.
         self._no_constrained_decoding: set[str] = set()
+        self._no_system_role: set[str] = set()
 
     def _get_client(self, model: ResolvedModel) -> AsyncOpenAI:
         """Lazily create one AsyncOpenAI client per unique endpoint."""
@@ -48,8 +67,26 @@ class LLMClient:
             self._clients[model.endpoint] = AsyncOpenAI(
                 base_url=model.endpoint,
                 api_key=model.api_key or "unused",
+                # Explicit timeouts: fail fast on connection problems, allow
+                # up to 3 min for large models to stream their first token.
+                # Without this httpx defaults to 600 s, making hangs invisible.
+                timeout=180.0,
             )
         return self._clients[model.endpoint]
+
+    def _messages(self, endpoint: str, system_prompt: str, user_prompt: str) -> list[dict]:
+        """Build the messages list for a chat request.
+
+        For endpoints that don't support the system role (e.g. Gemma via
+        NVIDIA API), the system content is prepended to the first user
+        message so the model still receives its full instructions.
+        """
+        if endpoint in self._no_system_role:
+            return [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
     async def aclose(self) -> None:
         """Close all httpx connection pools while the event loop is still open.
@@ -61,6 +98,46 @@ class LLMClient:
         for client in self._clients.values():
             await client.close()
         self._clients.clear()
+
+    async def _api_call(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
+        """Execute one chat completion, retrying on transient server errors.
+
+        Retries on:
+          - InternalServerError (500): EngineCore crash, vLLM restart
+          - RateLimitError (429): upstream throttling
+          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS: NVIDIA NIM
+            "DEGRADED function" and similar platform-unavailability messages
+
+        Genuine 400s (wrong response_format, unsupported system role) do NOT
+        match _TRANSIENT_REQUEST_ERRORS and are re-raised immediately so the
+        outer capability-detection loop in generate() can handle them.
+        """
+        delays = [5, 15]  # seconds between attempts 1→2 and 2→3
+        for attempt, delay in enumerate([-1] + delays):  # attempt 0 has no pre-sleep
+            if delay >= 0:
+                logger.warning(
+                    "Transient API error — retrying in %ds (attempt %d/3)...",
+                    delay, attempt + 1,
+                )
+                await asyncio.sleep(delay)
+            try:
+                return await client.chat.completions.create(**kwargs)
+            except (InternalServerError, RateLimitError) as exc:
+                if attempt == len(delays):
+                    raise
+                logger.warning("API error (%s): %s", type(exc).__name__, exc)
+            except BadRequestError as exc:
+                # Some providers (NVIDIA NIM) return 400 for transient platform
+                # failures ("DEGRADED function cannot be invoked"). These are not
+                # capability gaps — retry them like a 500. Genuine 400s (wrong
+                # response_format, unsupported system role) do NOT match these
+                # patterns and are re-raised immediately for the outer loop.
+                if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
+                    if attempt == len(delays):
+                        raise
+                    logger.warning("Transient 400 from API (%s): %s", type(exc).__name__, exc)
+                else:
+                    raise
 
     async def generate(
         self,
@@ -95,74 +172,88 @@ class LLMClient:
         """
         resolved = self._registry.get(role)
         client = self._get_client(resolved)
+        endpoint = resolved.endpoint
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        kwargs: dict[str, Any] = {
+        kwargs_base: dict[str, Any] = {
             "model": resolved.model,
-            "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-
         if extra_params:
-            kwargs.update(extra_params)
+            kwargs_base.update(extra_params)
+        # Model-level extra_body (e.g. chat_template_kwargs for NVIDIA NIM) is
+        # passed via the openai SDK's extra_body so it lands in the JSON payload
+        # without the SDK stripping unknown fields.
+        if resolved.extra_body:
+            kwargs_base["extra_body"] = resolved.extra_body
 
-        use_constrained = (
-            response_schema is not None
-            and resolved.endpoint not in self._no_constrained_decoding
-        )
+        # Retry loop — each pass may discover one new capability gap and adapt.
+        # At most 3 attempts: (1) preferred mode, (2) one fallback, (3) both fallbacks.
+        for _attempt in range(3):
+            use_constrained = (
+                response_schema is not None
+                and endpoint not in self._no_constrained_decoding
+            )
 
-        if use_constrained:
-            # Constrained decoding: json_schema response_format enforces the
-            # schema at the token level. Supported by vLLM and OpenAI.
-            schema_name = response_schema.__name__
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "schema": response_schema.model_json_schema(),
-                },
+            # In prompt-only mode inject the schema into the system prompt so
+            # the model knows what structure to produce without response_format.
+            eff_system = (
+                system_prompt + _json_prompt_suffix(response_schema)
+                if response_schema and not use_constrained
+                else system_prompt
+            )
+
+            kwargs: dict[str, Any] = {
+                **kwargs_base,
+                "messages": self._messages(endpoint, eff_system, user_prompt),
             }
 
-        logger.info(
-            "LLM request to %s [%s] model=%s constrained=%s",
-            role, resolved.endpoint, resolved.model, use_constrained,
-        )
-
-        try:
-            response = await client.chat.completions.create(**kwargs)
-        except BadRequestError as exc:
-            # Provider rejected response_format — fall back to prompt-only mode.
-            err_lower = str(exc).lower()
-            if response_schema is not None and any(
-                kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
-            ):
-                logger.info(
-                    "Endpoint %s does not support constrained decoding — "
-                    "using prompt-only JSON enforcement instead.",
-                    resolved.endpoint,
-                )
-                self._no_constrained_decoding.add(resolved.endpoint)
-                # Retry without response_format, schema injected into system prompt
-                kwargs.pop("response_format", None)
-                kwargs["messages"] = [
-                    {
-                        "role": "system",
-                        "content": system_prompt + _json_prompt_suffix(response_schema),
+            if use_constrained:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_schema.__name__,
+                        "schema": response_schema.model_json_schema(),
                     },
-                    {"role": "user", "content": user_prompt},
-                ]
-                response = await client.chat.completions.create(**kwargs)
-            else:
-                raise
+                }
 
-        content = response.choices[0].message.content or ""
-        logger.debug("LLM response from %s: %s chars", role, len(content))
-        return content
+            logger.info(
+                "LLM request to %s [%s] model=%s constrained=%s no_system_role=%s",
+                role, endpoint, resolved.model, use_constrained,
+                endpoint in self._no_system_role,
+            )
+
+            try:
+                response = await self._api_call(client, kwargs)
+                content = response.choices[0].message.content or ""
+                content = _strip_think_tags(content)
+                logger.debug("LLM response from %s: %s chars", role, len(content))
+                return content
+            except BadRequestError as exc:
+                err_lower = str(exc).lower()
+                if any(kw in err_lower for kw in _NO_SYSTEM_ROLE_ERRORS):
+                    logger.info(
+                        "Endpoint %s does not support system role — "
+                        "retrying with system content merged into user message.",
+                        endpoint,
+                    )
+                    self._no_system_role.add(endpoint)
+                elif response_schema is not None and any(
+                    kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
+                ):
+                    logger.info(
+                        "Endpoint %s does not support constrained decoding — "
+                        "retrying with prompt-only JSON enforcement.",
+                        endpoint,
+                    )
+                    self._no_constrained_decoding.add(endpoint)
+                else:
+                    raise
+
+        raise RuntimeError(
+            f"Request to {endpoint} failed after 3 fallback attempts. "
+            "Model may not be compatible with this pipeline."
+        )
 
     async def generate_structured(
         self,
@@ -178,12 +269,6 @@ class LLMClient:
         client fell back to prompt-only mode), the raw output may contain
         markdown fences or prose — _extract_json handles that gracefully.
         """
-        # If this endpoint is already known to not support constrained decoding,
-        # inject the schema into the system prompt up front.
-        resolved = self._registry.get(role)
-        if resolved.endpoint in self._no_constrained_decoding:
-            system_prompt = system_prompt + _json_prompt_suffix(response_model)
-
         raw = await self.generate(
             role=role,
             system_prompt=system_prompt,
@@ -360,6 +445,16 @@ def _extract_json_dict(text: str) -> dict:
         except json.JSONDecodeError:
             pass
     return {}
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks produced by reasoning models.
+
+    Models like Gemma 4 (enable_thinking=True), DeepSeek-R1, and QwQ emit
+    chain-of-thought inside these tags before the actual response. We want
+    only the final answer — the think block content is discarded.
+    """
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
 
 
 def _fix_code_formatting(raw_json: str) -> str:

@@ -5,16 +5,29 @@
 models:
   actor:
     endpoint: "https://integrate.api.nvidia.com/v1"
-    model: "tiiuae/falcon3-7b-instruct"
+    model: "google/gemma-4-31b-it"
     api_key_env: "NVIDIA_API_KEY"
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
   checker:
     endpoint: "https://integrate.api.nvidia.com/v1"
-    model: "tiiuae/falcon3-7b-instruct"
+    model: "google/gemma-4-31b-it"
     api_key_env: "NVIDIA_API_KEY"
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
   policy:
     endpoint: "http://localhost:8001/v1"
     model: "Qwen/Qwen2.5-Coder-7B-Instruct"
     api_key_env: "HPEMA_API_KEY"
+  dafny_architect:
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "google/gemma-4-31b-it"
+    api_key_env: "NVIDIA_API_KEY"
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
 
 policies:
   standards_dir: "data/standards"
