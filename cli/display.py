@@ -6,6 +6,7 @@ color-coded verdicts, and a final summary panel.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -13,7 +14,6 @@ from rich.align import Align
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -46,19 +46,110 @@ _LOGO_COLORS = [
 
 # Agent role → (display name, color)
 AGENT_STYLE = {
-    "actor": ("Actor", "blue"),
-    "dafny_architect": ("Dafny Architect", "magenta"),
-    "checker": ("Checker", "yellow"),
-    "dafny_verifier": ("Dafny Verifier", "magenta"),
-    "test_runner": ("Test Runner", "cyan"),
-    "policy": ("Policy", "green"),
+    "actor":          ("Actor",                    "blue"),
+    "dafny_architect":("Dafny Architect",          "magenta"),
+    "checker":        ("Checker",                  "yellow"),
+    "checker_dafny":  ("Checker + Dafny Verifier", "yellow"),
+    "dafny_verifier": ("Dafny Verifier",           "magenta"),
+    "test_runner":    ("Test Runner",              "cyan"),
+    "policy":         ("Policy",                   "green"),
 }
+
+# Per-agent personality verbs — cycled in the spinner label while the agent runs.
+_AGENT_VERBS: dict[str, list[str]] = {
+    "actor":           ["thinking",        "composing",          "drafting",           "reasoning",           "writing"],
+    "dafny_architect": ["specifying",      "formalizing",        "annotating",         "building invariants", "verifying logic"],
+    "checker":         ["reviewing",       "analyzing",          "auditing",           "scrutinizing",        "inspecting"],
+    "checker_dafny":   ["reviewing + proving", "analyzing + solving", "auditing + verifying", "inspecting + checking", "reasoning + solving"],
+    "dafny_verifier":  ["solving",         "proving",            "checking assertions","running Z3",          "reasoning"],
+    "test_runner":     ["executing",       "collecting tests",   "running pytest",     "measuring coverage",  "asserting"],
+    "policy":          ["evaluating",      "cross-referencing",  "auditing standards", "checking compliance", "reasoning"],
+}
+
+
+class _DynamicSpinner:
+    """Rich renderable: animated spinner with cycling personality verbs.
+
+    Implements ``__rich__`` so Rich re-evaluates each frame when used inside
+    ``Live(refresh_per_second=…)``.  Returns a fresh renderable every call
+    to avoid the one-shot exhaustion problem of ``__rich_console__``.
+
+    Optionally includes a full-width status bar below the spinner so the
+    mode + command hints stay visible while agents are working.
+    """
+
+    _DOT_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _VERB_INTERVAL = 5.0  # seconds between verb changes (increased from 3.5s)
+
+    def __init__(self, agent: str) -> None:
+        name, color = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "white"))
+        self._name = name
+        self._color = color
+        self._verbs = _AGENT_VERBS.get(agent, ["working"])
+        self._start = time.monotonic()
+
+    def __rich__(self) -> Text:
+        elapsed = time.monotonic() - self._start
+        verb = self._verbs[int(elapsed / self._VERB_INTERVAL) % len(self._verbs)]
+        frame = self._DOT_FRAMES[int(elapsed * 8) % len(self._DOT_FRAMES)]
+
+        line = Text()
+        line.append(f"  {frame} ", style=f"bold {self._color}")
+        line.append(f"{self._name}", style=f"bold {self._color}")
+        line.append(" is ")
+        line.append(f"{verb}", style="italic")
+        line.append("...")
+
+        # Right-aligned timer
+        timer_text = f"{elapsed:.1f}s"
+        padding = max(0, console.width - line.cell_len - len(timer_text) - 2)
+        line.append(" " * padding)
+        line.append(timer_text, style="dim")
+
+        return line
 
 VERDICT_STYLE = {
     "pass": ("PASS", "bold green"),
     "fail": ("FAIL", "bold red"),
     "warn": ("WARN", "bold yellow"),
 }
+
+
+# Persistent status bar — printed by the REPL and DisplayManager
+# ---------------------------------------------------------------------------
+
+def _build_status_bar_text(mode: str, hints: str = "") -> Text:
+    """Build a full-width status bar Text object (shared by print + spinner)."""
+    mode_label = mode.upper()
+    mode_color = "green" if mode == "build" else "cyan"
+    cols = console.width
+
+    bar = Text()
+    bar.append(f" {mode_label} ", style=f"bold white on {mode_color}")
+    if hints:
+        bar.append(f"  {hints}", style="dim")
+
+    padding = max(0, cols - bar.cell_len)
+    bar.append(" " * padding)
+    bar.stylize("on #1e1e2e")
+    return bar
+
+
+def _build_status_bar_html(mode: str, hints: str = "") -> str:
+    """Convert status bar to prompt_toolkit HTML for background app."""
+    mode_label = mode.upper()
+    mode_fg = "#a6e3a1" if mode == "build" else "#89dceb"
+    return (
+        f'<style bg="#1e1e2e">'
+        f'<b fg="{mode_fg}"> {mode_label} </b>'
+        f'  <style fg="#6c7086">{hints}</style>'
+        f'</style>'
+    )
+
+
+def print_status_bar(mode: str = "build", hints: str = "") -> None:
+    """Print a one-line status bar at the current cursor position."""
+    console.print(_build_status_bar_text(mode, hints), highlight=False)
 
 
 class DisplayManager:
@@ -81,11 +172,10 @@ class DisplayManager:
     # Spinner helpers
     # ------------------------------------------------------------------
 
-    def _start_spinner(self, label: str, color: str) -> None:
-        """Start an animated spinner line. Replaces any existing spinner."""
+    def _start_spinner(self, agent: str) -> None:
+        """Start an animated spinner with cycling personality verbs."""
         self._stop_spinner()
-        spinner = Spinner("dots", text=Text.from_markup(f"  [bold {color}]{label}[/]"), style=color)
-        self._live = Live(spinner, refresh_per_second=12, transient=True, console=console)
+        self._live = Live(_DynamicSpinner(agent), refresh_per_second=12, transient=True, console=console)
         self._live.start()
 
     def _stop_spinner(self) -> None:
@@ -118,23 +208,22 @@ class DisplayManager:
 
     def _on_agent_start(self, event: StreamEvent) -> None:
         agent = event.agent or "unknown"
-        name, color = AGENT_STYLE.get(agent, (agent, "white"))
         self._agent_start_times[agent] = time.monotonic()
 
         if agent == "checker":
             # Checker and Dafny run in parallel — one spinner covers both
             console.print()
-            self._start_spinner("Checker  +  Dafny Verifier  working...", "yellow")
+            self._start_spinner("checker_dafny")
             return
         if agent == "dafny_verifier":
             # Spinner already running from checker start — nothing to do
             return
         if agent == "test_runner":
-            self._start_spinner("Test Runner  executing pytest...", "cyan")
+            self._start_spinner("test_runner")
             return
 
         console.print()
-        self._start_spinner(f"{name}  working...", color)
+        self._start_spinner(agent)
 
     def _on_agent_output(self, event: StreamEvent) -> None:
         self._stop_spinner()
@@ -606,6 +695,7 @@ def show_help() -> None:
     table.add_column("Command", style="bold cyan")
     table.add_column("Description")
     table.add_row("<requirement>", "Type any requirement to start the pipeline")
+    table.add_row("/mode <build|chat>", "Switch mode: build runs pipeline, chat talks to Actor (Shift+Tab toggles; Alt+Enter for newline in input)")
     table.add_row("/standard <name>", "Set safety standard (DO_178C, MISRA_C, NASA, Boeing_SDP)")
     table.add_row("/language <name>", "Set target language (Python, C, SPARK_Ada)")
     table.add_row("/iterations <n>", "Set max pipeline iterations")
@@ -617,7 +707,7 @@ def show_help() -> None:
     table.add_row("/pytest [N]", "Full pytest output for iteration N (default: last)")
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
-    table.add_row("/config", "Show current configuration")
+    table.add_row("/config [path]", "Show config or load a new config file")
     table.add_row("/help", "Show this help")
     table.add_row("/quit", "Exit")
     console.print()

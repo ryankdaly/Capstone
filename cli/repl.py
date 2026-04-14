@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import UUID
 
 from rich.console import Console
@@ -28,6 +29,8 @@ try:
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
     _PT_AVAILABLE = True
 except ImportError:
     _PT_AVAILABLE = False
@@ -38,6 +41,7 @@ _CMD_META: dict[str, str] = {
     "/standard":   "set safety standard",
     "/language":   "set target language",
     "/stage":      "set pipeline stage",
+    "/mode":       "switch Build/Chat mode (or Shift+Tab)",
     "/run-tests":  "toggle pytest execution",
     "/iterations": "set max iterations",
     "/last":       "show last run details",
@@ -46,7 +50,7 @@ _CMD_META: dict[str, str] = {
     "/pytest":     "full pytest output [N]",
     "/history":    "show run history [N]",
     "/audit":      "traceability matrix",
-    "/config":     "show current config",
+    "/config":     "show config or set config file path",
     "/help":       "show all commands",
     "/quit":       "exit HPEMA",
     "/exit":       "exit HPEMA",
@@ -56,6 +60,7 @@ _CMD_ARGS: dict[str, list[str]] = {
     "/standard":  ["DO_178C", "MISRA_C", "NASA", "Boeing_SDP"],
     "/language":  ["Python", "C", "SPARK_Ada"],
     "/stage":     ["actor", "checker", "policy"],
+    "/mode":      ["build", "chat"],
     "/run-tests": ["on", "off"],
 }
 
@@ -146,6 +151,15 @@ class Session:
         # Run history (most recent last)
         self.history: list[RunRecord] = []
 
+        # Input mode — "build" runs the full pipeline; "chat" is a direct LLM conversation
+        self.mode: str = "build"
+
+        # True while a pipeline or chat call is in-flight (drives toolbar suggestions)
+        self.agents_running: bool = False
+
+        # Conversation history for Chat mode
+        self.chat_history: list[dict] = []
+
     @property
     def last_state(self) -> PipelineState | None:
         return self.history[-1].state if self.history else None
@@ -157,6 +171,103 @@ class Session:
     @property
     def is_disconnected(self) -> bool:
         return self.stage != PipelineStage.POLICY
+
+
+# ---------------------------------------------------------------------------
+# Config hot-swap
+# ---------------------------------------------------------------------------
+
+def _set_config(path: str, session: Session) -> None:
+    """Set HPEMA_CONFIG to *path* and offer an immediate restart."""
+    import os
+    import sys
+
+    path = path.strip()
+    if not os.path.isfile(path):
+        show_error(f"Config file not found: {path}")
+        return
+
+    os.environ["HPEMA_CONFIG"] = path
+    session.config_source = path
+    console.print(f"  Config path set to: [bold]{path}[/]")
+    console.print("  [dim]Takes effect on next startup. Restart now to apply immediately.[/]")
+
+    if not _PT_AVAILABLE:
+        answer = console.input("  Restart now? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            return
+    else:
+        from prompt_toolkit.formatted_text import HTML
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.styles import Style
+
+        choice = {"val": 0}  # 0 = Yes, 1 = No
+
+        kb = KeyBindings()
+
+        @kb.add("left")
+        @kb.add("right")
+        @kb.add("tab")
+        def _swap(event):
+            choice["val"] = 1 - choice["val"]
+            event.app.invalidate()
+
+        @kb.add("enter")
+        @kb.add("c-m")
+        def _confirm(event):
+            event.app.exit(result=choice["val"])
+
+        @kb.add("c-c")
+        def _cancel(event):
+            choice["val"] = 1  # treat Ctrl-C as No
+            event.app.exit(result=1)
+
+        from prompt_toolkit import PromptSession as _PS
+        _confirm_session = _PS(
+            key_bindings=kb,
+            style=Style.from_dict({"prompt": "bold #89b4fa"}),
+        )
+
+        def _toolbar_fn():
+            yes_style = "bold #a6e3a1" if choice["val"] == 0 else ""
+            no_style  = "bold #f38ba8" if choice["val"] == 1 else ""
+            return HTML(
+                f'<style bg="#313244"> '
+                f'Restart HPEMA now?  '
+                f'<style fg="{"#a6e3a1" if choice["val"] == 0 else "#6c7086"}">[ Yes ]</style>'
+                f'  '
+                f'<style fg="{"#f38ba8" if choice["val"] == 1 else "#6c7086"}">[ No ]</style>'
+                f'  <style fg="#6c7086">← → to select · Enter to confirm</style>'
+                f' </style>'
+            )
+
+        try:
+            result = _confirm_session.prompt(
+                HTML('<b><style fg="#89b4fa">  Restart?</style></b> '),
+                bottom_toolbar=_toolbar_fn,
+                default="",
+            )
+            # result is "" (user typed Enter) — actual choice in choice["val"]
+        except (EOFError, KeyboardInterrupt):
+            choice["val"] = 1
+
+        if choice["val"] != 0:
+            console.print("  [dim]Restart skipped — new config will apply on next manual start.[/]")
+            return
+
+    # --- Restart ---
+    console.print("  [bold]Restarting HPEMA...[/]")
+    # Find .env relative to the project root (same dir as this file's package)
+    project_root = str(Path(__file__).resolve().parent.parent)
+    env_file = os.path.join(project_root, ".env")
+
+    if os.path.isfile(env_file):
+        restart_cmd = f"source {env_file} && HPEMA_CONFIG={path} python -m cli.main"
+    else:
+        restart_cmd = f"HPEMA_CONFIG={path} python -m cli.main"
+
+    os.execv("/bin/bash", ["/bin/bash", "-c", restart_cmd])
+    # os.execv replaces the process — code below never reached
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +288,11 @@ def _handle_command(line: str, session: Session) -> bool:
         show_help()
 
     elif cmd == "/config":
-        show_config(session.standard, session.language, session.max_iterations, session.model, session.stage, session.run_tests)
+        if not arg:
+            show_config(session.standard, session.language, session.max_iterations, session.model, session.stage, session.run_tests)
+        else:
+            _set_config(arg, session)
+            return True  # may have restarted; if not, continue REPL
 
     elif cmd == "/standard":
         if not arg:
@@ -217,6 +332,19 @@ def _handle_command(line: str, session: Session) -> bool:
                 show_error("Usage: /history [N]")
                 return True
         _show_history(session, n)
+
+    elif cmd == "/mode":
+        if not arg:
+            mode_color = "green" if session.mode == "build" else "cyan"
+            console.print(f"  Current mode: [{mode_color}]{session.mode.upper()}[/]")
+            console.print("  [dim]build — runs the full pipeline  |  chat — direct conversation with Actor[/]")
+            console.print("  [dim]Tip: Shift+Tab toggles instantly[/]")
+        elif arg.lower() in ("build", "chat"):
+            session.mode = arg.lower()
+            mode_color = "green" if session.mode == "build" else "cyan"
+            console.print(f"  Mode: [{mode_color}]{session.mode.upper()}[/]")
+        else:
+            show_error(f"Unknown mode: {arg}. Options: build, chat")
 
     elif cmd == "/stage":
         if not arg:
@@ -693,14 +821,68 @@ def start_repl() -> None:
 
     # Build input function — prompt_toolkit if available, plain fallback otherwise
     if _PT_AVAILABLE:
+        # --- Key bindings ---
+        _bindings = KeyBindings()
+
+        @_bindings.add("s-tab")
+        def _cycle_mode(event):  # noqa: F841
+            session.mode = "chat" if session.mode == "build" else "build"
+            # Redraw so the user sees the mode change in the bottom bar instantly
+            event.app.invalidate()
+
+        @_bindings.add("enter")
+        def _submit_input(event):  # noqa: F841
+            """Enter always submits (even in multiline mode)."""
+            event.current_buffer.validate_and_handle()
+
+        @_bindings.add("escape", "enter")
+        def _insert_newline(event):  # noqa: F841
+            """Alt/Meta+Enter inserts a newline so the input box grows."""
+            event.current_buffer.insert_text("\n")
+
+        # Minimal style — prompt_toolkit's bottom_toolbar shows the mode.
+        # We also style the 'buffer' (input area) and 'rule' for the boxed look.
+        _input_style = Style.from_dict({
+            "bottom-toolbar":      "bg:#313244 #a6adc8 noreverse",
+            "bottom-toolbar.text": "noreverse",
+            "prompt":              "bold #89b4fa",
+            "buffer":              "bg:#1e1e2e #cdd6f4", # Darker background for the input field
+            "rule":                "#45475a",             # Subtle color for separators
+        })
+
+        def _toolbar() -> HTML:
+            """Persistent bottom bar: mode left, command hints right."""
+            mode_label = "BUILD" if session.mode == "build" else "CHAT"
+            mode_fg = "#a6e3a1" if session.mode == "build" else "#89dceb"
+            return HTML(
+                f'<style bg="#313244">'
+                f'<b fg="{mode_fg}"> {mode_label} </b>'
+                f'  <style fg="#6c7086">Shift+Tab: mode · /help · /last · /config</style>'
+                f'</style>'
+            )
+
         _pt_session: PromptSession = PromptSession(
             completer=_HpemaCompleter(),
             history=InMemoryHistory(),
             auto_suggest=AutoSuggestFromHistory(),
             complete_while_typing=True,
+            style=_input_style,
+            key_bindings=_bindings,
+            multiline=True,
+            bottom_toolbar=_toolbar,
         )
+
         def _get_input() -> str:
-            return _pt_session.prompt(HTML("<b><ansibrightblue>hpema ></ansibrightblue></b> "))
+            from rich.rule import Rule
+            console.print(Rule(style="#45475a", title="[bold #89b4fa]Requirement[/]"))
+            # We use prompt_toolkit's standard prompt here, but the Rule above
+            # and the bottom_toolbar below create the 'boxed' feel.
+            # To make the input background fill the line, we'd need a custom layout,
+            # but styling 'buffer' is a good middle ground that works with PromptSession.
+            text = _pt_session.prompt(
+                HTML('<b><style fg="#89b4fa">hpema</style></b> › '),
+            ).strip()
+            return text
     else:
         def _get_input() -> str:  # type: ignore[misc]
             return console.input("[bold bright_blue]hpema >[/] ")
@@ -721,12 +903,43 @@ def start_repl() -> None:
                 break
             continue
 
-        # Treat as a requirement — run the pipeline
+        # --- Chat mode: direct LLM conversation, no pipeline ---
+        if session.mode == "chat":
+            from cli.display import _DynamicSpinner
+            from cli.runner import chat_with_actor
+            from rich.live import Live
+            console.print()
+            spinner = _DynamicSpinner("actor")
+            live = Live(spinner, refresh_per_second=12, transient=True, console=console)
+            live.start()
+            try:
+                response = chat_with_actor(line, session.chat_history)
+                live.stop()
+                session.chat_history.append({"role": "user", "content": line})
+                session.chat_history.append({"role": "assistant", "content": response})
+                from rich.markdown import Markdown
+                from rich.panel import Panel
+                console.print(Panel(
+                    Markdown(response),
+                    title="[bold bright_blue]HPEMA[/]",
+                    border_style="bright_blue",
+                    padding=(1, 2),
+                ))
+            except KeyboardInterrupt:
+                live.stop()
+                console.print("\n  [yellow]Chat interrupted.[/]")
+            except Exception as e:
+                live.stop()
+                show_error(str(e))
+            continue
+
+        # --- Build mode: run the full pipeline ---
         console.print()
         console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
 
         display = DisplayManager()
         run_start = time.monotonic()
+        session.agents_running = True
 
         try:
             state = run_pipeline(
@@ -754,3 +967,5 @@ def start_repl() -> None:
         except Exception as e:
             display.cleanup()
             show_error(str(e))
+        finally:
+            session.agents_running = False
