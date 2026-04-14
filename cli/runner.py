@@ -51,6 +51,58 @@ async def _run_async(
         await orchestrator._llm.aclose()
 
 
+_CHAT_TIMEOUT = 90  # seconds — fail fast rather than hanging
+
+
+async def _chat_async(message: str) -> str:
+    """Single Actor LLM call for Chat mode — no pipeline, no structured output."""
+    config = load_config()
+    registry = ModelRegistry(config)
+    client = LLMClient(registry)
+    
+    max_tries = 3
+    for attempt in range(1, max_tries + 1):
+        try:
+            if attempt > 1:
+                from cli.display import console
+                console.print(f"  [yellow]Retry {attempt-1}/{max_tries-1} — Actor timed out. Trying again...[/]")
+            
+            return await asyncio.wait_for(
+                client.generate(
+                    role="actor",
+                    system_prompt=(
+                        "You are HPEMA's Actor agent — a knowledgeable assistant for "
+                        "high-assurance and safety-critical software engineering. "
+                        "Answer questions helpfully and concisely. Only generate code "
+                        "if explicitly asked."
+                    ),
+                    user_prompt=message,
+                    temperature=0.4,
+                    max_tokens=2048,
+                ),
+                timeout=_CHAT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            if attempt == max_tries:
+                await client.aclose()
+                raise TimeoutError(
+                    f"Actor did not respond after {max_tries} tries ({_CHAT_TIMEOUT}s each) — "
+                    "the model endpoint may be overloaded or unreachable."
+                )
+            continue # Try again
+        except Exception:
+            await client.aclose()
+            raise
+    
+    await client.aclose()
+    return "" # Should not reach here
+
+
+def chat_with_actor(message: str, history: list | None = None) -> str:
+    """Blocking single-turn chat for CLI Chat mode."""
+    return asyncio.run(_chat_async(message))
+
+
 def run_pipeline(
     requirement: str,
     standard: str,
