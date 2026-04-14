@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Type
+from typing import Any, AsyncGenerator, Type
 
 from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
@@ -255,27 +255,12 @@ class LLMClient:
             "Model may not be compatible with this pipeline."
         )
 
-    async def generate_structured(
-        self,
-        role: str,
-        system_prompt: str,
-        user_prompt: str,
-        response_model: Type[BaseModel],
-        **kwargs: Any,
-    ) -> BaseModel:
-        """Generate and parse into a Pydantic model.
+    def parse_structured(self, raw: str, response_model: Type[BaseModel], role: str = "?") -> BaseModel:
+        """Parse raw LLM text into a Pydantic model.
 
-        Tries constrained decoding first. If the provider rejected it (and the
-        client fell back to prompt-only mode), the raw output may contain
-        markdown fences or prose — _extract_json handles that gracefully.
+        Extracted so both generate_structured() and streaming callers can reuse
+        the same JSON-extraction / fallback logic without duplicating it.
         """
-        raw = await self.generate(
-            role=role,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_schema=response_model,
-            **kwargs,
-        )
         raw = _fix_code_formatting(raw)
 
         # First: try direct parse (works when constrained decoding succeeded)
@@ -318,6 +303,123 @@ class LLMClient:
                 f"Last error: {exc}. "
                 f"Raw output (first 300 chars): {raw[:300]}"
             ) from exc
+
+    async def generate_structured(
+        self,
+        role: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        **kwargs: Any,
+    ) -> BaseModel:
+        """Generate and parse into a Pydantic model.
+
+        Tries constrained decoding first. If the provider rejected it (and the
+        client fell back to prompt-only mode), the raw output may contain
+        markdown fences or prose — _extract_json handles that gracefully.
+        """
+        raw = await self.generate(
+            role=role,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_schema=response_model,
+            **kwargs,
+        )
+        return self.parse_structured(raw, response_model, role)
+
+    async def generate_stream(
+        self,
+        role: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: Type[BaseModel] | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        extra_params: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream text chunks from the LLM endpoint.
+
+        Yields raw string chunks as they arrive from the model. Callers should
+        accumulate them and call ``parse_structured()`` on the joined text.
+
+        Graceful fallback: if the endpoint does not support streaming (or the
+        streaming call fails for any reason), this falls back to a single
+        blocking ``generate()`` call and yields the full response as one chunk.
+        Models without streaming support therefore behave identically from the
+        caller's perspective — they just don't produce intermediate tokens.
+        """
+        resolved = self._registry.get(role)
+        client = self._get_client(resolved)
+        endpoint = resolved.endpoint
+
+        kwargs_base: dict[str, Any] = {
+            "model": resolved.model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if extra_params:
+            kwargs_base.update(extra_params)
+        if resolved.extra_body:
+            kwargs_base["extra_body"] = resolved.extra_body
+
+        use_constrained = (
+            response_schema is not None
+            and endpoint not in self._no_constrained_decoding
+        )
+        eff_system = (
+            system_prompt + _json_prompt_suffix(response_schema)
+            if response_schema and not use_constrained
+            else system_prompt
+        )
+        kwargs: dict[str, Any] = {
+            **kwargs_base,
+            "messages": self._messages(endpoint, eff_system, user_prompt),
+        }
+        if use_constrained:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema.__name__,
+                    "schema": response_schema.model_json_schema(),
+                },
+            }
+
+        # Attempt streaming — fall back to non-streaming on any failure.
+        stream_obj = None
+        try:
+            stream_obj = await client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            logger.warning(
+                "Streaming request failed for %s (%s: %s) — falling back.",
+                role, type(exc).__name__, exc,
+            )
+
+        if stream_obj is not None:
+            try:
+                async for chunk in stream_obj:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+                return  # streaming complete
+            except Exception as exc:
+                logger.warning(
+                    "Streaming interrupted for %s (%s: %s) — falling back.",
+                    role, type(exc).__name__, exc,
+                )
+                # Fall through to non-streaming fallback below.
+
+        # Non-streaming fallback: yields the full response as one chunk.
+        logger.info("Using non-streaming fallback for %s", role)
+        text = await self.generate(
+            role=role,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_schema=response_schema,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_params=extra_params,
+        )
+        yield text
 
 
 def _json_prompt_suffix(schema: Type[BaseModel]) -> str:

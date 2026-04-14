@@ -115,6 +115,7 @@ class PipelineState(BaseModel):
 
 class StreamEventType(str, Enum):
     AGENT_START = "agent_start"
+    AGENT_TOKEN = "agent_token"          # incremental text chunk while generating
     AGENT_OUTPUT = "agent_output"
     AGENT_ERROR = "agent_error"
     TEST_RUN = "test_run"

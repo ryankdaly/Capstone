@@ -905,20 +905,44 @@ def start_repl() -> None:
 
         # --- Chat mode: direct LLM conversation, no pipeline ---
         if session.mode == "chat":
+            import asyncio as _asyncio
             from cli.display import _DynamicSpinner
-            from cli.runner import chat_with_actor
+            from cli.runner import chat_stream
             from rich.live import Live
+            from rich.markdown import Markdown
+            from rich.panel import Panel
             console.print()
-            spinner = _DynamicSpinner("actor")
-            live = Live(spinner, refresh_per_second=12, transient=True, console=console)
+
+            collected: list[str] = []
+
+            class _ChatPanel:
+                """Live renderable: spinner until first token, then growing panel."""
+
+                def __init__(self) -> None:
+                    self._spinner = _DynamicSpinner("actor")
+
+                def __rich__(self):
+                    text = "".join(collected)
+                    if not text:
+                        return self._spinner.__rich__()
+                    return Panel(
+                        Markdown(text),
+                        title="[bold bright_blue]HPEMA[/]",
+                        border_style="bright_blue",
+                        padding=(1, 2),
+                    )
+
+            chat_panel = _ChatPanel()
+            live = Live(chat_panel, refresh_per_second=12, console=console)
             live.start()
             try:
-                response = chat_with_actor(line, session.chat_history)
+                response = _asyncio.run(
+                    chat_stream(line, on_token=collected.append)
+                )
                 live.stop()
                 session.chat_history.append({"role": "user", "content": line})
                 session.chat_history.append({"role": "assistant", "content": response})
-                from rich.markdown import Markdown
-                from rich.panel import Panel
+                # Final render (in case Live ended before last refresh)
                 console.print(Panel(
                     Markdown(response),
                     title="[bold bright_blue]HPEMA[/]",
