@@ -563,7 +563,7 @@ def show_logo() -> None:
             logo.append("\n")
 
     subtitle = Text(
-        "Hierarchical Policy-Enforced Multi-Agent  ·  v0.2.0",
+        "Hierarchical Policy-Enforced Multi-Agent  ·  v0.3.0",
         style="dim",
         justify="center",
     )
