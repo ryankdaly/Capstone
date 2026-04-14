@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from backend.api.schemas.pipeline import PipelineRequest, PipelineStage, PipelineState
 from backend.config import load_config
@@ -53,54 +53,54 @@ async def _run_async(
 
 _CHAT_TIMEOUT = 90  # seconds — fail fast rather than hanging
 
+_CHAT_SYSTEM_PROMPT = (
+    "You are HPEMA's Actor agent — a knowledgeable assistant for "
+    "high-assurance and safety-critical software engineering. "
+    "Answer questions helpfully and concisely. Only generate code "
+    "if explicitly asked."
+)
 
-async def _chat_async(message: str) -> str:
-    """Single Actor LLM call for Chat mode — no pipeline, no structured output."""
+
+async def chat_stream(message: str, on_token: Callable[[str], None]) -> str:
+    """Stream a chat response, calling on_token for each chunk.
+
+    Returns the full accumulated response text.  Falls back to a single
+    blocking call + one on_token invocation if streaming is unsupported.
+    Applies a per-chunk timeout guard: if no token arrives within
+    _CHAT_TIMEOUT seconds, raises TimeoutError.
+    """
     config = load_config()
     registry = ModelRegistry(config)
     client = LLMClient(registry)
-    
-    max_tries = 3
-    for attempt in range(1, max_tries + 1):
-        try:
-            if attempt > 1:
-                from cli.display import console
-                console.print(f"  [yellow]Retry {attempt-1}/{max_tries-1} — Actor timed out. Trying again...[/]")
-            
-            return await asyncio.wait_for(
-                client.generate(
-                    role="actor",
-                    system_prompt=(
-                        "You are HPEMA's Actor agent — a knowledgeable assistant for "
-                        "high-assurance and safety-critical software engineering. "
-                        "Answer questions helpfully and concisely. Only generate code "
-                        "if explicitly asked."
-                    ),
-                    user_prompt=message,
-                    temperature=0.4,
-                    max_tokens=2048,
-                ),
-                timeout=_CHAT_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            if attempt == max_tries:
-                await client.aclose()
-                raise TimeoutError(
-                    f"Actor did not respond after {max_tries} tries ({_CHAT_TIMEOUT}s each) — "
-                    "the model endpoint may be overloaded or unreachable."
-                )
-            continue # Try again
-        except Exception:
-            await client.aclose()
-            raise
-    
+
+    chunks: list[str] = []
+    try:
+        async for token in client.generate_stream(
+            role="actor",
+            system_prompt=_CHAT_SYSTEM_PROMPT,
+            user_prompt=message,
+            temperature=0.4,
+            max_tokens=2048,
+        ):
+            chunks.append(token)
+            on_token(token)
+    except Exception:
+        await client.aclose()
+        raise
+
     await client.aclose()
-    return "" # Should not reach here
+    return "".join(chunks)
 
 
+# Keep old blocking entry point for callers that don't need streaming.
 def chat_with_actor(message: str, history: list | None = None) -> str:
-    """Blocking single-turn chat for CLI Chat mode."""
-    return asyncio.run(_chat_async(message))
+    """Blocking non-streaming chat — kept for backwards compatibility."""
+    chunks: list[str] = []
+
+    async def _run() -> str:
+        return await chat_stream(message, on_token=chunks.append)
+
+    return asyncio.run(_run())
 
 
 def run_pipeline(

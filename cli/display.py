@@ -108,6 +108,107 @@ class _DynamicSpinner:
 
         return line
 
+_STREAM_MAX_LINES = 10  # max visible lines of streaming text in the panel
+
+
+def _render_stream_text(full_text: str, visible_text: str) -> Text:
+    """Render visible streaming text, dimming ``<think>`` content.
+
+    *full_text* is the complete accumulated text (used to detect whether the
+    visible window starts inside a think-block).  *visible_text* is the
+    portion to actually render.
+    """
+    body = Text()
+    if not visible_text:
+        return body
+
+    # Determine whether we enter the visible window already inside a think block.
+    prefix_len = len(full_text) - len(visible_text)
+    prefix = full_text[:prefix_len]
+    in_think = prefix.count("<think>") > prefix.count("</think>")
+
+    i = 0
+    seg = 0
+    while i < len(visible_text):
+        if not in_think and visible_text[i : i + 7] == "<think>":
+            if i > seg:
+                body.append(visible_text[seg:i], style="dim #cdd6f4")
+            seg = i + 7
+            i += 7
+            in_think = True
+        elif in_think and visible_text[i : i + 8] == "</think>":
+            body.append(visible_text[seg:i], style="dim italic #45475a")
+            seg = i + 8
+            i += 8
+            in_think = False
+        else:
+            i += 1
+
+    tail = visible_text[seg:]
+    if tail:
+        body.append(tail, style="dim italic #45475a" if in_think else "dim #cdd6f4")
+
+    return body
+
+
+class _StreamingPanel:
+    """Live renderable shown while an LLM agent is generating.
+
+    Displays an animated header (spinner + cycling verb + elapsed time) plus a
+    scrolling body of the last ``_STREAM_MAX_LINES`` raw lines streamed from
+    the model.  ``<think>`` blocks are rendered in a dimmer italic style so
+    chain-of-thought is visually distinct from actual output.
+
+    Token chunks are appended via ``add_token()`` from the event handler; the
+    Rich refresh thread calls ``__rich__()`` at 12 fps to pick up changes.
+    """
+
+    _DOT_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _VERB_INTERVAL = 5.0
+
+    def __init__(self, agent: str) -> None:
+        name, color = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "white"))
+        self._name = name
+        self._color = color
+        self._verbs = _AGENT_VERBS.get(agent, ["working"])
+        self._start = time.monotonic()
+        self._chunks: list[str] = []  # GIL-safe for CPython append + read
+
+    def add_token(self, token: str) -> None:
+        self._chunks.append(token)
+
+    def __rich__(self) -> Panel:
+        elapsed = time.monotonic() - self._start
+        verb = self._verbs[int(elapsed / self._VERB_INTERVAL) % len(self._verbs)]
+        frame = self._DOT_FRAMES[int(elapsed * 8) % len(self._DOT_FRAMES)]
+
+        # Snapshot chunks (safe: list read is consistent in CPython)
+        full_text = "".join(self._chunks)
+
+        # Trim to last MAX_LINES lines for the visible body
+        lines = full_text.splitlines()
+        if len(lines) > _STREAM_MAX_LINES:
+            visible_text = "\n".join(lines[-_STREAM_MAX_LINES:])
+        else:
+            visible_text = full_text
+
+        body = _render_stream_text(full_text, visible_text)
+
+        title = Text()
+        title.append(f" {frame} ", style=f"bold {self._color}")
+        title.append(self._name, style=f"bold {self._color}")
+        title.append(" is ")
+        title.append(verb, style="italic")
+        title.append(f"...  {elapsed:.1f}s", style="dim")
+
+        return Panel(
+            body,
+            title=title,
+            border_style=self._color,
+            padding=(0, 1),
+        )
+
+
 VERDICT_STYLE = {
     "pass": ("PASS", "bold green"),
     "fail": ("FAIL", "bold red"),
@@ -165,33 +266,42 @@ class DisplayManager:
         self.last_checker_output: dict[str, Any] = {}
         self.last_dafny_output: dict[str, Any] = {}
         self.last_policy_output: dict[str, Any] = {}
-        # Live spinner — active between AGENT_START and the first output event
+        # Live panel — active between AGENT_START and AGENT_OUTPUT
         self._live: Live | None = None
+        self._streaming_panel: _StreamingPanel | None = None
 
     # ------------------------------------------------------------------
-    # Spinner helpers
+    # Live panel helpers
     # ------------------------------------------------------------------
 
     def _start_spinner(self, agent: str) -> None:
-        """Start an animated spinner with cycling personality verbs."""
+        """Start a live streaming panel for the given agent."""
         self._stop_spinner()
-        self._live = Live(_DynamicSpinner(agent), refresh_per_second=12, transient=True, console=console)
+        self._streaming_panel = _StreamingPanel(agent)
+        self._live = Live(
+            self._streaming_panel,
+            refresh_per_second=12,
+            transient=True,
+            console=console,
+        )
         self._live.start()
 
     def _stop_spinner(self) -> None:
-        """Stop and erase the current spinner. No-op if none is running."""
+        """Stop and erase the current live panel. No-op if none running."""
         if self._live is not None:
             self._live.stop()
             self._live = None
+        self._streaming_panel = None
 
     def cleanup(self) -> None:
-        """Force-stop any running spinner. Call from exception handlers."""
+        """Force-stop any running live panel. Call from exception handlers."""
         self._stop_spinner()
 
     def handle_event(self, event: StreamEvent) -> None:
         """Route a stream event to the appropriate display method."""
         handlers = {
             StreamEventType.AGENT_START: self._on_agent_start,
+            StreamEventType.AGENT_TOKEN: self._on_agent_token,
             StreamEventType.AGENT_OUTPUT: self._on_agent_output,
             StreamEventType.AGENT_ERROR: self._on_agent_error,
             StreamEventType.TEST_RUN: self._on_test_run,
@@ -211,12 +321,13 @@ class DisplayManager:
         self._agent_start_times[agent] = time.monotonic()
 
         if agent == "checker":
-            # Checker and Dafny run in parallel — one spinner covers both
+            # Checker streams while dafny_verifier runs in background.
+            # Start a streaming panel labelled "checker_dafny".
             console.print()
             self._start_spinner("checker_dafny")
             return
         if agent == "dafny_verifier":
-            # Spinner already running from checker start — nothing to do
+            # Panel already started by the checker AGENT_START — skip.
             return
         if agent == "test_runner":
             self._start_spinner("test_runner")
@@ -224,6 +335,13 @@ class DisplayManager:
 
         console.print()
         self._start_spinner(agent)
+
+    def _on_agent_token(self, event: StreamEvent) -> None:
+        """Feed an incremental token into the live streaming panel."""
+        token = event.data.get("token", "")
+        if token and self._streaming_panel is not None:
+            self._streaming_panel.add_token(token)
+            # Rich Live auto-refreshes at 12 fps — no explicit update needed.
 
     def _on_agent_output(self, event: StreamEvent) -> None:
         self._stop_spinner()

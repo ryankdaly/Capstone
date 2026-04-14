@@ -124,12 +124,17 @@ class PipelineOrchestrator:
                 yield self._event(run_id, StreamEventType.AGENT_START, "actor")
                 self._audit.log(run_id, "agent_start", agent="actor", data={"iteration": i})
 
-                code_candidate = await self._actor.run(
+                code_candidate = None
+                async for _item in self._actor.run_streaming(
                     requirement=request.requirement_text,
                     language=request.target_language.value,
                     standard=request.safety_standard.value,
                     feedback=feedback,
-                )
+                ):
+                    if isinstance(_item, str):
+                        yield self._event(run_id, StreamEventType.AGENT_TOKEN, "actor", {"token": _item})
+                    else:
+                        code_candidate = _item
                 iteration.code_candidate = code_candidate
 
                 yield self._event(
@@ -163,12 +168,17 @@ class PipelineOrchestrator:
                     self._audit.log(run_id, "agent_start", agent="dafny_architect", data={"iteration": i})
 
                     prior_verification = feedback.verification_feedback if feedback else None
-                    dafny_result = await self._dafny_architect.run(
+                    dafny_result = None
+                    async for _item in self._dafny_architect.run_streaming(
                         source_code=code_candidate.source_code,
                         requirement=request.requirement_text,
                         language=request.target_language.value,
                         verification_feedback=prior_verification,
-                    )
+                    ):
+                        if isinstance(_item, str):
+                            yield self._event(run_id, StreamEventType.AGENT_TOKEN, "dafny_architect", {"token": _item})
+                        else:
+                            dafny_result = _item
                     code_candidate.dafny_spec = dafny_result.dafny_source
                     has_dafny_spec = bool(code_candidate.dafny_spec.strip())
 
@@ -185,16 +195,24 @@ class PipelineOrchestrator:
                     yield self._event(run_id, StreamEventType.AGENT_START, "checker")
                     yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
 
-                    checker_task = self._checker.run(
+                    # Run Dafny verifier in background (subprocess, no LLM tokens),
+                    # stream Checker in the foreground so tokens reach the display.
+                    dafny_task = asyncio.create_task(
+                        self._dafny.verify(code_candidate.dafny_spec)
+                    )
+
+                    checker_report = None
+                    async for _item in self._checker.run_streaming(
                         source_code=code_candidate.source_code,
                         language=request.target_language.value,
                         standard=request.safety_standard.value,
-                    )
-                    dafny_task = self._dafny.verify(code_candidate.dafny_spec)
+                    ):
+                        if isinstance(_item, str):
+                            yield self._event(run_id, StreamEventType.AGENT_TOKEN, "checker", {"token": _item})
+                        else:
+                            checker_report = _item
 
-                    checker_report, verification_result = await asyncio.gather(
-                        checker_task, dafny_task
-                    )
+                    verification_result = await dafny_task
 
                     iteration.checker_report = checker_report
                     iteration.verification_result = verification_result
@@ -270,14 +288,19 @@ class PipelineOrchestrator:
                         standard=request.safety_standard.value,
                     )
 
-                    policy_verdict = await self._policy.run(
+                    policy_verdict = None
+                    async for _item in self._policy.run_streaming(
                         source_code=code_candidate.source_code,
                         dafny_spec=code_candidate.dafny_spec,
                         standard=request.safety_standard.value,
                         checker_report=checker_report,
                         verification_result=verification_result,
                         policy_context=policy_context,
-                    )
+                    ):
+                        if isinstance(_item, str):
+                            yield self._event(run_id, StreamEventType.AGENT_TOKEN, "policy", {"token": _item})
+                        else:
+                            policy_verdict = _item
                     iteration.policy_verdict = policy_verdict
 
                     yield self._event(
