@@ -365,13 +365,25 @@ class DisplayManager:
         self._stop_spinner()
         error = event.data.get("error", "Unknown error")
         console.print()
-        console.print(
-            Panel(
-                f"[bold red]{error}[/]",
-                title="[bold red]Pipeline Error[/]",
-                border_style="red",
+        if event.data.get("skipped", False):
+            agent = event.agent or "agent"
+            name, _ = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "yellow"))
+            message = event.data.get("message", f"{name} skipped.")
+            console.print(
+                Panel(
+                    f"[bold yellow]{message}[/]",
+                    title=f"[bold yellow]{name} Skipped[/]",
+                    border_style="yellow",
+                )
             )
-        )
+        else:
+            console.print(
+                Panel(
+                    f"[bold red]{error}[/]",
+                    title="[bold red]Pipeline Error[/]",
+                    border_style="red",
+                )
+            )
 
     def _on_test_run(self, event: StreamEvent) -> None:
         self._stop_spinner()

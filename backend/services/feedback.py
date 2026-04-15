@@ -104,5 +104,6 @@ def compose_feedback(
         checker_feedback=checker_report,
         verification_feedback=verification_result,
         policy_feedback=policy_verdict,
+        test_feedback=test_result,
         priority_summary=" | ".join(priority_parts) if priority_parts else "All checks passed.",
     )
