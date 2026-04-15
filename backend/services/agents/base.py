@@ -20,7 +20,7 @@ from backend.services.llm.client import LLMClient, ThinkLoopError, _strip_think_
 logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "llm" / "prompts"
-_AGENT_LOG = Path(__file__).resolve().parent.parent.parent / "logs" / "agent.log"
+_AGENT_LOG = Path(__file__).resolve().parent.parent.parent.parent / "logs" / "agent.log"
 _agent_log_lock = threading.Lock()
 
 # --------------------------------------------------------------------------- #

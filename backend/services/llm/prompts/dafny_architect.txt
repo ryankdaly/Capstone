@@ -24,6 +24,15 @@ R10. Dafny has NO standard math library. exp(), log(), sin(), cos(), sqrt() do N
      rather than the exact computation. See the Sigmoid and Softmax examples below.
 R11. Use `real` literals with a decimal point: 0.0, 1.0, 0.5 — NOT 0, 1, 0 (those are int)
 R12. To cast int to real: write `x as real`. To cast real to int: write `r as int`.
+R12a. COMPARISON TYPE RULE — both sides of >, <, >=, <=, ==, != MUST be the same type.
+      Dafny rejects mixed int/real comparisons with "arguments must have a common supertype".
+      WRONG:  x > 0        when x: real   — 0 is int, x is real
+      WRONG:  result >= 1  when result: real
+      WRONG:  n < 3.0      when n: int
+      RIGHT:  x > 0.0      (real literal)
+      RIGHT:  result >= 1.0
+      RIGHT:  n as real < 3.0   OR   n < 3 (keep both int)
+      This applies to requires, ensures, if-conditions, loop invariants — everywhere.
 R13. Integer division truncates — use `real` arithmetic when fractional results are needed.
 R14. Recursive methods need a `decreases` clause on a quantity that strictly decreases.
 

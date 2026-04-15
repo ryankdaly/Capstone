@@ -802,12 +802,14 @@ def start_repl() -> None:
     # Rule 2: logo first, 1.5s pause, then config info
     show_logo()
     time.sleep(1.5)
+    config = load_config()
     show_startup_info(
         config_source=env_config,
         model=session.model,
         standard=session.standard,
         language=session.language,
         stage=session.stage,
+        models_config=config.models,
     )
 
     # Show large warning if running in disconnected (partial pipeline) mode
@@ -816,7 +818,6 @@ def start_repl() -> None:
 
     # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
     # Chat bar is naturally blocked until this returns.
-    config = load_config()
     wait_for_layers_ready(config, session.stage)
 
     # Build input function — prompt_toolkit if available, plain fallback otherwise
@@ -961,35 +962,80 @@ def start_repl() -> None:
         console.print()
         console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
 
-        display = DisplayManager()
-        run_start = time.monotonic()
         session.agents_running = True
+        retry_context = ""
+        requirement_text = line
 
         try:
-            state = run_pipeline(
-                requirement=line,
-                standard=session.standard,
-                language=session.language,
-                max_iterations=session.max_iterations,
-                display=display,
-                stage=session.stage,
-                run_tests=session.run_tests,
-            )
-            elapsed = time.monotonic() - run_start
-            if state is not None:
-                session.history.append(RunRecord(
-                    requirement=line,
-                    state=state,
-                    standard=session.standard,
-                    language=session.language,
-                    stage=session.stage.value,
-                    elapsed_seconds=elapsed,
-                ))
-        except KeyboardInterrupt:
-            display.cleanup()
-            console.print("\n  [yellow]Pipeline interrupted.[/]")
-        except Exception as e:
-            display.cleanup()
-            show_error(str(e))
+            while True:
+                display = DisplayManager()
+                run_start = time.monotonic()
+
+                try:
+                    state = run_pipeline(
+                        requirement=requirement_text,
+                        standard=session.standard,
+                        language=session.language,
+                        max_iterations=session.max_iterations,
+                        display=display,
+                        stage=session.stage,
+                        run_tests=session.run_tests,
+                        retry_context=retry_context,
+                    )
+                except KeyboardInterrupt:
+                    display.cleanup()
+                    console.print("\n  [yellow]Pipeline interrupted.[/]")
+                    break
+                except Exception as e:
+                    display.cleanup()
+                    show_error(str(e))
+                    break
+
+                elapsed = time.monotonic() - run_start
+
+                if state is not None:
+                    session.history.append(RunRecord(
+                        requirement=requirement_text,
+                        state=state,
+                        standard=session.standard,
+                        language=session.language,
+                        stage=session.stage.value,
+                        elapsed_seconds=elapsed,
+                    ))
+
+                # Only offer retry when pipeline failed (not cancelled/error)
+                if state is None or state.status.value != "failed":
+                    break
+
+                # --- Retry prompt ---
+                error_dump = display.build_error_dump()
+                console.print()
+                console.print(
+                    "  [bold yellow]All iterations failed.[/]  "
+                    "Feed error dump into a new run?"
+                )
+
+                if not _PT_AVAILABLE:
+                    answer = console.input(
+                        "  [bold]Retry loop?[/] [dim][Y/n][/] "
+                    ).strip().lower()
+                    do_retry = answer in ("", "y", "yes")
+                else:
+                    try:
+                        answer = _pt_session.prompt(  # type: ignore[name-defined]
+                            "  Retry loop? [Y/n] ",
+                        ).strip().lower()
+                        do_retry = answer in ("", "y", "yes")
+                    except (EOFError, KeyboardInterrupt):
+                        do_retry = False
+
+                if not do_retry:
+                    break
+
+                retry_context = error_dump
+                console.print(
+                    f"  [dim]Retrying with {len(error_dump)} chars of error context …[/]"
+                )
+                console.print()
         finally:
             session.agents_running = False

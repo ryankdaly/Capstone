@@ -470,13 +470,30 @@ class LLMClient:
 
         if stream_obj is not None:
             detector = _ThinkLoopDetector(role)
+            yielded_any = False
             try:
                 async for chunk in stream_obj:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        detector.feed(content)   # raises ThinkLoopError if loop found
-                        yield content
-                return  # streaming complete
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    # Primary content field (all standard models)
+                    token = delta.content or ""
+
+                    # Reasoning models (e.g. step-3.5-flash, QwQ) may route their
+                    # output through reasoning_content when response_format=json_schema
+                    # is active — delta.content stays empty the entire stream.
+                    # Fall back to reasoning_content so we at least have raw text to
+                    # attempt parsing.  We do NOT yield reasoning tokens for display
+                    # (they aren't part of the structured output) but we do accumulate
+                    # them so the empty-stream fallback below is not triggered.
+                    if not token:
+                        token = getattr(delta, "reasoning_content", None) or ""
+
+                    if token:
+                        detector.feed(token)     # raises ThinkLoopError if loop found
+                        yielded_any = True
+                        yield token
             except ThinkLoopError:
                 logger.warning(
                     "Think loop detected for %s — aborting stream and re-raising "
@@ -490,6 +507,22 @@ class LLMClient:
                     role, type(exc).__name__, exc,
                 )
                 # Fall through to non-streaming fallback below.
+            else:
+                # Stream completed without exception.
+                if not yielded_any and use_constrained:
+                    # Model returned HTTP 200 but emitted zero content tokens while
+                    # constrained decoding (response_format=json_schema) was active.
+                    # This is a silent capability gap — mark the endpoint and fall
+                    # through to the prompt-only non-streaming fallback.
+                    logger.info(
+                        "Endpoint %s returned empty stream with constrained decoding — "
+                        "flagging as no-constrained-decoding; falling back to "
+                        "prompt-only non-streaming call.",
+                        endpoint,
+                    )
+                    self._no_constrained_decoding.add(endpoint)
+                else:
+                    return  # streaming complete with content
 
         # Non-streaming fallback: yields the full response as one chunk.
         logger.info("Using non-streaming fallback for %s", role)

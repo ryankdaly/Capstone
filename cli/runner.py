@@ -25,12 +25,17 @@ if TYPE_CHECKING:
 
 def _build_orchestrator() -> PipelineOrchestrator:
     """Wire up the orchestrator with all dependencies from config."""
+    from backend.config import PROJECT_ROOT
     config = load_config()
     registry = ModelRegistry(config)
+    retriever = StandardsRetriever(
+        persist_dir=str(PROJECT_ROOT / config.policies.chromadb_dir),
+        auto_ingest_path=str(PROJECT_ROOT / config.policies.standards_dir),
+    )
     return PipelineOrchestrator(
         llm_client=LLMClient(registry),
         dafny_runner=DafnyRunner(),
-        retriever=StandardsRetriever(),
+        retriever=retriever,
         audit_logger=AuditLogger(),
     )
 
@@ -111,6 +116,7 @@ def run_pipeline(
     display: DisplayManager,
     stage: PipelineStage = PipelineStage.POLICY,
     run_tests: bool = True,
+    retry_context: str = "",
 ) -> PipelineState | None:
     """Run the full pipeline in-process. Blocking call.
 
@@ -123,6 +129,7 @@ def run_pipeline(
         max_iterations=max_iterations,
         stage=stage,
         run_tests=run_tests,
+        retry_context=retry_context,
     )
 
     return asyncio.run(_run_async(request, display))

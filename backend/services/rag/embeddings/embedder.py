@@ -17,16 +17,27 @@ class Embedder:
 
     def __init__(self, config: RAGConfig) -> None:
         """Initialize embedder with model.
-        
+
+        Model loading is deferred to first use — constructing this class
+        does NOT load the sentence-transformers model.
+
         Args:
             config: RAG configuration with embedding_model
         """
         self.config = config
         self._model = None
-        self._lazy_init()
+
+    @staticmethod
+    def is_available() -> bool:
+        """Return True if sentence-transformers is installed."""
+        try:
+            import sentence_transformers  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     def _lazy_init(self) -> None:
-        """Lazily load the embedding model on first use."""
+        """Load the embedding model on first use."""
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
