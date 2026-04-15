@@ -35,6 +35,7 @@ from backend.services.agents.base import _AGENT_LOG, _agent_log_lock
 from backend.services.agents.checker import CheckerAgent
 from backend.services.agents.dafny_architect import DafnyArchitectAgent
 from backend.services.agents.policy import PolicyAgent
+from backend.config import PROJECT_ROOT, settings
 from backend.services.audit.logger import AuditLogger
 from backend.services.feedback import compose_feedback
 from backend.services.llm.client import LLMClient
@@ -71,7 +72,10 @@ class PipelineOrchestrator:
     ) -> None:
         self._llm = llm_client or LLMClient()
         self._dafny = dafny_runner or DafnyRunner()
-        self._retriever = retriever or StandardsRetriever()
+        self._retriever = retriever or StandardsRetriever(
+            persist_dir=str(PROJECT_ROOT / settings.policies.chromadb_dir),
+            auto_ingest_path=str(PROJECT_ROOT / settings.policies.standards_dir),
+        )
         self._audit = audit_logger or AuditLogger()
         self._test_runner = test_runner or TestRunner()
 
@@ -126,7 +130,17 @@ class PipelineOrchestrator:
             "stage": max_stage.value,
         })
 
-        feedback: FeedbackMessage | None = None
+        # Seed feedback from a prior failed run if the caller passed retry context.
+        feedback: FeedbackMessage | None = (
+            FeedbackMessage(
+                iteration=0,
+                priority_summary=(
+                    f"[RETRY — prior run failed]\n{request.retry_context}"
+                ),
+            )
+            if request.retry_context
+            else None
+        )
         best_score: float = -1.0
         best_iteration: int = 0
 
@@ -458,10 +472,17 @@ class PipelineOrchestrator:
                 if stage_enabled(PipelineStage.POLICY, max_stage):
                     yield self._event(run_id, StreamEventType.AGENT_START, "policy")
 
-                    policy_context = self._retriever.retrieve(
-                        query=f"{request.requirement_text} {request.safety_standard.value}",
-                        standard=request.safety_standard.value,
-                    )
+                    try:
+                        policy_context = await self._retriever.retrieve(
+                            query=f"{request.requirement_text} {request.safety_standard.value}",
+                            standard=request.safety_standard.value,
+                        )
+                    except Exception as _rag_exc:
+                        logger.warning(
+                            "RAG retrieval failed (non-fatal) — proceeding without policy context: %s",
+                            _rag_exc,
+                        )
+                        policy_context = ""
 
                     policy_verdict = None
                     async for _item in self._policy.run_streaming(

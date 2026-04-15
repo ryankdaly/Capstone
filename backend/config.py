@@ -41,6 +41,7 @@ class ModelsConfig(BaseModel):
 
 class PoliciesConfig(BaseModel):
     standards_dir: str = "data/standards"
+    chromadb_dir: str = "data/chromadb"
     default_standard: str = "DO_178C"
     embedding_model: str = "all-MiniLM-L6-v2"
 

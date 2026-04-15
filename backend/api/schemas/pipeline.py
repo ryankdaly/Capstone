@@ -58,6 +58,10 @@ class PipelineRequest(BaseModel):
     max_iterations: int = Field(default=3, ge=1, le=10)
     stage: PipelineStage = PipelineStage.POLICY  # default: full pipeline
     run_tests: bool = Field(default=True, description="Execute checker test cases via pytest")
+    retry_context: str = Field(
+        default="",
+        description="Error/warning dump from a prior failed run; fed to the Actor as initial context",
+    )
 
 
 # ---------------------------------------------------------------------------
