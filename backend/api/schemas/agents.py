@@ -162,6 +162,7 @@ class FeedbackMessage(BaseModel):
     checker_feedback: Optional[CheckerReport] = None
     verification_feedback: Optional[VerificationResult] = None
     policy_feedback: Optional[PolicyVerdict] = None
+    test_feedback: Optional["TestRunResult"] = None
     priority_summary: str = Field(
         default="",
         description="Orchestrator-composed summary prioritizing critical failures",

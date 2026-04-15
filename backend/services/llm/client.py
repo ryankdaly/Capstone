@@ -40,6 +40,21 @@ _NO_SYSTEM_ROLE_ERRORS = (
     "system messages are not supported",
 )
 
+# Error substrings that indicate the endpoint rejected thinking-control params
+# (e.g. enable_thinking / thinking_budget in extra_body.chat_template_kwargs).
+# Minimax via NVIDIA NIM is the primary example: it always thinks and does not
+# expose a toggle.  When detected we strip these keys and retry — the model
+# will still produce <think> blocks; the pipeline handles them transparently.
+_NO_THINKING_KWARGS_ERRORS = (
+    "enable_thinking",
+    "thinking_budget",
+    "chat_template_kwargs",
+    "extra_body",
+    "unexpected keyword",
+    "unknown field",
+    "invalid parameter",
+)
+
 # 400 errors that are transient platform failures, not capability gaps.
 # These should be retried like a 500, not treated as permanent incompatibilities.
 _TRANSIENT_REQUEST_ERRORS = (
@@ -60,6 +75,9 @@ class LLMClient:
         # failing first attempt on subsequent calls to the same endpoint.
         self._no_constrained_decoding: set[str] = set()
         self._no_system_role: set[str] = set()
+        # Endpoints that reject thinking-control keys in extra_body
+        # (e.g. enable_thinking, thinking_budget).  We strip those keys and retry.
+        self._no_thinking_kwargs: set[str] = set()
 
     def _get_client(self, model: ResolvedModel) -> AsyncOpenAI:
         """Lazily create one AsyncOpenAI client per unique endpoint."""
@@ -87,6 +105,26 @@ class LLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _sanitized_extra_body(self, endpoint: str, extra_body: dict) -> dict:
+        """Return extra_body with thinking-control keys removed for known endpoints.
+
+        Called before each API request so that endpoints that previously
+        rejected ``enable_thinking`` / ``thinking_budget`` don't receive them
+        again.  The original ResolvedModel dict is never mutated.
+        """
+        if endpoint not in self._no_thinking_kwargs:
+            return extra_body
+        thinking_keys = {"enable_thinking", "thinking_budget"}
+        result = dict(extra_body)
+        if "chat_template_kwargs" in result:
+            ctk = {k: v for k, v in result["chat_template_kwargs"].items()
+                   if k not in thinking_keys}
+            if ctk:
+                result["chat_template_kwargs"] = ctk
+            else:
+                del result["chat_template_kwargs"]
+        return result
 
     async def aclose(self) -> None:
         """Close all httpx connection pools while the event loop is still open.
@@ -181,15 +219,10 @@ class LLMClient:
         }
         if extra_params:
             kwargs_base.update(extra_params)
-        # Model-level extra_body (e.g. chat_template_kwargs for NVIDIA NIM) is
-        # passed via the openai SDK's extra_body so it lands in the JSON payload
-        # without the SDK stripping unknown fields.
-        if resolved.extra_body:
-            kwargs_base["extra_body"] = resolved.extra_body
 
         # Retry loop — each pass may discover one new capability gap and adapt.
-        # At most 3 attempts: (1) preferred mode, (2) one fallback, (3) both fallbacks.
-        for _attempt in range(3):
+        # At most 4 attempts: (1) preferred mode, (2-4) each fallback.
+        for _attempt in range(4):
             use_constrained = (
                 response_schema is not None
                 and endpoint not in self._no_constrained_decoding
@@ -203,10 +236,19 @@ class LLMClient:
                 else system_prompt
             )
 
+            # Apply per-endpoint extra_body sanitization (strips thinking-control
+            # keys for endpoints that have previously rejected them).
+            eff_extra_body = (
+                self._sanitized_extra_body(endpoint, resolved.extra_body)
+                if resolved.extra_body else {}
+            )
+
             kwargs: dict[str, Any] = {
                 **kwargs_base,
                 "messages": self._messages(endpoint, eff_system, user_prompt),
             }
+            if eff_extra_body:
+                kwargs["extra_body"] = eff_extra_body
 
             if use_constrained:
                 kwargs["response_format"] = {
@@ -218,15 +260,18 @@ class LLMClient:
                 }
 
             logger.info(
-                "LLM request to %s [%s] model=%s constrained=%s no_system_role=%s",
+                "LLM request to %s [%s] model=%s constrained=%s no_system_role=%s no_thinking_kwargs=%s",
                 role, endpoint, resolved.model, use_constrained,
                 endpoint in self._no_system_role,
+                endpoint in self._no_thinking_kwargs,
             )
 
             try:
                 response = await self._api_call(client, kwargs)
                 content = response.choices[0].message.content or ""
-                content = _strip_think_tags(content)
+                # NOTE: do NOT strip think tags here — generate() is used by the
+                # non-streaming path; stripping happens in parse_structured() and
+                # in run_streaming() after accumulation so we never lose raw content.
                 logger.debug("LLM response from %s: %s chars", role, len(content))
                 return content
             except BadRequestError as exc:
@@ -238,6 +283,13 @@ class LLMClient:
                         endpoint,
                     )
                     self._no_system_role.add(endpoint)
+                elif any(kw in err_lower for kw in _NO_THINKING_KWARGS_ERRORS) and resolved.extra_body:
+                    logger.info(
+                        "Endpoint %s rejected thinking-control extra_body params — "
+                        "retrying without enable_thinking / thinking_budget.",
+                        endpoint,
+                    )
+                    self._no_thinking_kwargs.add(endpoint)
                 elif response_schema is not None and any(
                     kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
                 ):
@@ -251,7 +303,7 @@ class LLMClient:
                     raise
 
         raise RuntimeError(
-            f"Request to {endpoint} failed after 3 fallback attempts. "
+            f"Request to {endpoint} failed after 4 fallback attempts. "
             "Model may not be compatible with this pipeline."
         )
 
@@ -360,8 +412,15 @@ class LLMClient:
         }
         if extra_params:
             kwargs_base.update(extra_params)
-        if resolved.extra_body:
-            kwargs_base["extra_body"] = resolved.extra_body
+
+        # Apply per-endpoint sanitization (strips enable_thinking / thinking_budget
+        # for endpoints that have previously rejected those params).
+        eff_extra_body = (
+            self._sanitized_extra_body(endpoint, resolved.extra_body)
+            if resolved.extra_body else {}
+        )
+        if eff_extra_body:
+            kwargs_base["extra_body"] = eff_extra_body
 
         use_constrained = (
             response_schema is not None
@@ -385,10 +444,24 @@ class LLMClient:
                 },
             }
 
-        # Attempt streaming — fall back to non-streaming on any failure.
+        # Attempt streaming — detect capability errors inline, fall back on anything else.
         stream_obj = None
         try:
             stream_obj = await client.chat.completions.create(**kwargs)
+        except BadRequestError as exc:
+            err_lower = str(exc).lower()
+            if any(kw in err_lower for kw in _NO_THINKING_KWARGS_ERRORS) and resolved.extra_body:
+                logger.info(
+                    "Streaming: endpoint %s rejected thinking-control extra_body — "
+                    "flagging; fallback will retry without those params.",
+                    endpoint,
+                )
+                self._no_thinking_kwargs.add(endpoint)
+            else:
+                logger.warning(
+                    "Streaming request failed for %s (%s: %s) — falling back.",
+                    role, type(exc).__name__, exc,
+                )
         except Exception as exc:
             logger.warning(
                 "Streaming request failed for %s (%s: %s) — falling back.",
@@ -396,11 +469,21 @@ class LLMClient:
             )
 
         if stream_obj is not None:
+            detector = _ThinkLoopDetector(role)
             try:
                 async for chunk in stream_obj:
                     if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
+                        content = chunk.choices[0].delta.content
+                        detector.feed(content)   # raises ThinkLoopError if loop found
+                        yield content
                 return  # streaming complete
+            except ThinkLoopError:
+                logger.warning(
+                    "Think loop detected for %s — aborting stream and re-raising "
+                    "for retry.",
+                    role,
+                )
+                raise   # propagate up through run_streaming → orchestrator retry
             except Exception as exc:
                 logger.warning(
                     "Streaming interrupted for %s (%s: %s) — falling back.",
@@ -422,6 +505,97 @@ class LLMClient:
         yield text
 
 
+class ThinkLoopError(RuntimeError):
+    """Raised when a streaming model is detected to be stuck in a think loop.
+
+    This is a soft, retryable failure — the orchestrator retry logic will
+    start a fresh request which re-initialises the KV cache and typically
+    breaks the loop.
+    """
+
+
+class _ThinkLoopDetector:
+    """Monitors a raw token stream for runaway <think> loops.
+
+    Two independent signals, either sufficient to abort:
+
+    1. **Hard cap** — total chars accumulated inside ``<think>`` blocks
+       exceeds ``THINK_CHAR_CAP``.  Catches slow but genuine loops that
+       would otherwise run to the model's full ``max_tokens`` budget.
+
+    2. **Repetition detector** — scans the most recent ``SCAN_WINDOW``
+       chars of think content for any ``SNIPPET_LEN``-char substring that
+       appears at least ``REPEAT_THRESHOLD`` times.  Catches tight
+       "I should reconsider…I should reconsider…" loops early, usually
+       within 1–2 seconds of the loop starting.
+
+    Call ``feed(chunk)`` for each streaming token; it raises
+    ``ThinkLoopError`` the moment a loop is confirmed.
+    """
+
+    THINK_CHAR_CAP    = 8_000   # total think chars before hard abort
+    SCAN_WINDOW       = 2_000   # recent think chars to scan for repeats
+    SNIPPET_LEN       = 60      # pattern length to test for repetition
+    REPEAT_THRESHOLD  = 5       # how many times a snippet must repeat
+    CHECK_INTERVAL    = 400     # check once per this many new raw chars
+
+    def __init__(self, role: str) -> None:
+        self._role        = role
+        self._raw         = ""   # all streamed chars so far
+        self._think_chars = 0    # total chars inside <think> blocks
+        self._last_check  = 0    # len(_raw) at last check
+
+    # ------------------------------------------------------------------
+
+    def feed(self, chunk: str) -> None:
+        """Accumulate *chunk* and raise ThinkLoopError if a loop is found."""
+        self._raw += chunk
+        if len(self._raw) - self._last_check < self.CHECK_INTERVAL:
+            return
+        self._last_check = len(self._raw)
+        self._think_chars = _count_think_chars(self._raw)
+        self._check()
+
+    def _check(self) -> None:
+        if self._think_chars > self.THINK_CHAR_CAP:
+            raise ThinkLoopError(
+                f"Agent [{self._role}] think block exceeded "
+                f"{self.THINK_CHAR_CAP} chars ({self._think_chars} seen) — "
+                "aborting stream to trigger retry."
+            )
+
+        think_content = _extract_think_content(self._raw)
+        if len(think_content) < self.SNIPPET_LEN * self.REPEAT_THRESHOLD:
+            return
+
+        recent = think_content[-self.SCAN_WINDOW:]
+        stride = self.SNIPPET_LEN // 2   # overlapping scan for better coverage
+        for start in range(0, len(recent) - self.SNIPPET_LEN, stride):
+            snippet = recent[start : start + self.SNIPPET_LEN]
+            if recent.count(snippet) >= self.REPEAT_THRESHOLD:
+                raise ThinkLoopError(
+                    f"Agent [{self._role}] think loop detected: "
+                    f"a {self.SNIPPET_LEN}-char pattern repeated "
+                    f"{recent.count(snippet)}× in the last "
+                    f"{len(recent)} think chars — aborting stream."
+                )
+
+
+def _extract_think_content(text: str) -> str:
+    """Return the concatenated content of all <think> blocks (open or closed)."""
+    # Closed blocks
+    parts = re.findall(r"<think>(.*?)</think>", text, re.DOTALL)
+    # Unclosed trailing block
+    unclosed = re.search(r"<think>((?:(?!</think>).)*)\Z", text, re.DOTALL)
+    if unclosed:
+        parts.append(unclosed.group(1))
+    return "".join(parts)
+
+
+def _count_think_chars(text: str) -> int:
+    return len(_extract_think_content(text))
+
+
 def _json_prompt_suffix(schema: Type[BaseModel]) -> str:
     """Return a system prompt suffix that instructs the model to output JSON.
 
@@ -438,6 +612,8 @@ def _json_prompt_suffix(schema: Type[BaseModel]) -> str:
         "\n\n---",
         "IMPORTANT: Respond with a single valid JSON object ONLY.",
         "No markdown fences, no prose, no explanation — raw JSON only.",
+        "If you use internal reasoning tags (<think>), place the JSON AFTER them.",
+        "The JSON must appear as the final content in your response.",
     ]
     if required:
         lines.append(f"Required fields: {', '.join(required)}")
@@ -552,11 +728,23 @@ def _extract_json_dict(text: str) -> dict:
 def _strip_think_tags(text: str) -> str:
     """Remove <think>...</think> blocks produced by reasoning models.
 
-    Models like Gemma 4 (enable_thinking=True), DeepSeek-R1, and QwQ emit
-    chain-of-thought inside these tags before the actual response. We want
-    only the final answer — the think block content is discarded.
+    Handles three cases:
+    - Standard closed blocks: ``<think>…</think>`` followed by the response.
+    - Unclosed blocks: model hit the token limit while still reasoning, so
+      the closing ``</think>`` is absent.  We strip from ``<think>`` to end-of-
+      text so the caller sees an empty string (and can fall back to searching
+      the original text for embedded JSON).
+    - JSON embedded inside the think block: some models write their answer
+      inside ``<think>`` rather than after it.  Stripping here returns empty;
+      the caller is expected to retry on the original text.
     """
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    # 1. Remove all fully-closed think blocks.
+    stripped = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+    # 2. Remove any remaining unclosed ``<think>`` prefix (model stopped mid-think).
+    stripped = re.sub(r"<think>.*$", "", stripped, flags=re.DOTALL).strip()
+
+    return stripped
 
 
 def _fix_code_formatting(raw_json: str) -> str:
