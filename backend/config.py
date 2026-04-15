@@ -21,6 +21,11 @@ class ModelEndpointConfig(BaseModel):
     endpoint: str = "https://llm-api.arc.vt.edu/api/v1"
     model: str = "gpt-oss-120b"
     api_key_env: str = "HPEMA_API_KEY"
+    extra_body: dict = Field(
+        default_factory=dict,
+        description="Extra JSON body fields forwarded verbatim to the API "
+                    "(e.g. chat_template_kwargs for NVIDIA NIM models).",
+    )
 
     @property
     def api_key(self) -> str:
@@ -31,6 +36,7 @@ class ModelsConfig(BaseModel):
     actor: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
     checker: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
     policy: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+    dafny_architect: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
 
 
 class PoliciesConfig(BaseModel):

@@ -9,10 +9,44 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
+
+
+def _configure_logging() -> None:
+    """Route all log output to a file; keep the terminal clean.
+
+    logging.basicConfig() is a no-op when any library (e.g. chromadb) has
+    already touched the root logger before this function runs. We therefore
+    configure the handler explicitly — this is always safe to call.
+    """
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    file_handler = logging.FileHandler(log_dir / "hpema.log", mode="a")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    # Replace whatever handlers exist (console noise from third-party libs)
+    # with exactly one: our file handler.
+    root.handlers = [file_handler]
+
+    # Silence chromadb's broken telemetry — it prints even with telemetry=False
+    # in chromadb 0.4–0.5 due to a bug in the telemetry client's capture() API.
+    logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
+
+
+_configure_logging()
 
 from backend.api.schemas.pipeline import PipelineStage
 from cli.config import (
@@ -43,7 +77,7 @@ def default(ctx: typer.Context) -> None:
 def generate(
     requirement: str = typer.Option(..., "--requirement", "-r", help="Natural language requirement"),
     standard: str = typer.Option(DEFAULT_STANDARD, "--standard", "-s", help="Safety standard"),
-    language: str = typer.Option(DEFAULT_LANGUAGE, "--language", "-l", help="Target language (C, SPARK_Ada)"),
+    language: str = typer.Option(DEFAULT_LANGUAGE, "--language", "-l", help="Target language (Python, C, SPARK_Ada)"),
     max_iterations: int = typer.Option(DEFAULT_MAX_ITERATIONS, "--max-iterations", "-m", help="Max iterations"),
     stage: str = typer.Option("policy", "--stage", help="Pipeline stage: actor, checker, policy"),
 ) -> None:

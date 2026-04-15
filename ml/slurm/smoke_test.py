@@ -166,7 +166,7 @@ def test_pipeline() -> bool:
             json={
                 "requirement_text": "Write a function that returns the absolute value of an integer without using stdlib.",
                 "safety_standard": "DO_178C",
-                "target_language": "C",
+                "target_language": "Python",
                 "max_iterations": 1,
             },
             timeout=300.0,

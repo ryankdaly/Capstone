@@ -6,7 +6,7 @@ hpema_config.yaml or setting env vars (HPEMA_ACTOR_ENDPOINT, etc.).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from backend.config import HpemaConfig, ModelEndpointConfig, settings
 
@@ -18,6 +18,7 @@ class ResolvedModel:
     endpoint: str
     model: str
     api_key: str
+    extra_body: dict = field(default_factory=dict)
 
 
 class ModelRegistry:
@@ -31,6 +32,7 @@ class ModelRegistry:
             endpoint=cfg.endpoint,
             model=cfg.model,
             api_key=cfg.api_key,
+            extra_body=cfg.extra_body,
         )
 
     @property
@@ -45,12 +47,17 @@ class ModelRegistry:
     def policy(self) -> ResolvedModel:
         return self._resolve(self._config.models.policy)
 
+    @property
+    def dafny_architect(self) -> ResolvedModel:
+        return self._resolve(self._config.models.dafny_architect)
+
     def get(self, role: str) -> ResolvedModel:
         """Look up by string name (useful for dynamic dispatch)."""
         mapping = {
             "actor": self.actor,
             "checker": self.checker,
             "policy": self.policy,
+            "dafny_architect": self.dafny_architect,
         }
         if role not in mapping:
             raise ValueError(f"Unknown agent role: {role!r}. Valid: {list(mapping)}")

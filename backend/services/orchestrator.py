@@ -7,7 +7,6 @@ state machine that gives total control over the feedback loop.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -17,6 +16,8 @@ from backend.api.schemas.agents import (
     CheckerVerdict,
     CodeCandidate,
     FeedbackMessage,
+    PolicyVerdict,
+    TestRunResult,
     VerificationResult,
 )
 from backend.api.schemas.pipeline import (
@@ -30,12 +31,16 @@ from backend.api.schemas.pipeline import (
     stage_enabled,
 )
 from backend.services.agents.actor import ActorAgent
+from backend.services.agents.base import _AGENT_LOG, _agent_log_lock
 from backend.services.agents.checker import CheckerAgent
+from backend.services.agents.dafny_architect import DafnyArchitectAgent
 from backend.services.agents.policy import PolicyAgent
 from backend.services.audit.logger import AuditLogger
 from backend.services.feedback import compose_feedback
 from backend.services.llm.client import LLMClient
 from backend.services.rag.retriever import StandardsRetriever
+from backend.services.testing.runner import TestRunner
+from backend.services.verification.contract_extractor import DafnyContracts, extract_contracts
 from backend.services.verification.dafny_runner import DafnyRunner
 
 logger = logging.getLogger(__name__)
@@ -62,14 +67,17 @@ class PipelineOrchestrator:
         dafny_runner: DafnyRunner | None = None,
         retriever: StandardsRetriever | None = None,
         audit_logger: AuditLogger | None = None,
+        test_runner: TestRunner | None = None,
     ) -> None:
         self._llm = llm_client or LLMClient()
         self._dafny = dafny_runner or DafnyRunner()
         self._retriever = retriever or StandardsRetriever()
         self._audit = audit_logger or AuditLogger()
+        self._test_runner = test_runner or TestRunner()
 
         # Agents
         self._actor = ActorAgent(self._llm)
+        self._dafny_architect = DafnyArchitectAgent(self._llm)
         self._checker = CheckerAgent(self._llm)
         self._policy = PolicyAgent(self._llm)
 
@@ -92,18 +100,40 @@ class PipelineOrchestrator:
         )
         run_id = state.run_id
 
+        # --- Debug session header in agent.log ---
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            header = (
+                "\n"
+                "################################################################################\n"
+                f"# NEW PIPELINE RUN\n"
+                f"# run_id  : {run_id}\n"
+                f"# time    : {ts}\n"
+                f"# stage   : {max_stage.value}\n"
+                f"# standard: {request.safety_standard.value}\n"
+                f"# language: {request.target_language.value}\n"
+                f"# prompt  : {request.requirement_text[:200]}\n"
+                "################################################################################\n"
+            )
+            with _agent_log_lock:
+                with _AGENT_LOG.open("a", encoding="utf-8") as fh:
+                    fh.write(header)
+        except Exception:
+            pass
+
         self._audit.log(run_id, "pipeline_start", data={
             **request.model_dump(),
             "stage": max_stage.value,
         })
 
         feedback: FeedbackMessage | None = None
+        best_score: float = -1.0
+        best_iteration: int = 0
 
-        # With stage < POLICY, there's no feedback loop — run once.
+        # Actor-only has no feedback loop. Checker+ can loop on Dafny/Checker feedback.
         effective_max_iterations = (
-            request.max_iterations
-            if stage_enabled(PipelineStage.POLICY, max_stage)
-            else 1
+            1 if max_stage == PipelineStage.ACTOR
+            else request.max_iterations
         )
 
         try:
@@ -112,18 +142,53 @@ class PipelineOrchestrator:
 
                 iteration = IterationRecord(iteration=i)
 
-                # --- ACTOR (always runs) ---
-                yield self._event(run_id, StreamEventType.AGENT_START, "actor")
-                self._audit.log(run_id, "agent_start", agent="actor", data={"iteration": i})
+                # --- ACTOR (always runs) — up to 3 attempts ---
+                _ACTOR_MAX_RETRIES = 3
+                code_candidate = None
+                _actor_skipped = False
+                _actor_retry_hint: str | None = None
 
-                code_candidate = await self._actor.run(
-                    requirement=request.requirement_text,
-                    language=request.target_language.value,
-                    standard=request.safety_standard.value,
-                    feedback=feedback,
-                )
+                for _attempt in range(1, _ACTOR_MAX_RETRIES + 1):
+                    yield self._event(run_id, StreamEventType.AGENT_START, "actor")
+                    self._audit.log(run_id, "agent_start", agent="actor",
+                                    data={"iteration": i, "attempt": _attempt})
+                    try:
+                        async for _item in self._actor.run_streaming(
+                            requirement=request.requirement_text,
+                            language=request.target_language.value,
+                            standard=request.safety_standard.value,
+                            feedback=feedback,
+                            retry_hint=_actor_retry_hint,
+                        ):
+                            if isinstance(_item, str):
+                                yield self._event(run_id, StreamEventType.AGENT_TOKEN, "actor", {"token": _item})
+                            else:
+                                code_candidate = _item
+                        break  # success
+                    except Exception as _actor_exc:
+                        _actor_retry_hint = str(_actor_exc)
+                        logger.warning(
+                            "Actor attempt %d/%d failed: %s",
+                            _attempt, _ACTOR_MAX_RETRIES, _actor_exc,
+                        )
+                        if _attempt == _ACTOR_MAX_RETRIES:
+                            _actor_skipped = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "actor",
+                                {
+                                    "error": str(_actor_exc),
+                                    "skipped": True,
+                                    "message": "Actor failed after 3 attempts — skipping iteration.",
+                                },
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="actor",
+                                            data={"error": str(_actor_exc)})
+
+                if _actor_skipped:
+                    # Can't proceed without code — move to next pipeline iteration.
+                    continue
+
                 iteration.code_candidate = code_candidate
-
                 yield self._event(
                     run_id,
                     StreamEventType.AGENT_OUTPUT,
@@ -141,51 +206,251 @@ class PipelineOrchestrator:
                     data=code_candidate.model_dump(),
                 )
 
-                # --- CHECKER + DAFNY (parallel) — requires stage >= CHECKER ---
+                # ── PHASE 1: DAFNY (architect → verify, up to 3 full cycles) ──────────
+                # Each cycle: DafnyArchitect generates a spec, DafnyVerifier checks it.
+                # On verification failure the error is fed back to DafnyArchitect for
+                # the next cycle.  On LLM failure we retry the architect without a
+                # verification error attached.  Both phases complete before checker runs.
                 checker_report = None
                 verification_result = None
+                test_result: TestRunResult | None = None
+                has_dafny_spec = False
 
                 if stage_enabled(PipelineStage.CHECKER, max_stage):
-                    yield self._event(run_id, StreamEventType.AGENT_START, "checker")
-                    yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
-
-                    checker_task = self._checker.run(
-                        source_code=code_candidate.source_code,
-                        dafny_spec=code_candidate.dafny_spec,
-                        language=request.target_language.value,
-                        standard=request.safety_standard.value,
+                    _DAFNY_MAX_CYCLES = 3
+                    # Seed with any verification error from the previous outer iteration.
+                    prior_dafny_verification = (
+                        feedback.verification_feedback if feedback else None
                     )
-                    dafny_task = self._dafny.verify(code_candidate.dafny_spec)
+                    dafny_result = None
+                    dafny_arch_skipped = False
+                    _dafny_retry_hint: str | None = None
+                    dafny_contracts: DafnyContracts | None = None
 
-                    checker_report, verification_result = await asyncio.gather(
-                        checker_task, dafny_task
-                    )
+                    for _cycle in range(1, _DAFNY_MAX_CYCLES + 1):
+                        # ── Dafny Architect LLM ──────────────────────────────────────
+                        yield self._event(run_id, StreamEventType.AGENT_START, "dafny_architect")
+                        self._audit.log(run_id, "agent_start", agent="dafny_architect",
+                                        data={"iteration": i, "cycle": _cycle})
+                        try:
+                            async for _item in self._dafny_architect.run_streaming(
+                                source_code=code_candidate.source_code,
+                                requirement=request.requirement_text,
+                                language=request.target_language.value,
+                                verification_feedback=prior_dafny_verification,
+                                retry_hint=_dafny_retry_hint,
+                            ):
+                                if isinstance(_item, str):
+                                    yield self._event(run_id, StreamEventType.AGENT_TOKEN,
+                                                      "dafny_architect", {"token": _item})
+                                else:
+                                    dafny_result = _item
+                        except Exception as _arch_exc:
+                            _dafny_retry_hint = str(_arch_exc)
+                            logger.warning(
+                                "DafnyArchitect cycle %d/%d LLM failure: %s",
+                                _cycle, _DAFNY_MAX_CYCLES, _arch_exc,
+                            )
+                            if _cycle == _DAFNY_MAX_CYCLES and dafny_result is None:
+                                # Never got a valid spec — skip Dafny entirely.
+                                dafny_arch_skipped = True
+                                yield self._event(
+                                    run_id, StreamEventType.AGENT_ERROR, "dafny_architect",
+                                    {
+                                        "error": str(_arch_exc),
+                                        "skipped": True,
+                                        "message": "Dafny spec generation failed after "
+                                                   f"{_DAFNY_MAX_CYCLES} cycles — skipping.",
+                                    },
+                                )
+                                self._audit.log(run_id, "agent_skipped", agent="dafny_architect",
+                                                data={"error": str(_arch_exc)})
+                            # LLM failure: carry the hint; don't touch prior_dafny_verification
+                            continue
+
+                        # Architect succeeded — publish output immediately.
+                        code_candidate.dafny_spec = dafny_result.dafny_source
+                        has_dafny_spec = bool(code_candidate.dafny_spec.strip())
+                        yield self._event(
+                            run_id, StreamEventType.AGENT_OUTPUT, "dafny_architect",
+                            {
+                                "dafny_spec": dafny_result.dafny_source,
+                                "reasoning_trace": dafny_result.reasoning_trace,
+                                "cycle": _cycle,
+                            },
+                        )
+                        self._audit.log(run_id, "agent_output", agent="dafny_architect",
+                                        data={**dafny_result.model_dump(), "cycle": _cycle})
+
+                        # ── Dafny Verifier ────────────────────────────────────────────
+                        yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
+                        _cycle_verification = await self._dafny.verify(code_candidate.dafny_spec)
+                        verification_result = _cycle_verification
+
+                        yield self._event(
+                            run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
+                            {
+                                "verified": _cycle_verification.verified,
+                                "solver_output": _cycle_verification.solver_output,
+                                "failing_assertions": _cycle_verification.failing_assertions,
+                                "execution_time_seconds": _cycle_verification.execution_time_seconds,
+                                "cycle": _cycle,
+                            },
+                        )
+                        self._audit.log(run_id, "verification_result",
+                                        data={**_cycle_verification.model_dump(), "cycle": _cycle})
+
+                        if _cycle_verification.verified or not has_dafny_spec:
+                            if _cycle_verification.verified:
+                                dafny_contracts = extract_contracts(code_candidate.dafny_spec)
+                                logger.info(
+                                    "Extracted %d requires + %d ensures from Dafny spec for '%s'",
+                                    len(dafny_contracts.requires),
+                                    len(dafny_contracts.ensures),
+                                    dafny_contracts.method_name,
+                                )
+                            break  # Dafny phase complete ✓
+
+                        # Verification failed — feed the errors back for next cycle.
+                        logger.info(
+                            "Dafny verification failed on cycle %d/%d; feeding errors "
+                            "back to DafnyArchitect for next cycle.",
+                            _cycle, _DAFNY_MAX_CYCLES,
+                        )
+                        prior_dafny_verification = _cycle_verification
+                        # (loop continues to next cycle)
+
+                    if dafny_arch_skipped:
+                        code_candidate.dafny_spec = ""
+                        has_dafny_spec = False
+
+                    # ── PHASE 2: CHECKER (generate → tests) ──────────────────────────
+                    # Runs after Dafny phase is fully resolved.
+                    # Outer loop: up to 2 extra retries when pytest cannot collect
+                    # tests (syntax/indentation error in generated test file).
+                    # Inner loop: up to 3 retries for LLM parse failures.
+                    _CHECKER_MAX_RETRIES = 3
+                    _TEST_FIX_MAX = 2  # max extra rounds to fix broken test syntax
+                    checker_report = None
+                    _checker_skipped = False
+                    _checker_retry_hint: str | None = None
+                    _test_fix_hint: str | None = None
+                    is_python = request.target_language.value == "Python"
+
+                    for _fix_round in range(1, _TEST_FIX_MAX + 2):  # 1 normal + 2 fix rounds
+                        # ── Checker LLM (with parse-failure retries) ──────────────
+                        for _attempt in range(1, _CHECKER_MAX_RETRIES + 1):
+                            yield self._event(run_id, StreamEventType.AGENT_START, "checker")
+                            self._audit.log(run_id, "agent_start", agent="checker",
+                                            data={"iteration": i, "attempt": _attempt,
+                                                  "fix_round": _fix_round})
+                            try:
+                                async for _item in self._checker.run_streaming(
+                                    source_code=code_candidate.source_code,
+                                    language=request.target_language.value,
+                                    standard=request.safety_standard.value,
+                                    retry_hint=_checker_retry_hint,
+                                    dafny_contracts=dafny_contracts,
+                                    test_fix_hint=_test_fix_hint,
+                                ):
+                                    if isinstance(_item, str):
+                                        yield self._event(run_id, StreamEventType.AGENT_TOKEN,
+                                                          "checker", {"token": _item})
+                                    else:
+                                        checker_report = _item
+                                break  # LLM parse success
+                            except Exception as _checker_exc:
+                                _checker_retry_hint = str(_checker_exc)
+                                logger.warning(
+                                    "Checker attempt %d/%d (fix_round %d) failed: %s",
+                                    _attempt, _CHECKER_MAX_RETRIES, _fix_round, _checker_exc,
+                                )
+                                if _attempt == _CHECKER_MAX_RETRIES:
+                                    _checker_skipped = True
+                                    yield self._event(
+                                        run_id, StreamEventType.AGENT_ERROR, "checker",
+                                        {
+                                            "error": str(_checker_exc),
+                                            "skipped": True,
+                                            "message": "Checker failed after 3 attempts — skipping.",
+                                        },
+                                    )
+                                    self._audit.log(run_id, "agent_skipped", agent="checker",
+                                                    data={"error": str(_checker_exc)})
+
+                        if not _checker_skipped:
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_OUTPUT, "checker",
+                                {
+                                    "verdict": checker_report.verdict.value,
+                                    "issues": len(checker_report.issues),
+                                    "issues_detail": [iss.model_dump() for iss in checker_report.issues],
+                                    "test_cases": checker_report.test_cases,
+                                    "reasoning_trace": checker_report.reasoning_trace,
+                                },
+                            )
+                            self._audit.log(run_id, "agent_output", agent="checker",
+                                            data=checker_report.model_dump())
+
+                        # ── Test runner ───────────────────────────────────────────
+                        if (
+                            request.run_tests
+                            and is_python
+                            and checker_report is not None
+                            and checker_report.test_cases
+                        ):
+                            yield self._event(run_id, StreamEventType.AGENT_START, "test_runner")
+                            test_result = await self._test_runner.run(
+                                source_code=code_candidate.source_code,
+                                test_cases=checker_report.test_cases,
+                            )
+                            iteration.test_result = test_result
+
+                            yield self._event(
+                                run_id, StreamEventType.TEST_RUN, "test_runner",
+                                {
+                                    "executed": test_result.executed,
+                                    "total": test_result.total,
+                                    "passed": test_result.passed,
+                                    "failed": test_result.failed,
+                                    "errors": test_result.errors,
+                                    "test_results": [t.model_dump() for t in test_result.test_results],
+                                    "pytest_output": test_result.pytest_output,
+                                },
+                            )
+                            self._audit.log(run_id, "test_run", data=test_result.model_dump())
+
+                            # Detect collection error — pytest couldn't parse the test file.
+                            # Feed the error back to Checker to rewrite tests.
+                            _is_collection_err = (
+                                test_result.executed
+                                and test_result.errors > 0
+                                and test_result.total == 0
+                                and test_result.passed == 0
+                                and _fix_round <= _TEST_FIX_MAX
+                                and not _checker_skipped
+                            )
+                            if _is_collection_err:
+                                _test_fix_hint = test_result.pytest_output[:800]
+                                _checker_retry_hint = None  # reset parse-failure hint
+                                logger.warning(
+                                    "Test collection error on fix_round %d/%d — "
+                                    "asking Checker to rewrite tests.",
+                                    _fix_round, _TEST_FIX_MAX,
+                                )
+                                continue  # outer loop: rerun checker with fix hint
+                        elif not request.run_tests and checker_report is not None and checker_report.test_cases:
+                            test_result = TestRunResult(
+                                executed=False,
+                                total=len(checker_report.test_cases),
+                                pytest_output="Test execution disabled (run_tests=false).",
+                            )
+                            iteration.test_result = test_result
+
+                        break  # tests ran (or not applicable) — exit fix loop
 
                     iteration.checker_report = checker_report
                     iteration.verification_result = verification_result
-
-                    yield self._event(
-                        run_id, StreamEventType.AGENT_OUTPUT, "checker",
-                        {
-                            "verdict": checker_report.verdict.value,
-                            "issues": len(checker_report.issues),
-                            "issues_detail": [iss.model_dump() for iss in checker_report.issues],
-                            "test_cases": checker_report.test_cases,
-                            "reasoning_trace": checker_report.reasoning_trace,
-                        },
-                    )
-                    yield self._event(
-                        run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
-                        {
-                            "verified": verification_result.verified,
-                            "solver_output": verification_result.solver_output,
-                            "failing_assertions": verification_result.failing_assertions,
-                            "execution_time_seconds": verification_result.execution_time_seconds,
-                        },
-                    )
-
-                    self._audit.log(run_id, "agent_output", agent="checker", data=checker_report.model_dump())
-                    self._audit.log(run_id, "verification_result", data=verification_result.model_dump())
 
                 # --- POLICY — requires stage >= POLICY ---
                 policy_verdict = None
@@ -198,14 +463,19 @@ class PipelineOrchestrator:
                         standard=request.safety_standard.value,
                     )
 
-                    policy_verdict = await self._policy.run(
+                    policy_verdict = None
+                    async for _item in self._policy.run_streaming(
                         source_code=code_candidate.source_code,
                         dafny_spec=code_candidate.dafny_spec,
                         standard=request.safety_standard.value,
                         checker_report=checker_report,
                         verification_result=verification_result,
                         policy_context=policy_context,
-                    )
+                    ):
+                        if isinstance(_item, str):
+                            yield self._event(run_id, StreamEventType.AGENT_TOKEN, "policy", {"token": _item})
+                        else:
+                            policy_verdict = _item
                     iteration.policy_verdict = policy_verdict
 
                     yield self._event(
@@ -221,27 +491,71 @@ class PipelineOrchestrator:
                     self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
                 # --- CONVERGENCE CHECK ---
-                if stage_enabled(PipelineStage.POLICY, max_stage):
-                    # Full pipeline — check all agents
-                    all_pass = (
-                        checker_report is not None
-                        and checker_report.verdict == CheckerVerdict.PASS
-                        and verification_result is not None
-                        and verification_result.verified
-                        and policy_verdict is not None
-                        and policy_verdict.compliant
+                # Dafny is best-effort: tracked and fed back, but does NOT gate convergence.
+                # Checker verdict + test results (and Policy at full stage) determine pass/fail.
+                dafny_ok = verification_result is not None and verification_result.verified
+                checker_ok = checker_report is not None and checker_report.verdict == CheckerVerdict.PASS
+                tests_ok = (
+                    test_result is None  # no tests = not a blocker
+                    or not test_result.executed  # tests disabled = not a blocker
+                    or test_result.failed == 0  # all tests passed
+                )
+
+                if max_stage == PipelineStage.ACTOR:
+                    all_pass = True
+                elif max_stage == PipelineStage.CHECKER:
+                    # Checker verdict + test results gate convergence. Dafny is soft.
+                    all_pass = checker_ok and tests_ok
+
+                    feedback = compose_feedback(
+                        iteration=i,
+                        checker_report=checker_report,
+                        verification_result=verification_result,
+                        policy_verdict=None,
+                        test_result=test_result,
                     )
+                    iteration.feedback = feedback
+                else:
+                    # Full pipeline — Checker + Tests + Policy must pass. Dafny is soft.
+                    policy_ok = policy_verdict is not None and policy_verdict.compliant
+                    all_pass = checker_ok and tests_ok and policy_ok
 
                     feedback = compose_feedback(
                         iteration=i,
                         checker_report=checker_report,
                         verification_result=verification_result,
                         policy_verdict=policy_verdict,
+                        test_result=test_result,
                     )
                     iteration.feedback = feedback
-                else:
-                    # Disconnected mode — whatever ran is considered a pass
-                    all_pass = True
+
+                # Best-so-far tracking — detect regressions across iterations
+                score = (
+                    (1.0 if checker_ok else 0.0)
+                    + (1.0 if tests_ok else 0.0)
+                    + (0.5 if dafny_ok else 0.0)
+                    + (0.25 if has_dafny_spec else 0.0)
+                )
+                if max_stage == PipelineStage.POLICY:
+                    policy_ok = policy_verdict is not None and policy_verdict.compliant
+                    score += 1.0 if policy_ok else 0.0
+
+                if score > best_score:
+                    best_score = score
+                    best_iteration = i
+                elif i > 1 and score < best_score and feedback is not None:
+                    regression_note = (
+                        f"REGRESSION: Iteration {i} scored worse than iteration {best_iteration}. "
+                        f"Do NOT regress — preserve what worked before."
+                    )
+                    feedback = FeedbackMessage(
+                        iteration=feedback.iteration,
+                        checker_feedback=feedback.checker_feedback,
+                        verification_feedback=feedback.verification_feedback,
+                        policy_feedback=feedback.policy_feedback,
+                        priority_summary=f"{regression_note} | {feedback.priority_summary}",
+                    )
+                    iteration.feedback = feedback
 
                 iteration.completed_at = datetime.now(timezone.utc)
                 state.iterations.append(iteration)

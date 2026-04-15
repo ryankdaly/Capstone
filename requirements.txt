@@ -1,17 +1,30 @@
-# Core
-fastapi
-uvicorn[standard]
-pydantic
-pydantic-settings
-pyyaml
+# ============================================================
+# HPEMA — Python dependencies
+# Tested with Python 3.12
+# ============================================================
 
+# -----------------------------------------------------------
+# Core backend (FastAPI + config)
+# -----------------------------------------------------------
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0          # v2 required — v1 API is incompatible
+pyyaml>=6.0
+
+# -----------------------------------------------------------
 # LLM client
-openai
-httpx
+# Talks to any OpenAI-compatible endpoint: vLLM, OpenAI,
+# Groq, ARC, etc. openai>=1.0 required for AsyncOpenAI.
+# -----------------------------------------------------------
+openai>=1.0
+httpx>=0.27.0
 
+# -----------------------------------------------------------
 # CLI
-typer
-rich
+# -----------------------------------------------------------
+typer>=0.12.0
+rich>=13.0
+prompt_toolkit>=3.0   # autocomplete, history, ghost-text suggestions
 
 # RAG (optional — system works without these)
 torch==2.2.2
@@ -20,13 +33,16 @@ sentence-transformers==2.5.0
 transformers==4.37.2
 chromadb>=0.4.0
 
-# Dashboard (optional)
-streamlit
-
+# -----------------------------------------------------------
 # Testing
-pytest
-pytest-asyncio
+# pytest-asyncio needed for all async agent/pipeline tests.
+# anyio needed by pytest-asyncio for async test collection.
+# -----------------------------------------------------------
+pytest>=8.0
+pytest-asyncio>=0.23.0
+anyio>=4.0
 
-# Environment
-python-dotenv
-psycopg[binary]
+# -----------------------------------------------------------
+# Dashboard (optional — only needed for: streamlit run dashboard/app.py)
+# -----------------------------------------------------------
+streamlit>=1.30.0

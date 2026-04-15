@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from backend.api.schemas.pipeline import PipelineRequest, PipelineStage, PipelineState
 from backend.config import load_config
@@ -40,11 +40,67 @@ async def _run_async(
     display: DisplayManager,
 ) -> PipelineState | None:
     orchestrator = _build_orchestrator()
+    try:
+        async for event in orchestrator.run(request):
+            display.handle_event(event)
+        return orchestrator.last_state
+    finally:
+        # Close httpx connection pools while the event loop is still alive.
+        # Without this, Python 3.10+ logs "Event loop is closed" when the GC
+        # finalizes AsyncOpenAI clients after asyncio.run() shuts down the loop.
+        await orchestrator._llm.aclose()
 
-    async for event in orchestrator.run(request):
-        display.handle_event(event)
 
-    return orchestrator.last_state
+_CHAT_TIMEOUT = 90  # seconds — fail fast rather than hanging
+
+_CHAT_SYSTEM_PROMPT = (
+    "You are HPEMA's Actor agent — a knowledgeable assistant for "
+    "high-assurance and safety-critical software engineering. "
+    "Answer questions helpfully and concisely. Only generate code "
+    "if explicitly asked."
+)
+
+
+async def chat_stream(message: str, on_token: Callable[[str], None]) -> str:
+    """Stream a chat response, calling on_token for each chunk.
+
+    Returns the full accumulated response text.  Falls back to a single
+    blocking call + one on_token invocation if streaming is unsupported.
+    Applies a per-chunk timeout guard: if no token arrives within
+    _CHAT_TIMEOUT seconds, raises TimeoutError.
+    """
+    config = load_config()
+    registry = ModelRegistry(config)
+    client = LLMClient(registry)
+
+    chunks: list[str] = []
+    try:
+        async for token in client.generate_stream(
+            role="actor",
+            system_prompt=_CHAT_SYSTEM_PROMPT,
+            user_prompt=message,
+            temperature=0.4,
+            max_tokens=2048,
+        ):
+            chunks.append(token)
+            on_token(token)
+    except Exception:
+        await client.aclose()
+        raise
+
+    await client.aclose()
+    return "".join(chunks)
+
+
+# Keep old blocking entry point for callers that don't need streaming.
+def chat_with_actor(message: str, history: list | None = None) -> str:
+    """Blocking non-streaming chat — kept for backwards compatibility."""
+    chunks: list[str] = []
+
+    async def _run() -> str:
+        return await chat_stream(message, on_token=chunks.append)
+
+    return asyncio.run(_run())
 
 
 def run_pipeline(
@@ -54,6 +110,7 @@ def run_pipeline(
     max_iterations: int,
     display: DisplayManager,
     stage: PipelineStage = PipelineStage.POLICY,
+    run_tests: bool = True,
 ) -> PipelineState | None:
     """Run the full pipeline in-process. Blocking call.
 
@@ -65,6 +122,7 @@ def run_pipeline(
         target_language=language,
         max_iterations=max_iterations,
         stage=stage,
+        run_tests=run_tests,
     )
 
     return asyncio.run(_run_async(request, display))

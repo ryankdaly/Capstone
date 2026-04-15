@@ -14,6 +14,7 @@ from backend.api.schemas.agents import (
     CodeCandidate,
     FeedbackMessage,
     PolicyVerdict,
+    TestRunResult,
     VerificationResult,
 )
 from backend.api.schemas.generation import SafetyStandard, TargetLanguage
@@ -53,9 +54,10 @@ def stage_enabled(current: PipelineStage, max_stage: PipelineStage) -> bool:
 class PipelineRequest(BaseModel):
     requirement_text: str
     safety_standard: SafetyStandard = SafetyStandard.DO_178C
-    target_language: TargetLanguage = TargetLanguage.C
+    target_language: TargetLanguage = TargetLanguage.PYTHON
     max_iterations: int = Field(default=3, ge=1, le=10)
     stage: PipelineStage = PipelineStage.POLICY  # default: full pipeline
+    run_tests: bool = Field(default=True, description="Execute checker test cases via pytest")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ class IterationRecord(BaseModel):
     code_candidate: Optional[CodeCandidate] = None
     checker_report: Optional[CheckerReport] = None
     verification_result: Optional[VerificationResult] = None
+    test_result: Optional[TestRunResult] = None
     policy_verdict: Optional[PolicyVerdict] = None
     feedback: Optional[FeedbackMessage] = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -112,8 +115,10 @@ class PipelineState(BaseModel):
 
 class StreamEventType(str, Enum):
     AGENT_START = "agent_start"
+    AGENT_TOKEN = "agent_token"          # incremental text chunk while generating
     AGENT_OUTPUT = "agent_output"
     AGENT_ERROR = "agent_error"
+    TEST_RUN = "test_run"
     ITERATION_COMPLETE = "iteration_complete"
     PIPELINE_COMPLETE = "pipeline_complete"
     HUMAN_APPROVAL_REQUIRED = "human_approval_required"
