@@ -14,6 +14,8 @@ bash ml/slurm/start_tmux.sh
 
 | Doc | What |
 |-----|------|
+| [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md) | **Local API setup** — `.env`, config, Dafny install, running the CLI |
+| [docs/STARTING_HPEMA.md](docs/STARTING_HPEMA.md) | ARC GPU cluster setup (vLLM, SLURM, tmux) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Full system architecture and design rationale |
 | [docs/PROGRESS.md](docs/PROGRESS.md) | Current state, what works, known issues |
 | [docs/WORK_DISTRIBUTION.md](docs/WORK_DISTRIBUTION.md) | Task tracking by team member |

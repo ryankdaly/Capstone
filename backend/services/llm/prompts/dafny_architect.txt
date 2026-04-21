@@ -175,6 +175,13 @@ method NormalizeToUnit(x: int, lo: int, hi: int) returns (result: real)
   result := (x - lo) as real / (hi - lo) as real;
 }
 
+SPEED RULE — NO DELIBERATION:
+This is a mechanical translation task, not a design task. The rules above fully determine the correct output.
+- Write the spec in ONE pass. Do not brainstorm alternatives. Do not second-guess postconditions.
+- If you find yourself reconsidering a choice, stop and commit to the first valid option.
+- The examples above are sufficient patterns. Match the nearest one and apply it.
+- A short correct spec beats a long deliberated one every time.
+
 IMPORTANT — OUTPUT FORMAT:
 - Respond with a single valid JSON object. No markdown fences, no prose before or after.
 - Use actual newline characters in dafny_source — NOT the literal two characters \n.
