@@ -54,6 +54,9 @@ _CMD_META: dict[str, str] = {
     "/setup":      "configure API keys and model endpoints",
     "/help":       "show all commands",
     "/scroll":     "terminal scrollmode",
+    "/clear":      "clear console output",
+    "/clear-history": "clear session run history",
+    "/clear-logs": "delete all files under logs/ directory",
     "/quit":       "exit HPEMA",
     "/exit":       "exit HPEMA",
 }
@@ -273,6 +276,186 @@ def _set_config(path: str, session: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Clear commands helpers
+# ---------------------------------------------------------------------------
+
+def _clear_console() -> None:
+    """Clear the console output."""
+    console.clear()
+    console.print("  [dim]Console cleared.[/]")
+
+
+def _clear_history(session: Session) -> None:
+    """Clear the session run history with confirmation."""
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
+
+    if not session.history:
+        console.print("  [dim]History is already empty.[/]")
+        return
+
+    count = len(session.history)
+
+    # Show confirmation message
+    console.print()
+    console.print(f"  [bold yellow]Permanently delete all {count} run record(s)?[/]")
+
+    choice = {"val": 1}  # 0 = Yes, 1 = No
+
+    kb = KeyBindings()
+
+    @kb.add("left")
+    @kb.add("right")
+    @kb.add("tab")
+    def _swap(event):
+        choice["val"] = 1 - choice["val"]
+        event.app.invalidate()
+
+    @kb.add("enter")
+    @kb.add("c-m")
+    def _confirm(event):
+        event.app.exit(result=choice["val"])
+
+    @kb.add("c-c")
+    def _cancel(event):
+        choice["val"] = 1  # treat Ctrl-C as No
+        event.app.exit(result=1)
+
+    from prompt_toolkit import PromptSession as _PS
+    _confirm_session = _PS(
+        key_bindings=kb,
+        style=Style.from_dict({"prompt": "bold #89b4fa"}),
+    )
+
+    def _toolbar_fn():
+        yes_fg = "#a6e3a1" if choice["val"] == 0 else "#6c7086"
+        no_fg = "#f38ba8" if choice["val"] == 1 else "#6c7086"
+        return HTML(
+            f'<style bg="#313244"> '
+            f'Clear history?  '
+            f'<style fg="{yes_fg}">[ Yes ]</style>'
+            f'  '
+            f'<style fg="{no_fg}">[ No ]</style>'
+            f'  <style fg="#6c7086">← → to select · Enter to confirm</style>'
+            f' </style>'
+        )
+
+    try:
+        result = _confirm_session.prompt(
+            HTML('<b><style fg="#89b4fa">  Clear?</style></b> '),
+            bottom_toolbar=_toolbar_fn,
+            default="",
+        )
+    except (EOFError, KeyboardInterrupt):
+        choice["val"] = 1
+
+    if choice["val"] != 0:
+        console.print("  [dim]Clear cancelled.[/]")
+        return
+
+    session.history.clear()
+    console.print(f"  [green]Cleared[/] {count} run record(s) from session history.")
+
+
+def _clear_logs() -> None:
+    """Delete all files and folders under logs/ directory with confirmation."""
+    import os
+    import shutil
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
+
+    # Find project root (parent of cli package)
+    project_root = str(Path(__file__).resolve().parent.parent)
+    logs_dir = os.path.join(project_root, "logs")
+
+    if not os.path.isdir(logs_dir):
+        console.print("  [yellow]logs/ directory not found.[/]")
+        return
+
+    # Count items in logs directory
+    try:
+        items = []
+        for root, dirs, files in os.walk(logs_dir):
+            items.extend(dirs)
+            items.extend(files)
+        item_count = len(items)
+    except Exception:
+        item_count = 0
+
+    if item_count == 0:
+        console.print("  [dim]logs/ directory is already empty.[/]")
+        return
+
+    # Show confirmation message
+    console.print()
+    console.print(f"  [bold yellow]Permanently delete all {item_count} file(s)/folder(s) in logs/?[/]")
+    console.print("  [dim]This action cannot be undone.[/]")
+
+    choice = {"val": 1}  # 0 = Yes, 1 = No
+
+    kb = KeyBindings()
+
+    @kb.add("left")
+    @kb.add("right")
+    @kb.add("tab")
+    def _swap(event):
+        choice["val"] = 1 - choice["val"]
+        event.app.invalidate()
+
+    @kb.add("enter")
+    @kb.add("c-m")
+    def _confirm(event):
+        event.app.exit(result=choice["val"])
+
+    @kb.add("c-c")
+    def _cancel(event):
+        choice["val"] = 1  # treat Ctrl-C as No
+        event.app.exit(result=1)
+
+    from prompt_toolkit import PromptSession as _PS
+    _confirm_session = _PS(
+        key_bindings=kb,
+        style=Style.from_dict({"prompt": "bold #89b4fa"}),
+    )
+
+    def _toolbar_fn():
+        yes_fg = "#a6e3a1" if choice["val"] == 0 else "#6c7086"
+        no_fg = "#f38ba8" if choice["val"] == 1 else "#6c7086"
+        return HTML(
+            f'<style bg="#313244"> '
+            f'Delete logs?  '
+            f'<style fg="{yes_fg}">[ Yes ]</style>'
+            f'  '
+            f'<style fg="{no_fg}">[ No ]</style>'
+            f'  <style fg="#6c7086">← → to select · Enter to confirm</style>'
+            f' </style>'
+        )
+
+    try:
+        result = _confirm_session.prompt(
+            HTML('<b><style fg="#89b4fa">  Delete?</style></b> '),
+            bottom_toolbar=_toolbar_fn,
+            default="",
+        )
+    except (EOFError, KeyboardInterrupt):
+        choice["val"] = 1
+
+    if choice["val"] != 0:
+        console.print("  [dim]Deletion cancelled.[/]")
+        return
+
+    # Delete logs directory and recreate empty one
+    try:
+        shutil.rmtree(logs_dir)
+        os.makedirs(logs_dir, exist_ok=True)
+        console.print(f"  [green]Deleted[/] {item_count} item(s) from logs/ directory.")
+    except Exception as e:
+        show_error(f"Failed to delete logs: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Command handling
 # ---------------------------------------------------------------------------
 
@@ -392,6 +575,15 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/audit":
         _show_audit(session)
+
+    elif cmd == "/clear":
+        _clear_console()
+
+    elif cmd == "/clear-history":
+        _clear_history(session)
+
+    elif cmd == "/clear-logs":
+        _clear_logs()
 
     else:
         show_error(f"Unknown command: {cmd}. Type /help for options.")
