@@ -1006,6 +1006,7 @@ def show_help() -> None:
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
     table.add_row("/config [path]", "Show config or load a new config file")
+    table.add_row("/setup", "Configure API keys and model endpoints interactively")
     table.add_row("/help", "Show this help")
     table.add_row("/quit", "Exit")
     console.print()
