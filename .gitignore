@@ -25,3 +25,4 @@ local/
 CLAUDE.md
 dafny/
 envs/
+hpema_config.local.yaml
