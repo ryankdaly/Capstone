@@ -51,7 +51,9 @@ _CMD_META: dict[str, str] = {
     "/history":    "show run history [N]",
     "/audit":      "traceability matrix",
     "/config":     "show config or set config file path",
+    "/setup":      "configure API keys and model endpoints",
     "/help":       "show all commands",
+    "/scroll":     "terminal scrollmode",
     "/quit":       "exit HPEMA",
     "/exit":       "exit HPEMA",
 }
@@ -262,9 +264,9 @@ def _set_config(path: str, session: Session) -> None:
     env_file = os.path.join(project_root, ".env")
 
     if os.path.isfile(env_file):
-        restart_cmd = f"source {env_file} && HPEMA_CONFIG={path} python -m cli.main"
+        restart_cmd = f"source {env_file} && HPEMA_CONFIG={path} {sys.executable} -m cli.main"
     else:
-        restart_cmd = f"HPEMA_CONFIG={path} python -m cli.main"
+        restart_cmd = f"HPEMA_CONFIG={path} {sys.executable} -m cli.main"
 
     os.execv("/bin/bash", ["/bin/bash", "-c", restart_cmd])
     # os.execv replaces the process — code below never reached
@@ -283,6 +285,9 @@ def _handle_command(line: str, session: Session) -> bool:
     if cmd in ("/quit", "/exit", "/q"):
         _show_goodbye(session)
         return False
+
+    elif cmd == "/setup":
+        _run_setup(session)
 
     elif cmd == "/help":
         show_help()
@@ -361,6 +366,9 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/checker":
         _show_checker(session, arg)
+    
+    elif cmd == "/scroll":
+        _scroll_mode(session)
 
     elif cmd == "/dafny":
         _show_dafny(session, arg)
@@ -740,6 +748,252 @@ def _parse_iteration_arg(arg: str, total: int) -> int | None:
 
     return n - 1
 
+# ---------------------------------------------------------------------------
+# Scroll
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Scroll — curses-based in-terminal pager, no tmux required
+# ---------------------------------------------------------------------------
+
+def _scroll_mode(session: Session) -> None:
+    """Full-screen arrow-key pager over session output. No tmux required.
+
+    Keys:
+      ↑ / k          scroll up one line
+      ↓ / j          scroll down one line
+      PgUp / u       scroll up half a page
+      PgDn / d       scroll down half a page
+      Home / g       jump to top
+      End  / G       jump to bottom
+      q / Esc        return to REPL
+    """
+    import curses
+    import io
+    from rich.console import Console as _Console
+    from rich.syntax import Syntax as _Syntax
+
+    # ------------------------------------------------------------------
+    # 1. Render session to plain-text lines
+    # ------------------------------------------------------------------
+    buf_io = io.StringIO()
+    buf_console = _Console(
+        file=buf_io,
+        width=min(console.width, 200),
+        highlight=False,
+        markup=True,
+        no_color=True,
+    )
+
+    if not session.history:
+        buf_console.print("  No runs yet — type a requirement to start.\n")
+    else:
+        for i, record in enumerate(session.history, start=1):
+            state = record.state
+            sep = "─" * 80
+            buf_console.print(f"\n{sep}")
+            buf_console.print(
+                f"  Run {i:>3}  │  {record.requirement[:72]}\n"
+                f"  {state.status.value.upper()}"
+                f"  ·  {record.standard}"
+                f"  ·  {record.language}"
+                f"  ·  {record.elapsed_seconds:.1f}s"
+            )
+            buf_console.print(sep)
+
+            if state.final_code:
+                lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada"}
+                lang = lang_map.get(record.language, "c")
+                buf_console.print(
+                    f"\n  ── Source Code ({len(state.final_code.splitlines())} lines) ──\n"
+                )
+                buf_console.print(
+                    _Syntax(state.final_code, lang, theme="ansi_dark",
+                            line_numbers=True, padding=1)
+                )
+
+            if state.final_proof:
+                buf_console.print(
+                    f"\n  ── Dafny Specification"
+                    f" ({len(state.final_proof.splitlines())} lines) ──\n"
+                )
+                buf_console.print(
+                    _Syntax(state.final_proof, "csharp", theme="ansi_dark",
+                            line_numbers=True, padding=1)
+                )
+
+            if state.iterations:
+                last_iter = state.iterations[-1]
+                if last_iter.checker_report:
+                    cr = last_iter.checker_report
+                    buf_console.print(
+                        f"\n  ── Checker: {cr.verdict.value.upper()}"
+                        f"  ({len(cr.issues)} issues,"
+                        f" {len(cr.test_cases)} tests) ──"
+                    )
+                    for issue in cr.issues:
+                        buf_console.print(
+                            f"     [{issue.severity.value.upper()}]"
+                            f" {issue.description}"
+                        )
+                if last_iter.test_result and last_iter.test_result.executed:
+                    tr = last_iter.test_result
+                    buf_console.print(
+                        f"  ── Tests: {tr.passed}/{tr.total} passed ──"
+                    )
+                if last_iter.verification_result:
+                    vr = last_iter.verification_result
+                    buf_console.print(
+                        f"  ── Dafny: {'VERIFIED' if vr.verified else 'FAILED'} ──"
+                    )
+                if last_iter.policy_verdict:
+                    pv = last_iter.policy_verdict
+                    pc = "COMPLIANT" if pv.compliant else "NON-COMPLIANT"
+                    buf_console.print(
+                        f"  ── Policy: {pc}"
+                        f"  Risk: {pv.risk_level.value.upper()} ──"
+                    )
+                    for v in last_iter.policy_verdict.violations:
+                        buf_console.print(f"     [{v.rule_id}] {v.description}")
+
+        buf_console.print("\n")
+
+    raw_text = buf_io.getvalue()
+    # Strip any residual ANSI escape codes so curses sees clean text
+    import re
+    ansi_escape = re.compile(r"\x1B[@-_][0-?]*[ -/]*[@-~]")
+    lines: list[str] = [
+        ansi_escape.sub("", line)
+        for line in raw_text.splitlines()
+    ]
+
+    # ------------------------------------------------------------------
+    # 2. Hand off to curses pager
+    # ------------------------------------------------------------------
+    try:
+        curses.wrapper(_curses_pager, lines)
+    except curses.error:
+        # Terminal too small or curses unavailable — fall back to less/python pager
+        _fallback_pager(raw_text)
+
+
+def _curses_pager(stdscr, lines: list[str]) -> None:
+    """Curses inner loop — called by curses.wrapper."""
+    import curses
+
+    curses.curs_set(0)          # hide cursor
+    stdscr.keypad(True)         # enable arrow / PgUp / PgDn key constants
+    curses.use_default_colors() # transparent background
+
+    top = 0   # index of the topmost visible line
+
+    while True:
+        rows, cols = stdscr.getmaxyx()
+        content_rows = rows - 1   # last row reserved for the status bar
+
+        # Clamp top to valid range
+        max_top = max(0, len(lines) - content_rows)
+        top = max(0, min(top, max_top))
+
+        # Draw visible lines
+        stdscr.erase()
+        for screen_row, line_idx in enumerate(range(top, top + content_rows)):
+            if line_idx >= len(lines):
+                break
+            # Truncate to terminal width to avoid curses wrap errors
+            text = lines[line_idx][:cols - 1]
+            try:
+                stdscr.addstr(screen_row, 0, text)
+            except curses.error:
+                pass  # writing to the last cell of last row raises — ignore
+
+        # Status bar
+        pct = int(top / max_top * 100) if max_top else 100
+        at_end = top >= max_top
+        end_marker = " [END]" if at_end else ""
+        status = (
+            f"  HPEMA scroll  "
+            f"line {top + 1}/{len(lines)}  "
+            f"{pct}%{end_marker}"
+            f"  ── ↑↓ / jk  PgUp/PgDn  g/G  q:quit"
+        )
+        status = status[:cols - 1].ljust(cols - 1)
+        try:
+            stdscr.attron(curses.A_REVERSE)
+            stdscr.addstr(rows - 1, 0, status)
+            stdscr.attroff(curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        # Input
+        key = stdscr.getch()
+
+        if key in (ord("q"), ord("Q"), 27):          # q / Q / Esc
+            break
+        elif key in (curses.KEY_UP, ord("k")):
+            top -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            top += 1
+        elif key in (curses.KEY_PPAGE, ord("u")):     # PgUp / u
+            top -= content_rows // 2
+        elif key in (curses.KEY_NPAGE, ord("d")):     # PgDn / d
+            top += content_rows // 2
+        elif key in (curses.KEY_HOME, ord("g")):
+            top = 0
+        elif key in (curses.KEY_END, ord("G")):
+            top = max_top
+
+
+def _fallback_pager(text: str) -> None:
+    """less → more → built-in line pager. Used when curses is unavailable."""
+    import os, shutil, subprocess, tempfile
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="hpema_scroll_",
+        delete=False, encoding="utf-8",
+    )
+    try:
+        tmp.write(text)
+        tmp.flush()
+        tmp.close()
+
+        pager_env = os.environ.get("PAGER", "").strip()
+        if pager_env:
+            cmd = pager_env.split() + [tmp.name]
+        elif shutil.which("less"):
+            cmd = ["less", "-RXF", "--", tmp.name]
+        elif shutil.which("more"):
+            cmd = ["more", tmp.name]
+        else:
+            _python_pager(text)
+            return
+        try:
+            subprocess.run(cmd, check=False)
+        except FileNotFoundError:
+            _python_pager(text)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _python_pager(text: str, page_size: int = 40) -> None:
+    """Last-resort line-by-line pager for environments with nothing else."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        print("\n".join(lines[i : i + page_size]))
+        i += page_size
+        if i < len(lines):
+            try:
+                ans = input("\n-- more -- (Enter to continue, q to quit) ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ans.strip().lower() == "q":
+                break
 
 # ---------------------------------------------------------------------------
 # Audit
@@ -787,6 +1041,24 @@ def _show_audit(session: Session) -> None:
 # REPL entry point
 # ---------------------------------------------------------------------------
 
+def _run_setup(session: Session | None = None) -> None:
+    """Launch the interactive setup wizard (called by /setup command or on startup)."""
+    from cli.setup import run_setup_wizard
+    run_setup_wizard()
+    # If we returned (no restart), reload config into the live session
+    if session is not None:
+        try:
+            new_cfg = load_config()
+            session.standard       = new_cfg.policies.default_standard
+            session.max_iterations = new_cfg.pipeline.max_iterations
+            session.model          = new_cfg.models.actor.model
+            import os
+            session.config_source = os.environ.get("HPEMA_CONFIG", "hpema_config.local.yaml")
+        except Exception:
+            pass
+        console.print("  [dim]Session config reloaded from new settings.[/]\n")
+
+
 def start_repl() -> None:
     """Launch the interactive REPL."""
     # Rule 1: clear terminal noise from previous session
@@ -815,6 +1087,12 @@ def start_repl() -> None:
     # Show large warning if running in disconnected (partial pipeline) mode
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
+
+    # Welcome / setup prompt if no API keys are detected
+    from cli.setup import models_are_configured, show_welcome_screen
+    if not models_are_configured():
+        show_welcome_screen()
+        # Don't block — let the user type /setup themselves or proceed anyway
 
     # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
     # Chat bar is naturally blocked until this returns.

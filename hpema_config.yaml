@@ -23,8 +23,8 @@ policies:
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "dafny"
-  solver_path: null  # set to e.g. /opt/homebrew/bin/z3 when running locally on macOS
+  binary_path: "/opt/homebrew/bin/dafny"
+  solver_path: "/opt/homebrew/bin/z3"
 
 pipeline:
   max_iterations: 3
