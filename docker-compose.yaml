@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - HPEMA_API_KEY=${HPEMA_API_KEY}
+      - HPEMA_CONFIG=${HPEMA_CONFIG:-hpema_config.yaml}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
