@@ -1,0 +1,100 @@
+"""Central configuration — loads from hpema_config.yaml + env var overrides."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "hpema_config.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Sub-configs
+# ---------------------------------------------------------------------------
+
+class ModelEndpointConfig(BaseModel):
+    endpoint: str = "https://llm-api.arc.vt.edu/api/v1"
+    model: str = "gpt-oss-120b"
+    api_key_env: str = "HPEMA_API_KEY"
+    extra_body: dict = Field(
+        default_factory=dict,
+        description="Extra JSON body fields forwarded verbatim to the API "
+                    "(e.g. chat_template_kwargs for NVIDIA NIM models).",
+    )
+
+    @property
+    def api_key(self) -> str:
+        return os.environ.get(self.api_key_env, "")
+
+
+class ModelsConfig(BaseModel):
+    actor: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+    checker: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+    policy: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+    dafny_architect: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+
+
+class PoliciesConfig(BaseModel):
+    standards_dir: str = "data/standards"
+    chromadb_dir: str = "data/chromadb"
+    default_standard: str = "DO_178C"
+    embedding_model: str = "all-MiniLM-L6-v2"
+
+
+class VerificationConfig(BaseModel):
+    prover: str = "dafny"
+    timeout_seconds: int = 120
+    binary_path: str = "dafny"
+    solver_path: str | None = None  # e.g. /opt/homebrew/bin/z3; None = let Dafny find Z3 on PATH
+
+
+class PipelineConfig(BaseModel):
+    max_iterations: int = 3
+    require_human_approval: bool = True
+    audit_log_dir: str = "logs/audit"
+    model_run_log_dir: str = "logs/model_runs"
+    stage: str = "policy"  # "actor", "checker", "policy" — controls how far the pipeline runs
+
+
+# ---------------------------------------------------------------------------
+# Top-level config
+# ---------------------------------------------------------------------------
+
+class HpemaConfig(BaseModel):
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
+    policies: PoliciesConfig = Field(default_factory=PoliciesConfig)
+    verification: VerificationConfig = Field(default_factory=VerificationConfig)
+    pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+
+
+def load_config(path: Path | None = None) -> HpemaConfig:
+    """Load config from YAML, falling back to defaults if file is missing.
+
+    Resolution order:
+      1. Explicit `path` argument
+      2. HPEMA_CONFIG env var (relative to PROJECT_ROOT)
+      3. Default: hpema_config.yaml in project root
+    """
+    if path is None:
+        env_path = os.environ.get("HPEMA_CONFIG")
+        if env_path:
+            path = PROJECT_ROOT / env_path
+        else:
+            path = DEFAULT_CONFIG_PATH
+
+    if path.exists():
+        raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+        return HpemaConfig(**raw)
+    return HpemaConfig()
+
+
+# Module-level singleton — import this everywhere.
+settings = load_config()
