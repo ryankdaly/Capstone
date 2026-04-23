@@ -756,26 +756,46 @@ def _show_audit(session: Session) -> None:
     state = session.last_state
     matrix = build_traceability_matrix(state)
 
-    table = Table(title=f"Traceability Matrix — {state.run_id}", padding=(0, 1))
-    table.add_column("Requirement", style="bold")
+    table = Table(
+        title=f"Traceability Matrix — {state.run_id}",
+        padding=(0, 1),
+        show_lines=True,
+        expand=True,
+    )
+    table.add_column("Requirement", style="bold", overflow="fold")
     table.add_column("Code")
     table.add_column("Tests")
     table.add_column("Proof")
     table.add_column("Policy")
+    table.add_column("Standards")
 
     for row in matrix.rows:
         tests_str = f"{len(row.test_cases)} cases" if row.test_cases else "—"
-        refs = ", ".join(row.standard_references[:3]) if row.standard_references else ""
-        policy_str = row.policy_verdict
-        if refs:
-            policy_str += f"\n[dim]{refs}[/]"
+        proof_str = row.formal_proof_status or "—"
+        if proof_str.upper() == "VERIFIED":
+            proof_str = "[bold green]VERIFIED[/]"
+        elif proof_str.upper() == "FAILED":
+            proof_str = "[bold red]FAILED[/]"
+        else:
+            proof_str = f"[dim]{proof_str}[/]"
+
+        policy_str = row.policy_verdict or "—"
+        if policy_str.upper() == "COMPLIANT":
+            policy_str = "[bold green]COMPLIANT[/]"
+        elif policy_str.upper() == "NON-COMPLIANT":
+            policy_str = "[bold red]NON-COMPLIANT[/]"
+        else:
+            policy_str = f"[dim]{policy_str}[/]"
+
+        refs_str = "\n".join(row.standard_references[:5]) if row.standard_references else "—"
 
         table.add_row(
-            row.requirement[:40],
-            row.code_artifact,
+            row.requirement,
+            row.code_artifact or "—",
             tests_str,
-            row.formal_proof_status,
+            proof_str,
             policy_str,
+            refs_str,
         )
 
     console.print()
@@ -1019,13 +1039,13 @@ def start_repl() -> None:
                     answer = console.input(
                         "  [bold]Retry loop?[/] [dim][Y/n][/] "
                     ).strip().lower()
-                    do_retry = answer in ("", "y", "yes")
+                    do_retry = answer in ("y", "yes")
                 else:
                     try:
                         answer = _pt_session.prompt(  # type: ignore[name-defined]
                             "  Retry loop? [Y/n] ",
                         ).strip().lower()
-                        do_retry = answer in ("", "y", "yes")
+                        do_retry = answer in ("y", "yes")
                     except (EOFError, KeyboardInterrupt):
                         do_retry = False
 

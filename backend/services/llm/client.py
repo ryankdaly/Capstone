@@ -13,8 +13,16 @@ import json
 import logging
 import re
 from typing import Any, AsyncGenerator, Type
+import httpx
 
-from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitError
+from openai import (
+    AsyncOpenAI, 
+    BadRequestError, 
+    InternalServerError, 
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+)
 from pydantic import BaseModel, ValidationError
 
 from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
@@ -63,6 +71,37 @@ _TRANSIENT_REQUEST_ERRORS = (
     "service unavailable",
     "temporarily unavailable",
 )
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """Return True for low-level network/transport failures worth retrying."""
+    if isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ProtocolError,
+            OSError,
+            ConnectionError,
+        ),
+    ):
+        return True
+
+    msg = str(exc).lower()
+    transient_markers = (
+        "connection reset",
+        "connection reset by peer",
+        "broken pipe",
+        "server disconnected",
+        "remote protocol error",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "econnreset",
+        "econnaborted",
+        "connection aborted",
+    )
+    return any(marker in msg for marker in transient_markers)
 
 
 class LLMClient:
@@ -138,32 +177,43 @@ class LLMClient:
         self._clients.clear()
 
     async def _api_call(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
-        """Execute one chat completion, retrying on transient server errors.
+        """Execute one chat completion, retrying on transient API/transport errors.
 
-        Retries on:
-          - InternalServerError (500): EngineCore crash, vLLM restart
-          - RateLimitError (429): upstream throttling
-          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS: NVIDIA NIM
-            "DEGRADED function" and similar platform-unavailability messages
+        Retries up to 3 total attempts with backoff for:
+          - 5xx / InternalServerError
+          - 429 / RateLimitError
+          - SDK timeout/connection failures
+          - raw httpx/network transport failures (connection reset, broken pipe, etc.)
+          - transient provider-side 400s such as degraded/unavailable platform errors
 
-        Genuine 400s (wrong response_format, unsupported system role) do NOT
-        match _TRANSIENT_REQUEST_ERRORS and are re-raised immediately so the
-        outer capability-detection loop in generate() can handle them.
+        Permanent 400 capability errors are re-raised immediately so the outer
+        fallback logic in generate() can handle them.
         """
-        delays = [5, 15]  # seconds between attempts 1→2 and 2→3
-        for attempt, delay in enumerate([-1] + delays):  # attempt 0 has no pre-sleep
-            if delay >= 0:
-                logger.warning(
-                    "Transient API error — retrying in %ds (attempt %d/3)...",
-                    delay, attempt + 1,
-                )
-                await asyncio.sleep(delay)
+        backoff_delays = [1, 2]  # 3 total attempts: initial + 2 retries
+
+        for attempt in range(3):
             try:
                 return await client.chat.completions.create(**kwargs)
-            except (InternalServerError, RateLimitError) as exc:
-                if attempt == len(delays):
+
+            except (
+                InternalServerError,
+                RateLimitError,
+                APITimeoutError,
+                APIConnectionError,
+                TimeoutError,
+            ) as exc:
+                if attempt == len(backoff_delays):
                     raise
-                logger.warning("API error (%s): %s", type(exc).__name__, exc)
+                delay = backoff_delays[attempt]
+                logger.warning(
+                    "Transient API error (%s): %s — retrying in %ss (attempt %d/3).",
+                    type(exc).__name__,
+                    exc,
+                    delay,
+                    attempt + 2,
+                )
+                await asyncio.sleep(delay)
+
             except BadRequestError as exc:
                 # Some providers (NVIDIA NIM) return 400 for transient platform
                 # failures ("DEGRADED function cannot be invoked"). These are not
@@ -171,11 +221,34 @@ class LLMClient:
                 # response_format, unsupported system role) do NOT match these
                 # patterns and are re-raised immediately for the outer loop.
                 if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
-                    if attempt == len(delays):
+                    if attempt == len(backoff_delays):
                         raise
-                    logger.warning("Transient 400 from API (%s): %s", type(exc).__name__, exc)
+                    delay = backoff_delays[attempt]
+                    logger.warning(
+                        "Transient 400 from API (%s): %s — retrying in %ss (attempt %d/3).",
+                        type(exc).__name__,
+                        exc,
+                        delay,
+                        attempt + 2,
+                    )
+                    await asyncio.sleep(delay)
                 else:
                     raise
+
+            except Exception as exc:
+                if not _is_transient_transport_error(exc):
+                    raise
+                if attempt == len(backoff_delays):
+                    raise
+                delay = backoff_delays[attempt]
+                logger.warning(
+                    "Transient transport error (%s): %s — retrying in %ss (attempt %d/3).",
+                    type(exc).__name__,
+                    exc,
+                    delay,
+                    attempt + 2,
+                )
+                await asyncio.sleep(delay)
 
     async def generate(
         self,

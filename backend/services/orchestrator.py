@@ -43,6 +43,7 @@ from backend.services.rag.retriever import StandardsRetriever
 from backend.services.testing.runner import TestRunner
 from backend.services.verification.contract_extractor import DafnyContracts, extract_contracts
 from backend.services.verification.dafny_runner import DafnyRunner
+from backend.services.audit.model_run_logger import ModelRunLogger
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class PipelineOrchestrator:
         retriever: StandardsRetriever | None = None,
         audit_logger: AuditLogger | None = None,
         test_runner: TestRunner | None = None,
+        model_run_logger: ModelRunLogger | None = None,
     ) -> None:
         self._llm = llm_client or LLMClient()
         self._dafny = dafny_runner or DafnyRunner()
@@ -78,6 +80,7 @@ class PipelineOrchestrator:
         )
         self._audit = audit_logger or AuditLogger()
         self._test_runner = test_runner or TestRunner()
+        self._model_runs = model_run_logger or ModelRunLogger()
 
         # Agents
         self._actor = ActorAgent(self._llm)
@@ -103,6 +106,7 @@ class PipelineOrchestrator:
             status=PipelineStatus.RUNNING,
         )
         run_id = state.run_id
+        self._model_runs.start_run(run_id, request)
 
         # --- Debug session header in agent.log ---
         try:
@@ -166,6 +170,9 @@ class PipelineOrchestrator:
                     yield self._event(run_id, StreamEventType.AGENT_START, "actor")
                     self._audit.log(run_id, "agent_start", agent="actor",
                                     data={"iteration": i, "attempt": _attempt})
+                    self._model_runs.log_agent_start(run_id, iteration=i,
+                        agent="actor", attempt=_attempt,
+                    )
                     try:
                         async for _item in self._actor.run_streaming(
                             requirement=request.requirement_text,
@@ -176,6 +183,9 @@ class PipelineOrchestrator:
                         ):
                             if isinstance(_item, str):
                                 yield self._event(run_id, StreamEventType.AGENT_TOKEN, "actor", {"token": _item})
+                                self._model_runs.log_token(run_id, iteration=i,
+                                    agent="actor", attempt=_attempt, token=_item,
+                                )
                             else:
                                 code_candidate = _item
                         break  # success
@@ -197,6 +207,10 @@ class PipelineOrchestrator:
                             )
                             self._audit.log(run_id, "agent_skipped", agent="actor",
                                             data={"error": str(_actor_exc)})
+                            self._model_runs.log_error(run_id, iteration=i,
+                                agent="actor", attempt=_attempt,
+                                error=str(_actor_exc), skipped=True,
+                            )
 
                 if _actor_skipped:
                     # Can't proceed without code — move to next pipeline iteration.
@@ -218,6 +232,9 @@ class PipelineOrchestrator:
                 self._audit.log(
                     run_id, "agent_output", agent="actor",
                     data=code_candidate.model_dump(),
+                )
+                self._model_runs.log_output(run_id, iteration=i, agent="actor",
+                    attempt=_attempt, output=code_candidate.model_dump(),
                 )
 
                 # ── PHASE 1: DAFNY (architect → verify, up to 3 full cycles) ──────────
@@ -246,6 +263,9 @@ class PipelineOrchestrator:
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_architect")
                         self._audit.log(run_id, "agent_start", agent="dafny_architect",
                                         data={"iteration": i, "cycle": _cycle})
+                        self._model_runs.log_agent_start(run_id, iteration=i,
+                            agent="dafny_architect", cycle=_cycle,
+                        )
                         try:
                             async for _item in self._dafny_architect.run_streaming(
                                 source_code=code_candidate.source_code,
@@ -257,6 +277,9 @@ class PipelineOrchestrator:
                                 if isinstance(_item, str):
                                     yield self._event(run_id, StreamEventType.AGENT_TOKEN,
                                                       "dafny_architect", {"token": _item})
+                                    self._model_runs.log_token(run_id, iteration=i,
+                                        agent="dafny_architect", cycle=_cycle, token=_item,
+                                    )
                                 else:
                                     dafny_result = _item
                         except Exception as _arch_exc:
@@ -279,6 +302,10 @@ class PipelineOrchestrator:
                                 )
                                 self._audit.log(run_id, "agent_skipped", agent="dafny_architect",
                                                 data={"error": str(_arch_exc)})
+                                self._model_runs.log_error(run_id, iteration=i,
+                                    agent="dafny_architect", cycle=_cycle,
+                                    error=str(_arch_exc), skipped=True,
+                                )
                             # LLM failure: carry the hint; don't touch prior_dafny_verification
                             continue
 
@@ -295,6 +322,10 @@ class PipelineOrchestrator:
                         )
                         self._audit.log(run_id, "agent_output", agent="dafny_architect",
                                         data={**dafny_result.model_dump(), "cycle": _cycle})
+                        self._model_runs.log_output(run_id, iteration=i,
+                            agent="dafny_architect", cycle=_cycle,
+                            output={**dafny_result.model_dump(), "cycle": _cycle},
+                        )
 
                         # ── Dafny Verifier ────────────────────────────────────────────
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
@@ -313,6 +344,9 @@ class PipelineOrchestrator:
                         )
                         self._audit.log(run_id, "verification_result",
                                         data={**_cycle_verification.model_dump(), "cycle": _cycle})
+                        self._model_runs.log_verification_result(run_id, iteration=i,
+                            cycle=_cycle, result={**_cycle_verification.model_dump(), "cycle": _cycle},
+                        )
 
                         if _cycle_verification.verified or not has_dafny_spec:
                             if _cycle_verification.verified:
@@ -358,6 +392,9 @@ class PipelineOrchestrator:
                             self._audit.log(run_id, "agent_start", agent="checker",
                                             data={"iteration": i, "attempt": _attempt,
                                                   "fix_round": _fix_round})
+                            self._model_runs.log_agent_start(run_id, iteration=i,
+                                agent="checker", attempt=_attempt, fix_round=_fix_round,
+                            )
                             try:
                                 async for _item in self._checker.run_streaming(
                                     source_code=code_candidate.source_code,
@@ -370,6 +407,10 @@ class PipelineOrchestrator:
                                     if isinstance(_item, str):
                                         yield self._event(run_id, StreamEventType.AGENT_TOKEN,
                                                           "checker", {"token": _item})
+                                        self._model_runs.log_token(run_id, iteration=i,
+                                            agent="checker", attempt=_attempt,
+                                            fix_round=_fix_round, token=_item,
+                                        )
                                     else:
                                         checker_report = _item
                                 break  # LLM parse success
@@ -391,6 +432,10 @@ class PipelineOrchestrator:
                                     )
                                     self._audit.log(run_id, "agent_skipped", agent="checker",
                                                     data={"error": str(_checker_exc)})
+                                    self._model_runs.log_error(run_id, iteration=i,
+                                        agent="checker", attempt=_attempt, fix_round=_fix_round, 
+                                        error=str(_checker_exc), skipped=True,
+                                    )
 
                         if not _checker_skipped:
                             yield self._event(
@@ -405,6 +450,10 @@ class PipelineOrchestrator:
                             )
                             self._audit.log(run_id, "agent_output", agent="checker",
                                             data=checker_report.model_dump())
+                            self._model_runs.log_output(run_id, iteration=i,
+                                agent="checker", attempt=_attempt,
+                                fix_round=_fix_round, output=checker_report.model_dump(),
+                            )
 
                         # ── Test runner ───────────────────────────────────────────
                         if (
@@ -433,6 +482,9 @@ class PipelineOrchestrator:
                                 },
                             )
                             self._audit.log(run_id, "test_run", data=test_result.model_dump())
+                            self._model_runs.log_test_result(run_id, iteration=i,
+                                fix_round=_fix_round, result=test_result.model_dump(),
+                            )
 
                             # Detect collection error — pytest couldn't parse the test file.
                             # Feed the error back to Checker to rewrite tests.
@@ -471,6 +523,9 @@ class PipelineOrchestrator:
 
                 if stage_enabled(PipelineStage.POLICY, max_stage):
                     yield self._event(run_id, StreamEventType.AGENT_START, "policy")
+                    self._model_runs.log_agent_start(run_id, iteration=i,
+                        agent="policy", attempt=1,
+                    )
 
                     try:
                         policy_context = await self._retriever.retrieve(
@@ -495,6 +550,9 @@ class PipelineOrchestrator:
                     ):
                         if isinstance(_item, str):
                             yield self._event(run_id, StreamEventType.AGENT_TOKEN, "policy", {"token": _item})
+                            self._model_runs.log_token(run_id, iteration=i,
+                                agent="policy", attempt=1, token=_item,
+                            )
                         else:
                             policy_verdict = _item
                     iteration.policy_verdict = policy_verdict
@@ -510,6 +568,9 @@ class PipelineOrchestrator:
                         },
                     )
                     self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
+                    self._model_runs.log_output(run_id, iteration=i,agent="policy", 
+                        attempt=1, output=policy_verdict.model_dump(),
+                    )
 
                 # --- CONVERGENCE CHECK ---
                 # Dafny is best-effort: tracked and fed back, but does NOT gate convergence.
@@ -601,6 +662,7 @@ class PipelineOrchestrator:
             logger.exception("Pipeline error in run %s", run_id)
             state.status = PipelineStatus.FAILED
             state.error = str(e)
+            self._model_runs.complete_run(run_id, status=state.status.value, error=state.error)
             yield self._event(
                 run_id, StreamEventType.AGENT_ERROR, data={"error": str(e)},
             )
@@ -612,6 +674,7 @@ class PipelineOrchestrator:
             "iterations": len(state.iterations),
             "stage": max_stage.value,
         })
+        self._model_runs.complete_run(run_id, status=state.status.value, error=state.error)
 
         yield self._event(
             run_id, StreamEventType.PIPELINE_COMPLETE, data={

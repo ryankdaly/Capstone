@@ -83,7 +83,7 @@ class AuditLogger:
 
         # 1. Append to per-run JSONL file
         jsonl_path = self._log_dir / f"{run_id}.jsonl"
-        with open(jsonl_path, "a") as f:
+        with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(entry.model_dump_json() + "\n")
 
         # 2. Insert into SQLite (skipped if DB is unavailable)
@@ -114,7 +114,7 @@ class AuditLogger:
             return []
 
         entries: list[AuditEntry] = []
-        for line in jsonl_path.read_text().splitlines():
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 entries.append(AuditEntry.model_validate_json(line))
         return entries

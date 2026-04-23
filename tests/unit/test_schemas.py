@@ -22,6 +22,8 @@ from backend.api.schemas.pipeline import (
     PipelineStatus,
     StreamEvent,
     StreamEventType,
+    PipelineStage,
+    stage_enabled,
 )
 
 
@@ -138,3 +140,31 @@ class TestFeedbackMessage:
         )
         assert fb.iteration == 2
         assert "CRITICAL" in fb.priority_summary
+
+
+
+class TestPipelineStage:
+    def test_pipeline_request_defaults_to_policy_stage(self):
+        request = PipelineRequest(requirement_text="test")
+        assert request.stage == PipelineStage.POLICY
+
+    def test_pipeline_request_accepts_explicit_stage(self):
+        request = PipelineRequest(
+            requirement_text="test",
+            stage=PipelineStage.CHECKER,
+        )
+        assert request.stage == PipelineStage.CHECKER
+
+    def test_pipeline_request_parses_stage_from_json_value(self):
+        request = PipelineRequest.model_validate({
+            "requirement_text": "test",
+            "stage": "actor",
+        })
+        assert request.stage == PipelineStage.ACTOR
+
+    def test_stage_enabled_respects_pipeline_ordering(self):
+        assert stage_enabled(PipelineStage.ACTOR, PipelineStage.ACTOR) is True
+        assert stage_enabled(PipelineStage.ACTOR, PipelineStage.CHECKER) is True
+        assert stage_enabled(PipelineStage.CHECKER, PipelineStage.CHECKER) is True
+        assert stage_enabled(PipelineStage.POLICY, PipelineStage.CHECKER) is False
+        assert stage_enabled(PipelineStage.POLICY, PipelineStage.POLICY) is True

@@ -1226,10 +1226,15 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
     """
     import concurrent.futures
     import os
-    import select
     import sys
-    import termios
     import threading
+
+    if os.name == "nt":
+        import msvcrt
+    else:
+        import select
+        import termios
+    
 
     _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     # Poll unreachable local endpoints every N seconds (not every second)
@@ -1311,6 +1316,23 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
     def _listen_for_skip() -> None:
         if not sys.stdin.isatty():
             return
+        
+        # windows path: use msvcrt polling instead
+        if os.name == "nt":
+            try:
+                while not stop_event.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        # Ctrl+S
+                        if ch == b"\x13":
+                            skip_event.set()
+                            break
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            return
+        
+        #unix path
         try:
             fd = sys.stdin.fileno()
             old_attrs = termios.tcgetattr(fd)

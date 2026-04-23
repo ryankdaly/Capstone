@@ -28,7 +28,7 @@ def _configure_logging() -> None:
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
 
-    file_handler = logging.FileHandler(log_dir / "hpema.log", mode="a")
+    file_handler = logging.FileHandler(log_dir / "hpema.log", mode="a", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
