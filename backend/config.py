@@ -8,6 +8,9 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "hpema_config.yaml"
@@ -57,6 +60,7 @@ class PipelineConfig(BaseModel):
     max_iterations: int = 3
     require_human_approval: bool = True
     audit_log_dir: str = "logs/audit"
+    model_run_log_dir: str = "logs/model_runs"
     stage: str = "policy"  # "actor", "checker", "policy" — controls how far the pipeline runs
 
 
