@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "hpema"
+version = "0.1.0"
+description = "Hierarchical Policy-Enforced Multi-Agent code generation pipeline for safety-critical software"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+
+# Core dependencies — everything needed for the full pipeline including
+# the policy layer (RAG). Policy is not optional; it ships by default.
+dependencies = [
+    # LLM + HTTP
+    "openai>=1.0",
+    "httpx>=0.27.0",
+    # Data / config
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    # CLI
+    "typer>=0.12.0",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+    # Policy / RAG layer (always required — policy is a first-class pipeline stage)
+    "torch>=2.2,<3",
+    "numpy<2.0",
+    "sentence-transformers>=2.5,<3",
+    "transformers>=4.37,<5",
+    "chromadb>=0.6",
+]
+
+[project.optional-dependencies]
+# API server mode (backend/main.py) — not needed for the CLI
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+]
+# Dev / CI — never installed by end users
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
+    "anyio>=4.0",
+    "build>=1.0",
+    "twine>=5.0",
+    "hpema[server]",
+]
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+[project.scripts]
+hpema = "cli.main:app"
+
+# ---------------------------------------------------------------------------
+# Build — what goes into the wheel
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["cli", "backend", "hpema_data"]
+
+# Include non-Python data files that must ship with the package
+[tool.hatch.build.targets.wheel.force-include]
+# Safety standards documents (RAG source) — bundled under hpema_data package
+"data/standards"    = "hpema_data/standards"
+# Default config template — shipped for reference; /setup writes to ~/.hpema/
+"hpema_config.yaml" = "hpema_data/hpema_config.yaml"
+# NOTE: backend/services/llm/prompts/*.txt is already included via the backend
+# package scan — no force-include needed there.
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths   = ["tests"]
+# Integration tests hit real API endpoints — skip by default in CI / bundle check.
+# Run with:  pytest -m integration
+markers = [
+    "integration: tests that call live LLM endpoints (deselect with -m 'not integration')",
+]

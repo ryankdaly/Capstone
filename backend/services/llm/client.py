@@ -1,9 +1,11 @@
 """Async OpenAI-compatible LLM client.
 
-Single wrapper used by all agents. Supports constrained decoding via
-response_format (guided_json) when the server supports it (vLLM / OpenAI).
-Falls back to prompt-only JSON enforcement for providers that don't support
-the json_schema response_format (Groq, Anthropic, older endpoints, etc.).
+Single wrapper used by all agents.  Capability flags (constrained decoding,
+system role, thinking kwargs) are read from the family profile declared in
+hpema_config.yaml — not discovered at runtime.  This eliminates wasted API
+calls caused by sending wrong kwargs to models that reject them.
+
+See backend/services/llm/profiles.py for the family registry.
 """
 
 from __future__ import annotations
@@ -18,45 +20,12 @@ from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitE
 from pydantic import BaseModel, ValidationError
 
 from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
+from backend.services.llm.profiles import ModelFamilyProfile, get_profile
 
 logger = logging.getLogger(__name__)
 
-# Error substrings that indicate the provider rejected the response_format param.
-_CONSTRAINED_DECODING_ERRORS = (
-    "response_format",
-    "json_schema",
-    "guided_json",
-    "unsupported",
-    "not supported",
-    "invalid_request_error",
-)
-
-# Error substrings that indicate the provider doesn't support the system role
-# (e.g. Gemma family models via NVIDIA API, some Mistral endpoints).
-_NO_SYSTEM_ROLE_ERRORS = (
-    "system role not supported",
-    "system role is not supported",
-    "does not support system",
-    "system messages are not supported",
-)
-
-# Error substrings that indicate the endpoint rejected thinking-control params
-# (e.g. enable_thinking / thinking_budget in extra_body.chat_template_kwargs).
-# Minimax via NVIDIA NIM is the primary example: it always thinks and does not
-# expose a toggle.  When detected we strip these keys and retry — the model
-# will still produce <think> blocks; the pipeline handles them transparently.
-_NO_THINKING_KWARGS_ERRORS = (
-    "enable_thinking",
-    "thinking_budget",
-    "chat_template_kwargs",
-    "extra_body",
-    "unexpected keyword",
-    "unknown field",
-    "invalid parameter",
-)
-
 # 400 errors that are transient platform failures, not capability gaps.
-# These should be retried like a 500, not treated as permanent incompatibilities.
+# Retried like 500s — do NOT treat as permanent profile mismatches.
 _TRANSIENT_REQUEST_ERRORS = (
     "degraded",
     "function cannot be invoked",
@@ -66,18 +35,17 @@ _TRANSIENT_REQUEST_ERRORS = (
 
 
 class LLMClient:
-    """Async client that talks to any OpenAI-compatible endpoint."""
+    """Async client that talks to any OpenAI-compatible endpoint.
+
+    Capability flags (constrained decoding, system role, thinking kwargs) are
+    read from the model's family profile — not discovered at runtime.  This
+    eliminates wasted API calls caused by sending wrong kwargs to models that
+    reject them.  Transient errors (500, 429, DEGRADED 400s) are still retried.
+    """
 
     def __init__(self, registry: ModelRegistry | None = None) -> None:
         self._registry = registry or ModelRegistry()
         self._clients: dict[str, AsyncOpenAI] = {}
-        # Track capability gaps per endpoint so we skip the overhead of a
-        # failing first attempt on subsequent calls to the same endpoint.
-        self._no_constrained_decoding: set[str] = set()
-        self._no_system_role: set[str] = set()
-        # Endpoints that reject thinking-control keys in extra_body
-        # (e.g. enable_thinking, thinking_budget).  We strip those keys and retry.
-        self._no_thinking_kwargs: set[str] = set()
 
     def _get_client(self, model: ResolvedModel) -> AsyncOpenAI:
         """Lazily create one AsyncOpenAI client per unique endpoint."""
@@ -87,71 +55,146 @@ class LLMClient:
                 api_key=model.api_key or "unused",
                 # Explicit timeouts: fail fast on connection problems, allow
                 # up to 3 min for large models to stream their first token.
-                # Without this httpx defaults to 600 s, making hangs invisible.
                 timeout=180.0,
             )
         return self._clients[model.endpoint]
 
-    def _messages(self, endpoint: str, system_prompt: str, user_prompt: str) -> list[dict]:
-        """Build the messages list for a chat request.
+    # ── Profile helpers ──────────────────────────────────────────────────────
 
-        For endpoints that don't support the system role (e.g. Gemma via
-        NVIDIA API), the system content is prepended to the first user
-        message so the model still receives its full instructions.
+    def _messages(
+        self,
+        profile: ModelFamilyProfile,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> list[dict]:
+        """Build messages list according to the family profile.
+
+        For families that don't support the system role (Gemma 3), system
+        content is prepended to the first user message.
         """
-        if endpoint in self._no_system_role:
+        if not profile.supports_system_role:
             return [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-    def _sanitized_extra_body(self, endpoint: str, extra_body: dict) -> dict:
-        """Return extra_body with thinking-control keys removed for known endpoints.
+    def _thinking_kwargs(
+        self,
+        resolved: ResolvedModel,
+        profile: ModelFamilyProfile,
+    ) -> tuple[dict, dict]:
+        """Return (extra_body, extra_params) for thinking based on profile + config.
 
-        Called before each API request so that endpoints that previously
-        rejected ``enable_thinking`` / ``thinking_budget`` don't receive them
-        again.  The original ResolvedModel dict is never mutated.
+        extra_body  — merged into the API call's extra_body field
+        extra_params — merged into top-level API call kwargs (e.g. reasoning_effort)
         """
-        if endpoint not in self._no_thinking_kwargs:
-            return extra_body
-        thinking_keys = {"enable_thinking", "thinking_budget"}
-        result = dict(extra_body)
-        if "chat_template_kwargs" in result:
-            ctk = {k: v for k, v in result["chat_template_kwargs"].items()
-                   if k not in thinking_keys}
-            if ctk:
-                result["chat_template_kwargs"] = ctk
+        mode = profile.thinking_mode
+        want = resolved.enable_thinking
+
+        if mode in ("none", "always"):
+            # "none": no thinking capability
+            # "always": thinks natively — no control kwargs needed
+            extra_body: dict = {}
+            extra_params: dict = {}
+        elif mode == "toggle-off":
+            # Off by default; activate only when explicitly requested
+            if want:
+                extra_body = dict(profile.thinking_on_extra_body)
+                extra_params = dict(profile.thinking_on_extra_params)
             else:
-                del result["chat_template_kwargs"]
-        return result
+                extra_body = {}
+                extra_params = {}
+        elif mode == "toggle-on":
+            # On by default; must explicitly disable if not wanted
+            if want:
+                extra_body = dict(profile.thinking_on_extra_body)
+                extra_params = dict(profile.thinking_on_extra_params)
+            else:
+                extra_body = dict(profile.thinking_off_extra_body)
+                extra_params = dict(profile.thinking_off_extra_params)
+        else:
+            extra_body = {}
+            extra_params = {}
 
-    async def aclose(self) -> None:
-        """Close all httpx connection pools while the event loop is still open.
+        # Merge model-level extra_body overrides on top (never mutates profile)
+        if resolved.extra_body:
+            extra_body = {**extra_body, **resolved.extra_body}
 
-        Must be called before asyncio.run() returns. Without this, Python 3.10+
-        prints 'Event loop is closed' noise when the GC finalizes the
-        AsyncOpenAI clients after the loop has already been shut down.
-        """
-        for client in self._clients.values():
-            await client.close()
-        self._clients.clear()
+        return extra_body, extra_params
+
+    def _build_kwargs(
+        self,
+        resolved: ResolvedModel,
+        profile: ModelFamilyProfile,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: type[BaseModel] | None,
+        temperature: float,
+        max_tokens: int,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """Assemble the full kwargs dict for one API call using the family profile."""
+        use_constrained = (
+            response_schema is not None and profile.supports_json_schema
+        )
+
+        eff_system = (
+            system_prompt + _json_prompt_suffix(response_schema)
+            if response_schema and not use_constrained
+            else system_prompt
+        )
+
+        extra_body, extra_params = self._thinking_kwargs(resolved, profile)
+
+        kwargs: dict[str, Any] = {
+            "model": resolved.model,
+            "messages": self._messages(profile, eff_system, user_prompt),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **extra_params,
+        }
+        if stream:
+            kwargs["stream"] = True
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if use_constrained:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema.__name__,
+                    "schema": response_schema.model_json_schema(),
+                },
+            }
+
+        logger.info(
+            "LLM call | role=%s family=%s model=%s constrained=%s "
+            "thinking_mode=%s enable_thinking=%s",
+            resolved.model.split("/")[-1],  # short name
+            resolved.family,
+            resolved.model,
+            use_constrained,
+            profile.thinking_mode,
+            resolved.enable_thinking,
+        )
+        return kwargs
+
+    # ── Transient-error retry ────────────────────────────────────────────────
 
     async def _api_call(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
-        """Execute one chat completion, retrying on transient server errors.
+        """Execute one chat completion, retrying only on transient errors.
 
-        Retries on:
-          - InternalServerError (500): EngineCore crash, vLLM restart
-          - RateLimitError (429): upstream throttling
-          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS: NVIDIA NIM
-            "DEGRADED function" and similar platform-unavailability messages
+        Retries:
+          - InternalServerError (500)
+          - RateLimitError (429)
+          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS
+            (NVIDIA NIM "DEGRADED function", platform unavailability)
 
-        Genuine 400s (wrong response_format, unsupported system role) do NOT
-        match _TRANSIENT_REQUEST_ERRORS and are re-raised immediately so the
-        outer capability-detection loop in generate() can handle them.
+        All other 400s are re-raised immediately — they indicate a profile
+        misconfiguration, not a transient failure.
         """
-        delays = [5, 15]  # seconds between attempts 1→2 and 2→3
-        for attempt, delay in enumerate([-1] + delays):  # attempt 0 has no pre-sleep
+        delays = [5, 15]  # seconds between attempt 1→2 and 2→3
+        for attempt, delay in enumerate([-1] + delays):
             if delay >= 0:
                 logger.warning(
                     "Transient API error — retrying in %ds (attempt %d/3)...",
@@ -165,147 +208,57 @@ class LLMClient:
                     raise
                 logger.warning("API error (%s): %s", type(exc).__name__, exc)
             except BadRequestError as exc:
-                # Some providers (NVIDIA NIM) return 400 for transient platform
-                # failures ("DEGRADED function cannot be invoked"). These are not
-                # capability gaps — retry them like a 500. Genuine 400s (wrong
-                # response_format, unsupported system role) do NOT match these
-                # patterns and are re-raised immediately for the outer loop.
                 if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
                     if attempt == len(delays):
                         raise
-                    logger.warning("Transient 400 from API (%s): %s", type(exc).__name__, exc)
+                    logger.warning("Transient 400 (%s): %s", type(exc).__name__, exc)
                 else:
                     raise
+
+    # ── Public interface ─────────────────────────────────────────────────────
+
+    async def aclose(self) -> None:
+        """Close all httpx connection pools (call before event loop shuts down)."""
+        for client in self._clients.values():
+            await client.close()
+        self._clients.clear()
 
     async def generate(
         self,
         role: str,
         system_prompt: str,
         user_prompt: str,
-        response_schema: Type[BaseModel] | None = None,
+        response_schema: type[BaseModel] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 4096,
         extra_params: dict[str, Any] | None = None,
     ) -> str:
-        """Send a chat completion request and return the raw response text.
+        """Send a chat completion and return the raw response text.
 
-        Parameters
-        ----------
-        role : str
-            Agent role name (actor, checker, policy) — resolved via registry.
-        system_prompt : str
-            System message for the agent.
-        user_prompt : str
-            User/task message.
-        response_schema : Type[BaseModel] | None
-            If provided, requests constrained decoding so the model's output
-            matches the schema. Falls back to prompt-only JSON if the provider
-            doesn't support response_format=json_schema.
-        temperature : float
-            Sampling temperature.
-        max_tokens : int
-            Max tokens to generate.
-        extra_params : dict | None
-            Additional params passed to the API (e.g., vLLM-specific flags).
+        Kwargs are built from the model's family profile — no runtime discovery.
         """
         resolved = self._registry.get(role)
+        profile = get_profile(resolved.family)
         client = self._get_client(resolved)
-        endpoint = resolved.endpoint
 
-        kwargs_base: dict[str, Any] = {
-            "model": resolved.model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if extra_params:
-            kwargs_base.update(extra_params)
-
-        # Retry loop — each pass may discover one new capability gap and adapt.
-        # At most 4 attempts: (1) preferred mode, (2-4) each fallback.
-        for _attempt in range(4):
-            use_constrained = (
-                response_schema is not None
-                and endpoint not in self._no_constrained_decoding
-            )
-
-            # In prompt-only mode inject the schema into the system prompt so
-            # the model knows what structure to produce without response_format.
-            eff_system = (
-                system_prompt + _json_prompt_suffix(response_schema)
-                if response_schema and not use_constrained
-                else system_prompt
-            )
-
-            # Apply per-endpoint extra_body sanitization (strips thinking-control
-            # keys for endpoints that have previously rejected them).
-            eff_extra_body = (
-                self._sanitized_extra_body(endpoint, resolved.extra_body)
-                if resolved.extra_body else {}
-            )
-
-            kwargs: dict[str, Any] = {
-                **kwargs_base,
-                "messages": self._messages(endpoint, eff_system, user_prompt),
-            }
-            if eff_extra_body:
-                kwargs["extra_body"] = eff_extra_body
-
-            if use_constrained:
-                kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_schema.__name__,
-                        "schema": response_schema.model_json_schema(),
-                    },
-                }
-
-            logger.info(
-                "LLM request to %s [%s] model=%s constrained=%s no_system_role=%s no_thinking_kwargs=%s",
-                role, endpoint, resolved.model, use_constrained,
-                endpoint in self._no_system_role,
-                endpoint in self._no_thinking_kwargs,
-            )
-
-            try:
-                response = await self._api_call(client, kwargs)
-                content = response.choices[0].message.content or ""
-                # NOTE: do NOT strip think tags here — generate() is used by the
-                # non-streaming path; stripping happens in parse_structured() and
-                # in run_streaming() after accumulation so we never lose raw content.
-                logger.debug("LLM response from %s: %s chars", role, len(content))
-                return content
-            except BadRequestError as exc:
-                err_lower = str(exc).lower()
-                if any(kw in err_lower for kw in _NO_SYSTEM_ROLE_ERRORS):
-                    logger.info(
-                        "Endpoint %s does not support system role — "
-                        "retrying with system content merged into user message.",
-                        endpoint,
-                    )
-                    self._no_system_role.add(endpoint)
-                elif any(kw in err_lower for kw in _NO_THINKING_KWARGS_ERRORS) and resolved.extra_body:
-                    logger.info(
-                        "Endpoint %s rejected thinking-control extra_body params — "
-                        "retrying without enable_thinking / thinking_budget.",
-                        endpoint,
-                    )
-                    self._no_thinking_kwargs.add(endpoint)
-                elif response_schema is not None and any(
-                    kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
-                ):
-                    logger.info(
-                        "Endpoint %s does not support constrained decoding — "
-                        "retrying with prompt-only JSON enforcement.",
-                        endpoint,
-                    )
-                    self._no_constrained_decoding.add(endpoint)
-                else:
-                    raise
-
-        raise RuntimeError(
-            f"Request to {endpoint} failed after 4 fallback attempts. "
-            "Model may not be compatible with this pipeline."
+        kwargs = self._build_kwargs(
+            resolved, profile, system_prompt, user_prompt,
+            response_schema, temperature, max_tokens,
         )
+        if extra_params:
+            kwargs.update(extra_params)
+
+        response = await self._api_call(client, kwargs)
+        content = response.choices[0].message.content or ""
+
+        # Some reasoning models (o-series, step) route output through
+        # reasoning_content when constrained decoding is active.
+        if not content and response.choices:
+            msg = response.choices[0].message
+            content = getattr(msg, "reasoning_content", None) or ""
+
+        logger.debug("LLM response from %s: %d chars", role, len(content))
+        return content
 
     def parse_structured(self, raw: str, response_model: Type[BaseModel], role: str = "?") -> BaseModel:
         """Parse raw LLM text into a Pydantic model.
@@ -384,7 +337,7 @@ class LLMClient:
         role: str,
         system_prompt: str,
         user_prompt: str,
-        response_schema: Type[BaseModel] | None = None,
+        response_schema: type[BaseModel] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 4096,
         extra_params: dict[str, Any] | None = None,
@@ -394,77 +347,34 @@ class LLMClient:
         Yields raw string chunks as they arrive from the model. Callers should
         accumulate them and call ``parse_structured()`` on the joined text.
 
-        Graceful fallback: if the endpoint does not support streaming (or the
-        streaming call fails for any reason), this falls back to a single
-        blocking ``generate()`` call and yields the full response as one chunk.
-        Models without streaming support therefore behave identically from the
-        caller's perspective — they just don't produce intermediate tokens.
+        Graceful fallback: if the streaming call fails for any reason, falls
+        back to a single blocking ``generate()`` call and yields the full
+        response as one chunk.  Models without streaming support behave
+        identically from the caller's perspective.
         """
         resolved = self._registry.get(role)
+        profile = get_profile(resolved.family)
         client = self._get_client(resolved)
-        endpoint = resolved.endpoint
 
-        kwargs_base: dict[str, Any] = {
-            "model": resolved.model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if extra_params:
-            kwargs_base.update(extra_params)
-
-        # Apply per-endpoint sanitization (strips enable_thinking / thinking_budget
-        # for endpoints that have previously rejected those params).
-        eff_extra_body = (
-            self._sanitized_extra_body(endpoint, resolved.extra_body)
-            if resolved.extra_body else {}
+        kwargs = self._build_kwargs(
+            resolved, profile, system_prompt, user_prompt,
+            response_schema, temperature, max_tokens, stream=True,
         )
-        if eff_extra_body:
-            kwargs_base["extra_body"] = eff_extra_body
+        if extra_params:
+            kwargs.update(extra_params)
 
         use_constrained = (
-            response_schema is not None
-            and endpoint not in self._no_constrained_decoding
+            response_schema is not None and profile.supports_json_schema
         )
-        eff_system = (
-            system_prompt + _json_prompt_suffix(response_schema)
-            if response_schema and not use_constrained
-            else system_prompt
-        )
-        kwargs: dict[str, Any] = {
-            **kwargs_base,
-            "messages": self._messages(endpoint, eff_system, user_prompt),
-        }
-        if use_constrained:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": response_schema.__name__,
-                    "schema": response_schema.model_json_schema(),
-                },
-            }
 
-        # Attempt streaming — detect capability errors inline, fall back on anything else.
+        # Attempt streaming — fall back on any error (profile mis-config, network, etc.)
         stream_obj = None
         try:
             stream_obj = await client.chat.completions.create(**kwargs)
-        except BadRequestError as exc:
-            err_lower = str(exc).lower()
-            if any(kw in err_lower for kw in _NO_THINKING_KWARGS_ERRORS) and resolved.extra_body:
-                logger.info(
-                    "Streaming: endpoint %s rejected thinking-control extra_body — "
-                    "flagging; fallback will retry without those params.",
-                    endpoint,
-                )
-                self._no_thinking_kwargs.add(endpoint)
-            else:
-                logger.warning(
-                    "Streaming request failed for %s (%s: %s) — falling back.",
-                    role, type(exc).__name__, exc,
-                )
         except Exception as exc:
             logger.warning(
-                "Streaming request failed for %s (%s: %s) — falling back.",
+                "Streaming request failed for %s (%s: %s) — falling back to "
+                "blocking generate(). Check family profile if this is a 400.",
                 role, type(exc).__name__, exc,
             )
 
@@ -480,18 +390,17 @@ class LLMClient:
                     # Primary content field (all standard models)
                     token = delta.content or ""
 
-                    # Reasoning models (e.g. step-3.5-flash, QwQ) may route their
-                    # output through reasoning_content when response_format=json_schema
-                    # is active — delta.content stays empty the entire stream.
-                    # Fall back to reasoning_content so we at least have raw text to
-                    # attempt parsing.  We do NOT yield reasoning tokens for display
-                    # (they aren't part of the structured output) but we do accumulate
-                    # them so the empty-stream fallback below is not triggered.
+                    # Reasoning models may route output through reasoning_content
+                    # when response_format=json_schema is active — delta.content
+                    # stays empty for the whole stream.  Accumulate reasoning tokens
+                    # so the empty-stream fallback is not triggered, but only yield
+                    # them if no regular content ever arrives (they are raw reasoning,
+                    # not structured output).
                     if not token:
                         token = getattr(delta, "reasoning_content", None) or ""
 
                     if token:
-                        detector.feed(token)     # raises ThinkLoopError if loop found
+                        detector.feed(token)  # raises ThinkLoopError if loop found
                         yielded_any = True
                         yield token
             except ThinkLoopError:
@@ -500,7 +409,7 @@ class LLMClient:
                     "for retry.",
                     role,
                 )
-                raise   # propagate up through run_streaming → orchestrator retry
+                raise  # propagate up through run_streaming → orchestrator retry
             except Exception as exc:
                 logger.warning(
                     "Streaming interrupted for %s (%s: %s) — falling back.",
@@ -508,21 +417,18 @@ class LLMClient:
                 )
                 # Fall through to non-streaming fallback below.
             else:
-                # Stream completed without exception.
                 if not yielded_any and use_constrained:
-                    # Model returned HTTP 200 but emitted zero content tokens while
-                    # constrained decoding (response_format=json_schema) was active.
-                    # This is a silent capability gap — mark the endpoint and fall
-                    # through to the prompt-only non-streaming fallback.
+                    # Model returned HTTP 200 but emitted zero content tokens
+                    # while constrained decoding was active — silent capability gap.
+                    # Fall through to prompt-only non-streaming fallback.
                     logger.info(
-                        "Endpoint %s returned empty stream with constrained decoding — "
-                        "flagging as no-constrained-decoding; falling back to "
-                        "prompt-only non-streaming call.",
-                        endpoint,
+                        "Empty stream with constrained decoding for %s — "
+                        "falling back to prompt-only non-streaming call. "
+                        "Consider setting supports_json_schema=False in the profile.",
+                        role,
                     )
-                    self._no_constrained_decoding.add(endpoint)
                 else:
-                    return  # streaming complete with content
+                    return  # streaming completed successfully
 
         # Non-streaming fallback: yields the full response as one chunk.
         logger.info("Using non-streaming fallback for %s", role)

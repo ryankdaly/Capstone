@@ -1,32 +1,59 @@
-# HPEMA Pipeline Configuration
-# Boeing (or any org) customizes THIS file — no code changes needed.
+# HPEMA Configuration Template
+# Copied to ~/.hpema/hpema_config.yaml on first run.
+# Edit that file — do NOT edit this one inside the package.
+#
+# MODEL FAMILIES (set `family` to match your endpoint):
+#   mistral       mistralai/* models via NVIDIA or Mistral API
+#   qwen3         Qwen/Qwen3-* models (thinking-capable)
+#   gemma3        google/gemma-3-* (no system role)
+#   gemma4        google/gemma-4-* (no system role)
+#   deepseek-r1   DeepSeek-R1 reasoning models
+#   deepseek-v3   DeepSeek-V3 non-reasoning
+#   kimi-k2       moonshotai/Kimi-K2
+#   anthropic     claude-* models via Anthropic API
+#   openai        gpt-4.1-* / o-series via OpenAI API
+#   stepfun       stepfun-ai/step-* models
+#   minimax       minimaxai/* models
+#   generic       any other OpenAI-compatible endpoint
 
 models:
   actor:
-    endpoint: "https://llm-api.arc.vt.edu/api/v1"
-    model: "gpt-oss-120b"
-    api_key_env: "HPEMA_API_KEY"
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "mistralai/mistral-large-3-675b-instruct-2512"
+    api_key_env: "NVIDIA_API_KEY"
+    family: "mistral"
+
   checker:
-    endpoint: "https://llm-api.arc.vt.edu/api/v1"
-    model: "gpt-oss-120b"
-    api_key_env: "HPEMA_API_KEY"
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "mistralai/mistral-large-3-675b-instruct-2512"
+    api_key_env: "NVIDIA_API_KEY"
+    family: "mistral"
+
   policy:
-    endpoint: "https://llm-api.arc.vt.edu/api/v1"
-    model: "gpt-oss-120b"
-    api_key_env: "HPEMA_API_KEY"
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "mistralai/mistral-large-3-675b-instruct-2512"
+    api_key_env: "NVIDIA_API_KEY"
+    family: "mistral"
+
+  dafny_architect:
+    endpoint: "https://integrate.api.nvidia.com/v1"
+    model: "mistralai/mistral-large-3-675b-instruct-2512"
+    api_key_env: "NVIDIA_API_KEY"
+    family: "mistral"
 
 policies:
   standards_dir: "data/standards"
+  chromadb_dir: "data/chromadb"
   default_standard: "DO_178C"
   embedding_model: "all-MiniLM-L6-v2"
 
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "/opt/homebrew/bin/dafny"
-  solver_path: "/opt/homebrew/bin/z3"
+  binary_path: "dafny"   # path to dafny binary; "dafny" assumes it is on PATH
 
 pipeline:
   max_iterations: 3
-  require_human_approval: true
+  require_human_approval: false
   audit_log_dir: "logs/audit"
+  stage: "policy"        # pipeline depth: "actor" | "checker" | "dafny" | "policy"

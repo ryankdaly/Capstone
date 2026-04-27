@@ -35,6 +35,12 @@ R12a. COMPARISON TYPE RULE — both sides of >, <, >=, <=, ==, != MUST be the sa
       This applies to requires, ensures, if-conditions, loop invariants — everywhere.
 R13. Integer division truncates — use `real` arithmetic when fractional results are needed.
 R14. Recursive methods need a `decreases` clause on a quantity that strictly decreases.
+R15. When the Actor's code is a **class**, do NOT attempt to spec the full class lifecycle.
+     Instead: (a) identify the core computation method (e.g. get(), compute(), vote()),
+     (b) model instance state as additional method parameters (constructor args become
+     `requires` clauses; internal buffers become seq<T> parameters),
+     (c) write a standalone method that specs that computation's input/output contract.
+     Do NOT produce a trivial placeholder — derive real postconditions from the logic.
 
 VERIFIED EXAMPLES — these all pass `dafny verify`. Copy this syntax exactly:
 
@@ -105,18 +111,6 @@ method Sigmoid(x: real) returns (result: real)
   }
 }
 
-### Softmax (single element score > others) — property-based spec
-// exp() does not exist; spec what softmax guarantees about a single element:
-// its output is in (0,1) and all outputs sum to 1 (enforce via property).
-method SoftmaxMaxIndex(scores: seq<real>, n: int) returns (result: int)
-  requires |scores| > 0
-  requires 0 <= n < |scores|
-  requires forall k :: 0 <= k < |scores| ==> scores[n] >= scores[k]
-  ensures 0 <= result < |scores|
-{
-  result := n;
-}
-
 ### Factorial — recursive with decreases clause
 method Factorial(n: int) returns (result: int)
   requires n >= 0
@@ -128,22 +122,6 @@ method Factorial(n: int) returns (result: int)
   } else {
     var sub := Factorial(n - 1);
     result := n * sub;
-  }
-}
-
-### ArraySum — loop with invariant and decreases
-method ArraySum(a: array<int>) returns (sum: int)
-  requires a != null
-  ensures sum >= 0 || true   // postcondition: sum is well-defined
-{
-  sum := 0;
-  var i := 0;
-  while i < a.Length
-    invariant 0 <= i <= a.Length
-    decreases a.Length - i
-  {
-    sum := sum + a[i];
-    i := i + 1;
   }
 }
 
@@ -173,6 +151,94 @@ method NormalizeToUnit(x: int, lo: int, hi: int) returns (result: real)
   ensures 0.0 <= result <= 1.0
 {
   result := (x - lo) as real / (hi - lo) as real;
+}
+
+### IntMovingAverage.get() — class decomposed to standalone method (R15 pattern)
+// Actor writes: class IntMovingAverage with __init__(window_size) and get() -> int.
+// R15: model class state as parameters. Constructor arg → requires. Buffer → seq<int>.
+method ComputeAverage(samples: seq<int>, window_size: int) returns (result: int)
+  requires 1 <= window_size <= 256
+  requires |samples| == window_size
+  requires forall k :: 0 <= k < |samples| ==> -32768 <= samples[k] <= 32767
+  ensures -32768 <= result <= 32767
+{
+  var sum := 0;
+  var i := 0;
+  while i < |samples|
+    invariant 0 <= i <= |samples|
+    invariant -32768 * i <= sum <= 32767 * i
+    decreases |samples| - i
+  {
+    sum := sum + samples[i];
+    i := i + 1;
+  }
+  result := sum / window_size;
+}
+
+R19. Dafny has NO ternary operator `? :`. Use expression-form if-then-else instead.
+     WRONG:  (k == 0 ? 0 : prev[k])   → "closeparen expected"
+     RIGHT:  (if k == 0 then 0 else prev[k])
+     This applies in ensures, requires, and loop invariants — anywhere an expression appears.
+
+R20. Ensures/requires clauses must be PURE BOOLEAN EXPRESSIONS — no statements allowed.
+     Never put `var`, assignments, or `while` loops inside an ensures/requires.
+     WRONG:  ensures ok ==> ( var x := 0; while ... { x := x ^ a[i]; } x == 0 )
+     RIGHT:  If you need a loop-computed value in ensures, either:
+             (a) spec a property (bounds/range) like the Sigmoid example, OR
+             (b) define a pure `function` outside the method and reference it.
+     Attempting to re-compute a loop inside ensures → "invalid UnaryExpression".
+
+R16. Always parenthesize the right-hand side of ==> when it spans multiple lines or
+     contains &&/||. Dafny warns "unusual indentation in right-hand operand of ==>" and
+     may misparse without the parens.
+     WRONG:
+       ensures ok ==>
+         condition1 &&
+         condition2
+     RIGHT:
+       ensures ok ==> (
+         condition1 &&
+         condition2
+       )
+
+R17. Ensures predicates must mirror the body's exact computation. Never substitute a
+     simpler predicate that is only equivalent under special assumptions.
+     If the body uses `a - b <= tol && b - a <= tol`, the ensures MUST use that exact
+     expression — NOT `a == b` (only equivalent when tol == 0). The verifier checks the
+     ensures against every execution path; an overly strong postcondition causes
+     "postcondition could not be proved".
+
+R18. When you get "postcondition could not be proved on this return path": insert an
+     `assert <predicate>;` statement immediately before the return/assignment on that
+     branch. This gives the SMT solver an explicit hint on the path it cannot close.
+     Example: if `ensures result >= 0` fails on the else-branch, add:
+       assert result >= 0;   // SMT hint
+       result := computed_value;
+
+### TMRVote — majority voter, parenthesized ==> and mirrored tolerance predicates
+// R16: wrap multi-line ==> RHS in parens.  R17: ensures mirrors body's tolerance check.
+method TMRVote(a: int, b: int, c: int, tolerance: int) returns (result: int, ok: bool)
+  requires tolerance >= 0
+  ensures ok ==> (
+    ((a - b <= tolerance && b - a <= tolerance) && result == a) ||
+    ((a - c <= tolerance && c - a <= tolerance) && result == a) ||
+    ((b - c <= tolerance && c - b <= tolerance) && result == b)
+  )
+  ensures !ok ==> !(
+    (a - b <= tolerance && b - a <= tolerance) ||
+    (a - c <= tolerance && c - a <= tolerance) ||
+    (b - c <= tolerance && c - b <= tolerance)
+  )
+{
+  if a - b <= tolerance && b - a <= tolerance {
+    result := a; ok := true;
+  } else if a - c <= tolerance && c - a <= tolerance {
+    result := a; ok := true;
+  } else if b - c <= tolerance && c - b <= tolerance {
+    result := b; ok := true;
+  } else {
+    result := 0; ok := false;
+  }
 }
 
 SPEED RULE — NO DELIBERATION:
