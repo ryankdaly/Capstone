@@ -31,11 +31,11 @@ from backend.api.schemas.pipeline import (
     stage_enabled,
 )
 from backend.services.agents.actor import ActorAgent
-from backend.services.agents.base import _AGENT_LOG, _agent_log_lock
+from backend.services.agents.base import write_run_header
 from backend.services.agents.checker import CheckerAgent
 from backend.services.agents.dafny_architect import DafnyArchitectAgent
 from backend.services.agents.policy import PolicyAgent
-from backend.config import PROJECT_ROOT, settings
+from backend.config import resolve_data_path, settings
 from backend.services.audit.logger import AuditLogger
 from backend.services.feedback import compose_feedback
 from backend.services.llm.client import LLMClient
@@ -73,8 +73,8 @@ class PipelineOrchestrator:
         self._llm = llm_client or LLMClient()
         self._dafny = dafny_runner or DafnyRunner()
         self._retriever = retriever or StandardsRetriever(
-            persist_dir=str(PROJECT_ROOT / settings.policies.chromadb_dir),
-            auto_ingest_path=str(PROJECT_ROOT / settings.policies.standards_dir),
+            persist_dir=str(resolve_data_path(settings.policies.chromadb_dir, "chromadb")),
+            auto_ingest_path=str(resolve_data_path(settings.policies.standards_dir, "standards")),
         )
         self._audit = audit_logger or AuditLogger()
         self._test_runner = test_runner or TestRunner()
@@ -119,9 +119,7 @@ class PipelineOrchestrator:
                 f"# prompt  : {request.requirement_text[:200]}\n"
                 "################################################################################\n"
             )
-            with _agent_log_lock:
-                with _AGENT_LOG.open("a", encoding="utf-8") as fh:
-                    fh.write(header)
+            write_run_header(header)
         except Exception:
             pass
 
@@ -338,6 +336,17 @@ class PipelineOrchestrator:
                         code_candidate.dafny_spec = ""
                         has_dafny_spec = False
 
+                    # When Dafny produced a spec but verification failed, pass the raw
+                    # spec + solver output to the checker as a conceptual hint — not as
+                    # verified contracts. The checker uses it to write sharper test cases
+                    # without treating the unverified postconditions as ground truth.
+                    dafny_unverified_spec: str | None = None
+                    dafny_solver_output_hint: str | None = None
+                    if has_dafny_spec and dafny_contracts is None:
+                        dafny_unverified_spec = code_candidate.dafny_spec
+                        if verification_result is not None:
+                            dafny_solver_output_hint = verification_result.solver_output
+
                     # ── PHASE 2: CHECKER (generate → tests) ──────────────────────────
                     # Runs after Dafny phase is fully resolved.
                     # Outer loop: up to 2 extra retries when pytest cannot collect
@@ -365,6 +374,8 @@ class PipelineOrchestrator:
                                     standard=request.safety_standard.value,
                                     retry_hint=_checker_retry_hint,
                                     dafny_contracts=dafny_contracts,
+                                    dafny_unverified_spec=dafny_unverified_spec,
+                                    dafny_solver_output=dafny_solver_output_hint,
                                     test_fix_hint=_test_fix_hint,
                                 ):
                                     if isinstance(_item, str):

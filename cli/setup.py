@@ -2,26 +2,27 @@
 
 Called on first run (when no keys are detected) and via the /setup command.
 
+All LLM providers in HPEMA use the OpenAI-compatible REST API — the same
+Python client (openai.AsyncOpenAI) talks to every endpoint, with only the
+base_url and api_key differing per provider. This wizard just pre-fills those
+two values so the user doesn't have to write YAML by hand.
+
 Flow
 ----
 1. Welcome screen
-2. Ask: what provider are you using?
-   - OpenAI, Groq, NVIDIA / NIM, ARC vLLM, or Custom
-3. If API key is needed, prompt key for checker model, then tester/actor model, then policy model
-   (each can be individualised or shared from a single key)
-4. Choose specific model names (optional; defaults provided)
-5. Write config to .env and generate / update hpema_config.local.yaml
-6. Offer to restart immediately so the changes take effect
-
-All prompts use prompt_toolkit when available for a rich interactive
-experience (arrow-key selection, masked input), falling back to plain
-``input()`` in non-tty environments.
+2. Pick provider (all are OpenAI-compatible endpoints)
+3. Enter / confirm API key
+4. Optionally customise model names per agent
+5. Auto-detect Dafny; warn if missing
+6. Write ~/.hpema/hpema_config.yaml  +  ~/.hpema/.env
+7. Offer restart
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,71 +48,177 @@ try:
 except ImportError:
     _PT = False
 
+# ---------------------------------------------------------------------------
+# Path resolution — works both from source checkout and pip-installed package
+# ---------------------------------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_FILE     = PROJECT_ROOT / ".env"
-LOCAL_CONFIG = PROJECT_ROOT / "hpema_config.local.yaml"
+
+# Import canonical helpers from backend — single source of truth for paths.
+# Lazy import pattern used here because setup.py is loaded early and we don't
+# want to trigger the full backend import chain at module level.
+def _hpema_home() -> Path:
+    from backend.config import hpema_home
+    return hpema_home()
+
+
+def _env_file() -> Path:
+    """Always ~/.hpema/.env — the canonical writable location for API keys."""
+    return _hpema_home() / ".env"
+
+
+def _next_config_path(name: str = "") -> Path:
+    """Return a non-conflicting config path inside ~/.hpema/.
+
+    If name is blank: tries hpema_config.yaml, then hpema_config_2.yaml, etc.
+    If name is given: hpema_config_{name}.yaml, auto-increments suffix on collision.
+    Never overwrites an existing file.
+    """
+    home = _hpema_home()
+    if name:
+        safe = re.sub(r"[^\w\-]", "_", name.strip())
+        candidate = home / f"hpema_config_{safe}.yaml"
+        if not candidate.exists():
+            return candidate
+        n = 2
+        while (home / f"hpema_config_{safe}_{n}.yaml").exists():
+            n += 1
+        return home / f"hpema_config_{safe}_{n}.yaml"
+    else:
+        candidate = home / "hpema_config.yaml"
+        if not candidate.exists():
+            return candidate
+        n = 2
+        while (home / f"hpema_config_{n}.yaml").exists():
+            n += 1
+        return home / f"hpema_config_{n}.yaml"
 
 # ---------------------------------------------------------------------------
-# Provider presets
+# Dafny / Z3 auto-detection
+# ---------------------------------------------------------------------------
+
+def _detect_dafny() -> str | None:
+    """Return the Dafny binary path, or None if not found."""
+    # 1. System PATH (covers homebrew, apt, dotnet global tool on PATH)
+    found = shutil.which("dafny")
+    if found:
+        return found
+    # 2. ~/.hpema/dafny_path written by `hpema setup --install-dafny`
+    marker = _hpema_home() / "dafny_path"
+    if marker.exists():
+        p = marker.read_text().strip()
+        if Path(p).exists():
+            return p
+    # 3. Common fixed locations (platform-aware)
+    candidates: list[Path] = [
+        Path("/opt/homebrew/bin/dafny"),                        # macOS Homebrew (Apple Silicon)
+        Path("/usr/local/bin/dafny"),                            # macOS Homebrew (Intel)
+        Path.home() / ".dotnet" / "tools" / "dafny",            # dotnet global (Unix)
+        Path.home() / ".dotnet" / "tools" / "dafny.exe",        # dotnet global (Windows)
+        Path("/usr/bin/dafny"),                                  # Linux distro package
+        PROJECT_ROOT / "local" / "installs" / "dafny" / "dafny",     # in-repo binary (Unix)
+        PROJECT_ROOT / "local" / "installs" / "dafny" / "dafny.exe", # in-repo binary (Windows)
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _detect_z3() -> str | None:
+    """Return the Z3 binary path, or None if not found."""
+    found = shutil.which("z3")
+    if found:
+        return found
+    candidates: list[Path] = [
+        Path("/opt/homebrew/bin/z3"),
+        Path("/usr/local/bin/z3"),
+        Path("/usr/bin/z3"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider presets — ALL use the OpenAI-compatible REST API
 # ---------------------------------------------------------------------------
 
 PROVIDERS: list[dict[str, Any]] = [
     {
-        "id":          "openai",
-        "label":       "OpenAI  (gpt-4o, gpt-4o-mini, …)",
-        "endpoint":    "https://api.openai.com/v1",
-        "key_env":     "OPENAI_API_KEY",
-        "key_prefix":  "sk-",
-        "default_model": "gpt-4o-mini",
-        "needs_key":   True,
+        "id":             "nvidia",
+        "label":          "NVIDIA NIM  (mistral-large, llama-3.1-70b, …)  [recommended]",
+        "endpoint":       "https://integrate.api.nvidia.com/v1",
+        "key_env":        "NVIDIA_API_KEY",
+        "key_prefix":     "nvapi-",
+        "default_model":  "mistralai/mistral-large-3-675b-instruct-2512",
+        "default_family": "mistral",
+        "needs_key":      True,
     },
     {
-        "id":          "groq",
-        "label":       "Groq  (llama-3.3-70b, mixtral-8x7b, …)",
-        "endpoint":    "https://api.groq.com/openai/v1",
-        "key_env":     "GROQ_API_KEY",
-        "key_prefix":  "gsk_",
-        "default_model": "llama-3.3-70b-versatile",
-        "needs_key":   True,
+        "id":             "openai",
+        "label":          "OpenAI  (gpt-4.1-mini, gpt-4.1, …)",
+        "endpoint":       "https://api.openai.com/v1",
+        "key_env":        "OPENAI_API_KEY",
+        "key_prefix":     "sk-",
+        "default_model":  "gpt-4.1-mini",
+        "default_family": "openai-gpt4o",
+        "needs_key":      True,
     },
     {
-        "id":          "nvidia",
-        "label":       "NVIDIA NIM / NGC  (llama-3.1-70b-instruct, …)",
-        "endpoint":    "https://integrate.api.nvidia.com/v1",
-        "key_env":     "NVIDIA_API_KEY",
-        "key_prefix":  "nvapi-",
-        "default_model": "meta/llama-3.1-70b-instruct",
-        "needs_key":   True,
+        "id":             "groq",
+        "label":          "Groq  (llama-3.3-70b, mixtral-8x7b, …)",
+        "endpoint":       "https://api.groq.com/openai/v1",
+        "key_env":        "GROQ_API_KEY",
+        "key_prefix":     "gsk_",
+        "default_model":  "llama-3.3-70b-versatile",
+        "default_family": "generic",
+        "needs_key":      True,
     },
     {
-        "id":          "arc",
-        "label":       "ARC vLLM  (on-cluster, no key needed)",
-        "endpoint":    "https://llm-api.arc.vt.edu/api/v1",
-        "key_env":     "HPEMA_API_KEY",
-        "key_prefix":  "",
-        "default_model": "gpt-oss-120b",
-        "needs_key":   False,
+        "id":             "arc",
+        "label":          "ARC vLLM  (on-cluster, no key needed)",
+        "endpoint":       "https://llm-api.arc.vt.edu/api/v1",
+        "key_env":        "HPEMA_API_KEY",
+        "key_prefix":     "",
+        "default_model":  "gpt-oss-120b",
+        "default_family": "generic",
+        "needs_key":      False,
     },
     {
-        "id":          "local",
-        "label":       "Local vLLM  (http://localhost:8000/v1)",
-        "endpoint":    "http://localhost:8000/v1",
-        "key_env":     "HPEMA_API_KEY",
-        "key_prefix":  "",
-        "default_model": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "needs_key":   False,
+        "id":             "local",
+        "label":          "Local vLLM  (http://localhost:8000/v1, no key needed)",
+        "endpoint":       "http://localhost:8000/v1",
+        "key_env":        "HPEMA_API_KEY",
+        "key_prefix":     "",
+        "default_model":  "meta-llama/Meta-Llama-3-8B-Instruct",
+        "default_family": "generic",
+        "needs_key":      False,
     },
     {
-        "id":          "custom",
-        "label":       "Custom / other OpenAI-compatible endpoint",
-        "endpoint":    "",
-        "key_env":     "HPEMA_API_KEY",
-        "key_prefix":  "",
-        "default_model": "",
-        "needs_key":   True,
+        "id":             "custom",
+        "label":          "Custom / other OpenAI-compatible endpoint",
+        "endpoint":       "",
+        "key_env":        "HPEMA_API_KEY",
+        "key_prefix":     "",
+        "default_model":  "",
+        "default_family": "generic",
+        "needs_key":      True,
     },
 ]
 
+ALL_FAMILIES: list[str] = [
+    "generic", "mistral", "mistral-reasoning",
+    "qwen3", "gemma3", "gemma4",
+    "kimi-k2", "anthropic",
+    "openai-gpt4o", "openai-reasoning",
+    "stepfun", "minimax",
+    "deepseek-r1", "deepseek-v3",
+]
+
+# Agents shown in the model-name step. dafny_architect is auto-set to mirror
+# actor (same provider + model) — power users can edit the YAML afterwards.
 AGENT_LABELS = [
     ("actor",   "Actor  (code generator)"),
     ("checker", "Checker  (safety reviewer)"),
@@ -128,14 +235,11 @@ def _hr(title: str = "") -> None:
 
 def _print_step(n: int, total: int, title: str) -> None:
     console.print()
-    console.print(
-        f"  [bold bright_blue]Step {n}/{total}[/]  [bold]{title}[/]"
-    )
+    console.print(f"  [bold bright_blue]Step {n}/{total}[/]  [bold]{title}[/]")
     console.print()
 
 
 def _masked(s: str) -> str:
-    """Show first 4 chars + *** for display."""
     if not s:
         return "[dim](none)[/]"
     visible = s[:4]
@@ -143,7 +247,6 @@ def _masked(s: str) -> str:
 
 
 def _plain_input(prompt: str, secret: bool = False) -> str:
-    """Fallback plain input. Use getpass for secrets."""
     if secret:
         import getpass
         return getpass.getpass(f"  {prompt}: ").strip()
@@ -158,11 +261,7 @@ def _plain_input(prompt: str, secret: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _pick_option(options: list[str], title: str = "Select an option") -> int:
-    """Arrow-key selection menu. Returns 0-based index of chosen item.
-
-    Falls back to numbered prompt when prompt_toolkit is unavailable or
-    when stdin is not a tty.
-    """
+    """Arrow-key selection menu. Returns 0-based index. Falls back to numbered prompt."""
     if not _PT or not sys.stdin.isatty():
         console.print(f"\n  [bold]{title}[/]")
         for i, opt in enumerate(options, 1):
@@ -177,7 +276,6 @@ def _pick_option(options: list[str], title: str = "Select an option") -> int:
                 pass
             console.print("  [red]Invalid — enter a number from the list.[/]")
 
-    # ---------- prompt_toolkit path ----------
     choice = {"idx": 0}
     kb = KeyBindings()
 
@@ -205,39 +303,20 @@ def _pick_option(options: list[str], title: str = "Select an option") -> int:
         "prompt":         "bold #89b4fa",
     })
 
-    def _toolbar():
-        return HTML(
-            '<style bg="#313244"> '
-            '<style fg="#6c7086">↑↓ navigate · Enter select · Ctrl+C cancel</style>'
-            ' </style>'
-        )
-
-    def _prompt_text():
-        lines = [f"\n  [bold bright_blue]{title}[/]\n"]
-        for i, opt in enumerate(options):
-            if i == choice["idx"]:
-                lines.append(f"  [bold #a6e3a1]▶  {opt}[/]")
-            else:
-                lines.append(f"  [dim]   {opt}[/]")
-        return "\n".join(lines) + "\n\n"
-
-    # Use a session in repaint loop
-    from prompt_toolkit import Application
-    from prompt_toolkit.formatted_text import ANSI
-    from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-
     def _get_text():
-        lines = []
-        lines.append(("bold #89b4fa", f"\n  {title}\n\n"))
+        lines = [("bold #89b4fa", f"\n  {title}\n\n")]
         for i, opt in enumerate(options):
             if i == choice["idx"]:
                 lines.append(("bold #a6e3a1", f"  ▶  {opt}\n"))
             else:
-                lines.append(("class:dim #6c7086", f"     {opt}\n"))
+                lines.append(("#6c7086", f"     {opt}\n"))
         lines.append(("", "\n"))
         return lines
+
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
 
     window = Window(content=FormattedTextControl(_get_text, focusable=True))
     layout = Layout(window)
@@ -255,22 +334,17 @@ def _pick_option(options: list[str], title: str = "Select an option") -> int:
 
 
 def _prompt_secret(prompt: str, env_var: str = "") -> str:
-    """Prompt for a secret/API key with masking."""
     if not _PT or not sys.stdin.isatty():
         return _plain_input(prompt, secret=True)
 
     from prompt_toolkit import PromptSession as _PS
-    from prompt_toolkit.formatted_text import HTML as _HTML
 
-    _style = Style.from_dict({
-        "prompt": "bold #89b4fa",
-    })
-
+    _style = Style.from_dict({"prompt": "bold #89b4fa"})
     hint = f" ({env_var})" if env_var else ""
     session = _PS(style=_style)
     try:
         val = session.prompt(
-            _HTML(f'<b><style fg="#89b4fa">  {prompt}{hint}: </style></b>'),
+            HTML(f'<b><style fg="#89b4fa">  {prompt}{hint}: </style></b>'),
             is_password=True,
         )
         return val.strip() if val else ""
@@ -279,23 +353,20 @@ def _prompt_secret(prompt: str, env_var: str = "") -> str:
 
 
 def _prompt_text_input(prompt: str, default: str = "") -> str:
-    """Prompt for a text value with an optional default."""
     if not _PT or not sys.stdin.isatty():
         raw = _plain_input(f"{prompt} [{default}]" if default else prompt)
         return raw if raw else default
 
     from prompt_toolkit import PromptSession as _PS
-    from prompt_toolkit.formatted_text import HTML as _HTML
 
     _style = Style.from_dict({"prompt": "bold #89b4fa"})
     session = _PS(style=_style)
-    default_hint = f" [dim](default: {default})[/dim]" if default else ""
     try:
         val = session.prompt(
-            _HTML(
+            HTML(
                 f'<b><style fg="#89b4fa">  {prompt}</style></b>'
                 + (f'<style fg="#6c7086"> (default: {default})</style>' if default else "")
-                + ': '
+                + ": "
             ),
             default=default,
         )
@@ -305,7 +376,6 @@ def _prompt_text_input(prompt: str, default: str = "") -> str:
 
 
 def _confirm(prompt: str, default: bool = True) -> bool:
-    """Yes/No confirmation with arrow-key selection."""
     options = ["Yes", "No"]
     choice = {"val": 0 if default else 1}
 
@@ -348,12 +418,9 @@ def _confirm(prompt: str, default: bool = True) -> bool:
             f' </style>'
         )
 
-    session = PromptSession(
-        key_bindings=kb,
-        style=_style,
-    )
+    session = PromptSession(key_bindings=kb, style=_style)
     try:
-        result = session.prompt(
+        session.prompt(
             HTML(f'<b><style fg="#89b4fa">  {prompt}</style></b> '),
             bottom_toolbar=_toolbar,
             default="",
@@ -364,11 +431,10 @@ def _confirm(prompt: str, default: bool = True) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Welcome screen (models not configured)
+# Welcome screen
 # ---------------------------------------------------------------------------
 
 def show_welcome_screen() -> None:
-    """Rich welcome panel shown when no API keys are detected on startup."""
     console.print()
     console.print(Panel(
         Text.from_markup(
@@ -379,8 +445,7 @@ def show_welcome_screen() -> None:
             "  HPEMA needs access to at least one LLM to function.\n\n"
             "  [bold]To get started:[/]\n"
             "    [cyan]1.[/] Run [bold cyan]/setup[/] to configure your API keys interactively\n"
-            "    [cyan]2.[/] Or set the [bold]OPENAI_API_KEY[/] / [bold]HPEMA_API_KEY[/] environment\n"
-            "       variables and restart\n\n"
+            "    [cyan]2.[/] Or set [bold]NVIDIA_API_KEY[/] / [bold]OPENAI_API_KEY[/] and restart\n\n"
             "  [dim]Type [bold]/setup[/] now, or [bold]/help[/] for all commands.[/]"
             "\n"
         ),
@@ -396,58 +461,42 @@ def show_welcome_screen() -> None:
 # ---------------------------------------------------------------------------
 
 def _detect_active_keys() -> dict[str, str]:
-    """Return mapping of env-var-name → masked value for keys that are set."""
-    candidates = [
-        "OPENAI_API_KEY",
-        "GROQ_API_KEY",
-        "NVIDIA_API_KEY",
-        "HPEMA_API_KEY",
-    ]
-    found: dict[str, str] = {}
-    for var in candidates:
-        val = os.environ.get(var, "")
-        if val and val not in ("unused", ""):
-            found[var] = val
-    return found
+    candidates = ["NVIDIA_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "HPEMA_API_KEY"]
+    return {
+        var: val
+        for var in candidates
+        if (val := os.environ.get(var, "")) and val not in ("unused", "")
+    }
 
 
 def models_are_configured() -> bool:
-    """Return True when at least one real API key or a local endpoint is active."""
-    keys = _detect_active_keys()
-    if keys:
+    """True when at least one real API key or a local/no-key endpoint is active."""
+    if _detect_active_keys():
         return True
-    # Check if config points to a local endpoint (no key needed)
     try:
         from backend.config import load_config
-        cfg = load_config()
-        ep = cfg.models.actor.endpoint
-        if any(h in ep for h in ("localhost", "127.0.0.1", "0.0.0.0")):
-            return True
-        # ARC endpoint doesn't need external keys either
-        if "arc.vt.edu" in ep:
-            return True
+        ep = load_config().models.actor.endpoint
+        return any(h in ep for h in ("localhost", "127.0.0.1", "0.0.0.0", "arc.vt.edu"))
     except Exception:
-        pass
-    return False
+        return False
 
 
 # ---------------------------------------------------------------------------
-# .env writer
+# File writers
 # ---------------------------------------------------------------------------
 
 def _write_env(updates: dict[str, str]) -> None:
-    """Merge *updates* into PROJECT_ROOT/.env, preserving existing lines."""
+    """Merge updates into ~/.hpema/.env, preserving existing lines."""
+    env_path = _env_file()
     existing: dict[str, str] = {}
     lines: list[str] = []
 
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("export "):
-                stripped = stripped[7:]
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            stripped = line.strip().removeprefix("export ")
             m = re.match(r'^([A-Z_][A-Z0-9_]*)=(.*)', stripped)
             if m:
-                existing[m.group(1)] = line  # keep original line for preserving comments
+                existing[m.group(1)] = line
             lines.append(line)
     else:
         lines = [
@@ -459,55 +508,78 @@ def _write_env(updates: dict[str, str]) -> None:
     for key, val in updates.items():
         export_line = f"export {key}={val}"
         if key in existing:
-            # Replace in-place
             lines = [
-                export_line if (
-                    l.strip().replace("export ", "").startswith(f"{key}=")
-                ) else l
+                export_line if l.strip().removeprefix("export ").startswith(f"{key}=") else l
                 for l in lines
             ]
         else:
             lines.append(export_line)
 
-    ENV_FILE.write_text("\n".join(lines) + "\n")
+    env_path.write_text("\n".join(lines) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# hpema_config.local.yaml writer
-# ---------------------------------------------------------------------------
+def _build_config_yaml(
+    cfg: dict[str, dict],
+    dafny_path: str | None,
+    z3_path: str | None,
+    family: str = "generic",
+) -> str:
+    """Render the hpema_config YAML from wizard results and detected binaries."""
+    # Use forward slashes in all YAML path values — YAML double-quoted strings
+    # interpret backslashes as escape sequences, which breaks Windows paths.
+    # Python's pathlib accepts forward slashes on Windows too.
+    def _yp(p: str | Path | None) -> str:
+        return Path(p).as_posix() if p else ""
 
-_CONFIG_TEMPLATE = """\
-# HPEMA local configuration — auto-generated by /setup
-# Edit as needed. Use: HPEMA_CONFIG=hpema_config.local.yaml python -m cli.main
+    dafny_bin = _yp(dafny_path) if dafny_path else "dafny"
+    solver_line = (
+        f'  solver_path: "{_yp(z3_path)}"' if z3_path
+        else "  solver_path: null  # set to z3 path if Dafny can't find it"
+    )
+    # Always use absolute ~/.hpema/ paths so the config works from any cwd.
+    home = _hpema_home()
+    chroma_dir = (home / "chromadb").as_posix()
+    standards_dir = (home / "standards").as_posix()
+
+    return f"""\
+# HPEMA configuration — auto-generated by /setup
+# Re-run:  hpema then /setup
+# All endpoints use the OpenAI-compatible REST API.
 
 models:
   actor:
-    endpoint: "{actor_endpoint}"
-    model: "{actor_model}"
-    api_key_env: "{actor_key_env}"
+    endpoint: "{cfg['actor']['endpoint']}"
+    model: "{cfg['actor']['model']}"
+    api_key_env: "{cfg['actor']['key_env']}"
+    family: "{cfg['actor'].get('family', family)}"
   checker:
-    endpoint: "{checker_endpoint}"
-    model: "{checker_model}"
-    api_key_env: "{checker_key_env}"
+    endpoint: "{cfg['checker']['endpoint']}"
+    model: "{cfg['checker']['model']}"
+    api_key_env: "{cfg['checker']['key_env']}"
+    family: "{cfg['checker'].get('family', family)}"
   policy:
-    endpoint: "{policy_endpoint}"
-    model: "{policy_model}"
-    api_key_env: "{policy_key_env}"
+    endpoint: "{cfg['policy']['endpoint']}"
+    model: "{cfg['policy']['model']}"
+    api_key_env: "{cfg['policy']['key_env']}"
+    family: "{cfg['policy'].get('family', family)}"
   dafny_architect:
-    endpoint: "{actor_endpoint}"
-    model: "{actor_model}"
-    api_key_env: "{actor_key_env}"
+    # Mirrors actor by default. Edit model/endpoint here for a dedicated verifier.
+    endpoint: "{cfg['actor']['endpoint']}"
+    model: "{cfg['actor']['model']}"
+    api_key_env: "{cfg['actor']['key_env']}"
+    family: "{cfg['actor'].get('family', family)}"
 
 policies:
-  standards_dir: "data/standards"
+  standards_dir: "{standards_dir}"
+  chromadb_dir: "{chroma_dir}"
   default_standard: "DO_178C"
   embedding_model: "all-MiniLM-L6-v2"
 
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "/opt/homebrew/bin/dafny"
-  solver_path: "/opt/homebrew/bin/z3"
+  binary_path: "{dafny_bin}"
+{solver_line}
 
 pipeline:
   max_iterations: 3
@@ -517,90 +589,290 @@ pipeline:
 """
 
 
-def _write_local_config(cfg: dict[str, dict]) -> None:
-    """Write hpema_config.local.yaml from the wizard results."""
-    content = _CONFIG_TEMPLATE.format(
-        actor_endpoint   = cfg["actor"]["endpoint"],
-        actor_model      = cfg["actor"]["model"],
-        actor_key_env    = cfg["actor"]["key_env"],
-        checker_endpoint = cfg["checker"]["endpoint"],
-        checker_model    = cfg["checker"]["model"],
-        checker_key_env  = cfg["checker"]["key_env"],
-        policy_endpoint  = cfg["policy"]["endpoint"],
-        policy_model     = cfg["policy"]["model"],
-        policy_key_env   = cfg["policy"]["key_env"],
-    )
-    LOCAL_CONFIG.write_text(content)
+def _write_config(
+    cfg_path: Path,
+    cfg: dict[str, dict],
+    dafny_path: str | None,
+    z3_path: str | None,
+    family: str = "generic",
+) -> None:
+    cfg_path.write_text(_build_config_yaml(cfg, dafny_path, z3_path, family))
+
+
+# ---------------------------------------------------------------------------
+# Restart helper
+# ---------------------------------------------------------------------------
+
+def _restart(config_path: str | None = None) -> None:
+    """Re-exec HPEMA using the installed `hpema` binary or python -m cli.main."""
+    console.print("\n  [bold]Restarting HPEMA...[/]\n")
+
+    hpema_bin = shutil.which("hpema")
+    if hpema_bin:
+        os.execv(hpema_bin, [hpema_bin])
+        return  # unreachable
+
+    env_path = _env_file()
+    if sys.platform == "win32":
+        import subprocess
+        env = os.environ.copy()
+        if config_path:
+            env["HPEMA_CONFIG"] = config_path
+        subprocess.run([sys.executable, "-m", "cli.main"], env=env)
+        sys.exit(0)
+    else:
+        if env_path.exists() and config_path:
+            os.execv(
+                "/bin/bash",
+                ["/bin/bash", "-c",
+                 f"source {env_path} && HPEMA_CONFIG={config_path} {sys.executable} -m cli.main"],
+            )
+        elif env_path.exists():
+            os.execv("/bin/bash", ["/bin/bash", "-c",
+                     f"source {env_path} && {sys.executable} -m cli.main"])
+        else:
+            os.execv(sys.executable, [sys.executable, "-m", "cli.main"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers: prefill from existing config, key validation
+# ---------------------------------------------------------------------------
+
+def _provider_idx_from_endpoint(endpoint: str) -> int:
+    """Return index into PROVIDERS matching this endpoint, or last (custom) index."""
+    for i, p in enumerate(PROVIDERS):
+        if p["id"] != "custom" and p.get("endpoint") == endpoint:
+            return i
+    return len(PROVIDERS) - 1  # custom
+
+
+def _prefill_from_yaml(path: Path) -> dict:
+    """Load an existing config YAML and return prefill defaults for the wizard."""
+    import yaml as _yaml
+    prefill: dict = {
+        "provider_idx": 0,
+        "endpoint": PROVIDERS[0]["endpoint"],
+        "key_env": PROVIDERS[0]["key_env"],
+        "models": {},
+        "family": "generic",
+        "needs_key": True,
+    }
+    try:
+        raw = _yaml.safe_load(path.read_text()) or {}
+        actor = raw.get("models", {}).get("actor", {})
+        endpoint = actor.get("endpoint", prefill["endpoint"])
+        prefill["endpoint"] = endpoint
+        prefill["key_env"] = actor.get("api_key_env", prefill["key_env"])
+        prefill["provider_idx"] = _provider_idx_from_endpoint(endpoint)
+        prefill["family"] = actor.get("family", "generic")
+        for role in ("actor", "checker", "policy"):
+            m = raw.get("models", {}).get(role, {})
+            prefill["models"][role] = m.get("model", "")
+        prefill["needs_key"] = prefill["key_env"] not in ("", "unused")
+    except Exception:
+        pass
+    return prefill
+
+
+def _validate_and_fix_keys(cfg_out: dict[str, dict]) -> None:
+    """Check all configured API key env vars are set. Prompt to enter any missing ones."""
+    needed = sorted({
+        v["key_env"]
+        for v in cfg_out.values()
+        if v.get("key_env") and v["key_env"] != "unused"
+    })
+    if not needed:
+        return
+
+    console.print()
+    console.rule("[dim]API Key Check[/]", style="dim")
+    console.print()
+
+    env_updates: dict[str, str] = {}
+    all_ok = True
+
+    for key_env in needed:
+        val = os.environ.get(key_env, "")
+        if val and val != "unused":
+            console.print(f"  [green]✓[/] [bold]{key_env}[/] is set  {_masked(val)}")
+        else:
+            all_ok = False
+            console.print(
+                f"\n  [bold yellow]⚠  {key_env} is not set.[/]\n"
+                f"  [dim]HPEMA cannot call the model without this key.[/]"
+            )
+            new_val = _prompt_secret(f"Enter {key_env} now (or press Enter to skip)", env_var=key_env)
+            if new_val:
+                os.environ[key_env] = new_val
+                env_updates[key_env] = new_val
+                console.print(f"  [green]✓[/] {key_env} set for this session")
+            else:
+                console.print(
+                    f"  [yellow]Skipped.[/] [dim]Set [bold]{key_env}[/] in your shell "
+                    f"or re-run [bold]/setup[/] before using HPEMA.[/]"
+                )
+
+    if env_updates:
+        _write_env(env_updates)
+        console.print(f"\n  [green]✓[/] Key(s) saved to [bold]{_env_file()}[/]")
+
+    if all_ok:
+        console.print("\n  [green]✓[/] All API keys are configured.\n")
+    else:
+        console.print()
 
 
 # ---------------------------------------------------------------------------
 # Main wizard
 # ---------------------------------------------------------------------------
 
-def run_setup_wizard() -> bool:
+def run_setup_wizard(edit_path: Path | None = None) -> bool:
     """Run the interactive setup wizard.
 
-    Returns True if setup completed successfully, False if the user cancelled.
+    edit_path: if set, runs in edit mode — loads existing config as defaults
+               and saves back to the same file. If None, creates a new config.
+    Returns True on success, False on cancel.
     """
     console.clear()
+    home = _hpema_home()
 
-    # ── Header ──────────────────────────────────────────────────────────────
-    console.print()
-    console.print(Panel(
-        Text.from_markup(
-            "\n"
-            "  [bold #89b4fa]HPEMA Model Setup Wizard[/]\n"
-            "  [dim]Configure API keys and model endpoints for each pipeline agent[/]\n"
-            "\n"
-            "  [dim]You can re-run this at any time with [bold]/setup[/]\n"
-            "  Changes are written to [bold].env[/] and [bold]hpema_config.local.yaml[/][/]\n"
-        ),
-        border_style="bright_blue",
-        padding=(1, 3),
-    ))
-    console.print()
+    # ── Edit existing vs create new ────────────────────────────────────────
+    if edit_path is None:
+        existing_configs = sorted(home.glob("hpema_config*.yaml"))
 
-    total_steps = 5
+        if existing_configs:
+            console.print()
+            console.print(Panel(
+                Text.from_markup(
+                    "\n"
+                    "  [bold #89b4fa]HPEMA Setup[/]\n"
+                    f"  [dim]{len(existing_configs)} existing config(s) found in [bold]{home}[/][/]\n"
+                ),
+                border_style="bright_blue",
+                padding=(1, 3),
+            ))
+            console.print()
+            try:
+                action_idx = _pick_option(
+                    ["Edit existing configuration", "Create new configuration"],
+                    "What would you like to do?",
+                )
+            except KeyboardInterrupt:
+                console.print("\n  [yellow]Setup cancelled.[/]\n")
+                return False
+
+            if action_idx == 0:
+                configs = sorted(home.glob("hpema_config*.yaml"))
+                options = [p.name for p in configs]
+                try:
+                    cidx = _pick_option(options, "Select configuration to edit")
+                except KeyboardInterrupt:
+                    console.print("\n  [yellow]Setup cancelled.[/]\n")
+                    return False
+                edit_path = configs[cidx]
+                # Recurse with edit_path set
+                return run_setup_wizard(edit_path=edit_path)
+
+    # ── Determine save target and prefill ─────────────────────────────────
+    is_edit = edit_path is not None
+    prefill = _prefill_from_yaml(edit_path) if is_edit else {}
+
+    if is_edit:
+        target_config = edit_path
+        console.print()
+        console.print(Panel(
+            Text.from_markup(
+                "\n"
+                f"  [bold #89b4fa]Edit Configuration[/]\n"
+                f"  [dim]Editing: [bold]{edit_path.name}[/]\n"
+                f"  Full path: {edit_path}[/]\n\n"
+                "  [dim]Press Enter to keep current values. Changes are saved on confirm.[/]\n"
+            ),
+            border_style="bright_blue",
+            padding=(1, 3),
+        ))
+        console.print()
+    else:
+        # ── Config name for new config ─────────────────────────────────────
+        console.print()
+        console.print(Panel(
+            Text.from_markup(
+                "\n"
+                "  [bold #89b4fa]HPEMA Model Setup Wizard[/]\n"
+                "  [dim]Configure API keys and model endpoints for each pipeline agent[/]\n\n"
+                "  [dim]Every provider below uses the [bold]OpenAI-compatible REST API[/].\n"
+                "  HPEMA uses the same Python client for all of them — only the\n"
+                "  base URL and API key differ.[/]\n\n"
+                f"  [dim]Config saved to [bold]{home}[/][/]\n"
+            ),
+            border_style="bright_blue",
+            padding=(1, 3),
+        ))
+        console.print()
+
+        config_name_input = _prompt_text_input(
+            "Config name (leave blank for auto-generated, e.g. 'nvidia_mistral')",
+            default="",
+        )
+        target_config = _next_config_path(config_name_input)
+        console.print(f"  [dim]Will save to: [bold]{target_config}[/][/]\n")
+
+    total_steps = 6
 
     # ── Step 1: Provider ────────────────────────────────────────────────────
     _print_step(1, total_steps, "Choose your LLM provider")
+    console.print(
+        "  [dim]All options are OpenAI-compatible endpoints. HPEMA uses the same\n"
+        "  protocol for every provider — only the URL and key change.[/]\n"
+    )
 
-    provider_options = [p["label"] for p in PROVIDERS]
+    # In edit mode, pre-select the provider that matches the existing endpoint
+    default_provider_idx = prefill.get("provider_idx", 0)
+    # Rotate list so current provider appears first
+    ordered_providers = (
+        [PROVIDERS[default_provider_idx]]
+        + [p for i, p in enumerate(PROVIDERS) if i != default_provider_idx]
+    )
+    provider_options = [p["label"] for p in ordered_providers]
     try:
-        provider_idx = _pick_option(provider_options, "LLM Provider")
+        provider_sel = _pick_option(provider_options, "LLM Provider")
     except KeyboardInterrupt:
         console.print("\n  [yellow]Setup cancelled.[/]\n")
         return False
 
-    provider = PROVIDERS[provider_idx]
+    provider = ordered_providers[provider_sel]
     console.print(f"\n  [green]✓[/] Selected: [bold]{provider['label']}[/]\n")
 
-    # ── Step 2: Custom endpoint (if chosen) ─────────────────────────────────
+    # ── Step 2: Endpoint ────────────────────────────────────────────────────
     if provider["id"] == "custom":
         _print_step(2, total_steps, "Custom endpoint configuration")
-        endpoint = _prompt_text_input("API endpoint URL", default="http://localhost:8000/v1")
-        key_env  = _prompt_text_input("Environment variable name for API key", default="HPEMA_API_KEY")
+        endpoint = _prompt_text_input(
+            "OpenAI-compatible API endpoint URL",
+            default=prefill.get("endpoint", "http://localhost:8000/v1"),
+        )
+        key_env  = _prompt_text_input(
+            "Environment variable name for API key",
+            default=prefill.get("key_env", "HPEMA_API_KEY"),
+        )
         provider = {**provider, "endpoint": endpoint, "key_env": key_env}
     else:
         _print_step(2, total_steps, "Endpoint confirmation")
-        console.print(f"  Endpoint: [bold]{provider['endpoint']}[/]")
+        console.print(f"  Endpoint : [bold]{provider['endpoint']}[/]")
+        console.print(f"  Protocol : [dim]OpenAI-compatible REST (application/json)[/]")
 
     # ── Step 3: API key(s) ──────────────────────────────────────────────────
     env_updates: dict[str, str] = {}
-    shared_key  = ""
+    shared_key = ""
 
     if provider["needs_key"]:
         _print_step(3, total_steps, f"API Key  ({provider['key_env']})")
 
-        # Check if already set
         existing_val = os.environ.get(provider["key_env"], "")
         if existing_val and existing_val not in ("unused", ""):
             console.print(
-                f"  [green]✓[/] [bold]{provider['key_env']}[/] is already set: "
-                f"{_masked(existing_val)}"
+                f"  [green]✓[/] [bold]{provider['key_env']}[/] already set: {_masked(existing_val)}"
             )
-            keep = _confirm("Keep existing key?", default=True)
-            if keep:
+            if _confirm("Keep existing key?", default=True):
                 shared_key = existing_val
             else:
                 shared_key = _prompt_secret(f"New {provider['key_env']}", env_var=provider["key_env"])
@@ -609,8 +881,7 @@ def run_setup_wizard() -> bool:
         else:
             console.print(
                 f"  Enter your [bold]{provider['label']}[/] API key.\n"
-                f"  [dim]It will be saved to [bold].env[/] as "
-                f"[bold]{provider['key_env']}[/][/]\n"
+                f"  [dim]Saved to [bold]{_env_file()}[/] as [bold]{provider['key_env']}[/][/]\n"
             )
             shared_key = _prompt_secret(provider["key_env"])
             if not shared_key:
@@ -618,10 +889,9 @@ def run_setup_wizard() -> bool:
             else:
                 env_updates[provider["key_env"]] = shared_key
 
-        # Per-agent keys?
         console.print()
         use_same = _confirm(
-            "Use the same key for all three agents (Actor, Checker, Policy)?",
+            "Use same key for all agents (Actor, Checker, Policy)?",
             default=True,
         )
 
@@ -631,119 +901,151 @@ def run_setup_wizard() -> bool:
             for agent_id, agent_label in AGENT_LABELS:
                 console.print(f"\n  [bold]{agent_label}[/]")
                 var_name = f"HPEMA_{agent_id.upper()}_API_KEY"
-                val = _prompt_secret(f"{var_name}", env_var=var_name)
+                val = _prompt_secret(var_name, env_var=var_name)
                 if val:
                     env_updates[var_name] = val
                     agent_keys[agent_id] = var_name
                 else:
-                    agent_keys[agent_id] = provider["key_env"]  # fall back to shared
+                    agent_keys[agent_id] = provider["key_env"]
         else:
-            for agent_id, _ in AGENT_LABELS:
-                agent_keys[agent_id] = provider["key_env"]
+            agent_keys = {aid: provider["key_env"] for aid, _ in AGENT_LABELS}
     else:
-        # No key needed (local / ARC)
         _print_step(3, total_steps, "API Key")
         console.print(f"  [dim]No API key required for [bold]{provider['label']}[/].[/]")
         env_updates[provider["key_env"]] = "unused"
-        agent_keys = {agent_id: provider["key_env"] for agent_id, _ in AGENT_LABELS}
+        agent_keys = {aid: provider["key_env"] for aid, _ in AGENT_LABELS}
 
     # ── Step 4: Model names ─────────────────────────────────────────────────
     _print_step(4, total_steps, "Model names for each agent")
-
+    # In edit mode use existing model as the per-agent default; otherwise provider default
+    prefill_models = prefill.get("models", {})
+    fallback_model = provider["default_model"]
     console.print(
-        "  You can use the same model for all agents, or use different models.\n"
-        f"  [dim]Default: [bold]{provider['default_model']}[/][/]\n"
+        f"  [dim]Actor and Checker process all code. Policy runs RAG compliance checks.\n"
+        "  Dafny Architect mirrors Actor unless you edit the config manually.[/]\n"
     )
 
     agent_models: dict[str, str] = {}
+    # Check if all existing models are the same (offer "same for all" shortcut)
+    existing_actor = prefill_models.get("actor", fallback_model) or fallback_model
+    all_same = len(set(prefill_models.values())) <= 1 if prefill_models else True
     use_same_model = _confirm(
-        f"Use [{provider['default_model']}] for all agents?",
-        default=True,
+        f"Use the same model for all agents? (current: {existing_actor})",
+        default=all_same,
     )
 
     if use_same_model:
-        shared_model = _prompt_text_input(
-            "Model name", default=provider["default_model"]
-        )
-        for agent_id, _ in AGENT_LABELS:
-            agent_models[agent_id] = shared_model
+        shared_model = _prompt_text_input("Model name", default=existing_actor)
+        agent_models = {aid: shared_model for aid, _ in AGENT_LABELS}
     else:
         for agent_id, agent_label in AGENT_LABELS:
             console.print(f"\n  [bold]{agent_label}[/]")
-            m = _prompt_text_input("Model name", default=provider["default_model"])
-            agent_models[agent_id] = m
+            agent_default = prefill_models.get(agent_id, fallback_model) or fallback_model
+            agent_models[agent_id] = _prompt_text_input("Model name", default=agent_default)
 
-    # ── Step 5: Save ────────────────────────────────────────────────────────
-    _print_step(5, total_steps, "Review & Save")
+    # ── Step 5: Model family ────────────────────────────────────────────────
+    _print_step(5, total_steps, "Model family profile")
+    # In edit mode prefer existing family; new mode prefers provider default
+    default_family = prefill.get("family") or provider.get("default_family", "generic")
+    console.print(
+        f"  [dim]Family controls thinking-mode kwargs, system-role support, and JSON schema.\n"
+        f"  Current: [bold]{default_family}[/]. Change if switching model family.[/]\n"
+    )
+    try:
+        default_idx = ALL_FAMILIES.index(default_family)
+    except ValueError:
+        default_idx = 0
+    # Rotate list so current family is first
+    ordered_families = [ALL_FAMILIES[default_idx]] + [f for i, f in enumerate(ALL_FAMILIES) if i != default_idx]
+    try:
+        family_idx = _pick_option(ordered_families, "Model family")
+    except KeyboardInterrupt:
+        family_idx = 0
+    chosen_family = ordered_families[family_idx]
+    console.print(f"\n  [green]✓[/] Family: [bold]{chosen_family}[/]\n")
 
-    # Build a summary table
+    # ── Dafny detection ─────────────────────────────────────────────────────
+    dafny_path = _detect_dafny()
+    z3_path    = _detect_z3()
+
+    # ── Step 6: Review & Save ───────────────────────────────────────────────
+    _print_step(6, total_steps, "Review & Save")
+
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Agent",    style="bold", width=12)
     table.add_column("Model",    width=36)
+    table.add_column("Family",   width=18, style="dim")
     table.add_column("Key env",  width=28, style="dim")
-    table.add_column("Endpoint", width=44, style="dim")
 
     cfg_out: dict[str, dict] = {}
     for agent_id, agent_label in AGENT_LABELS:
-        short_label = agent_label.split("(")[0].strip()
+        short = agent_label.split("(")[0].strip()
         cfg_out[agent_id] = {
             "endpoint": provider["endpoint"],
             "model":    agent_models[agent_id],
             "key_env":  agent_keys.get(agent_id, provider["key_env"]),
+            "family":   chosen_family,
         }
         table.add_row(
-            short_label,
+            short,
             agent_models[agent_id],
+            chosen_family,
             agent_keys.get(agent_id, provider["key_env"]),
-            provider["endpoint"],
         )
 
     console.print(table)
+    console.print(f"\n  [dim]Config will be saved to: [bold]{target_config}[/][/]")
     console.print()
 
-    confirmed = _confirm("Save this configuration?", default=True)
+    # Dafny status
+    if dafny_path:
+        console.print(f"  [green]✓[/] Dafny detected: [dim]{dafny_path}[/]")
+        if z3_path:
+            console.print(f"  [green]✓[/] Z3 detected: [dim]{z3_path}[/]")
+    else:
+        console.print(
+            "\n  [yellow]⚠  Dafny not detected.[/]\n"
+            "  [dim]The verification stage will be unavailable until Dafny is installed.\n"
+            "  Quick install (macOS):  brew install dotnet dafny[/]\n"
+        )
+
+    console.print()
+    action_label = "Save changes?" if is_edit else "Save this configuration?"
+    confirmed = _confirm(action_label, default=True)
     if not confirmed:
         console.print("\n  [yellow]Setup cancelled — no changes made.[/]\n")
         return False
 
-    # Write .env
+    # Write files
+    env_path = _env_file()
     if env_updates:
         _write_env(env_updates)
         for var, val in env_updates.items():
-            os.environ[var] = val  # apply to current process immediately
-        console.print(f"\n  [green]✓[/] API keys written to [bold]{ENV_FILE.name}[/]")
+            os.environ[var] = val
+        console.print(f"\n  [green]✓[/] API keys written to [bold]{env_path}[/]")
 
-    # Write hpema_config.local.yaml
-    _write_local_config(cfg_out)
-    console.print(f"  [green]✓[/] Config written to [bold]{LOCAL_CONFIG.name}[/]")
+    _write_config(target_config, cfg_out, dafny_path, z3_path, chosen_family)
+    console.print(f"  [green]✓[/] Config {'updated' if is_edit else 'written'} → [bold]{target_config}[/]")
 
-    # Set HPEMA_CONFIG in current process
-    os.environ["HPEMA_CONFIG"] = "hpema_config.local.yaml"
-    console.print("  [green]✓[/] HPEMA_CONFIG set to [bold]hpema_config.local.yaml[/]")
+    os.environ["HPEMA_CONFIG"] = str(target_config)
 
-    # ── Offer restart ────────────────────────────────────────────────────────
-    console.print()
-    restart = _confirm(
-        "Restart HPEMA now to apply the new configuration?",
-        default=True,
-    )
-    if restart:
-        console.print("\n  [bold]Restarting HPEMA...[/]\n")
-        env_file = str(ENV_FILE)
-        python_bin = sys.executable  # use the same Python interpreter (venv-aware)
-        if ENV_FILE.exists():
-            restart_cmd = (
-                f"source {env_file} && "
-                f"HPEMA_CONFIG=hpema_config.local.yaml {python_bin} -m cli.main"
-            )
-        else:
-            restart_cmd = f"HPEMA_CONFIG=hpema_config.local.yaml {python_bin} -m cli.main"
-        os.execv("/bin/bash", ["/bin/bash", "-c", restart_cmd])
+    if not dafny_path:
+        console.print(
+            "\n  [bold yellow]Note:[/] config written with [dim]binary_path: dafny[/] — "
+            "relies on Dafny being on PATH.\n"
+            "  Once installed, re-run [bold]/setup[/] to auto-detect the path."
+        )
+
+    # ── API key validation — catch missing keys before restart ─────────────
+    _validate_and_fix_keys(cfg_out)
+
+    # Offer restart
+    if _confirm("Restart HPEMA now to apply?", default=True):
+        _restart(str(target_config))
     else:
         console.print(
-            "\n  [dim]Config saved. Restart HPEMA manually for changes to fully take effect.\n"
+            "\n  [dim]Config saved. Restart HPEMA for changes to fully take effect.\n"
             "  New keys are already active in this session.[/]\n"
         )
-        return True
 
-    return True  # unreachable after execv, but keeps type-checker happy
+    return True

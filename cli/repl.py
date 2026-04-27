@@ -1052,23 +1052,110 @@ def _run_setup(session: Session | None = None) -> None:
             session.standard       = new_cfg.policies.default_standard
             session.max_iterations = new_cfg.pipeline.max_iterations
             session.model          = new_cfg.models.actor.model
-            import os
-            session.config_source = os.environ.get("HPEMA_CONFIG", "hpema_config.local.yaml")
+            from backend.config import find_config_path as _fcp2
+            _f2 = _fcp2()
+            session.config_source = str(_f2) if _f2 else ""
         except Exception:
             pass
         console.print("  [dim]Session config reloaded from new settings.[/]\n")
 
 
+def _startup_config_check() -> None:
+    """Gate that runs before the logo/startup sequence.
+
+    Three cases:
+      A. No config found anywhere     → auto-launch /setup wizard (blocks).
+      B. Config found, never verified → show a summary panel, ask to confirm
+                                        or re-run /setup. Writes ~/.hpema/.config_verified
+                                        on confirmation so this prompt is shown exactly once.
+      C. Config found and verified    → silent pass-through; proceed normally.
+    """
+    from rich.panel import Panel as _Panel
+    from rich.table import Table as _Table
+    from rich.text import Text as _Text
+    from backend.config import hpema_home, find_config_path, load_config as _load
+
+    home     = hpema_home()
+    verified = home / ".config_verified"
+
+    # ── Determine whether ANY config is reachable (single source of truth) ──
+    found_path   = find_config_path()
+    config_found = found_path is not None
+
+    # ── Case A: no config → auto-launch wizard ──────────────────────────────
+    if not config_found:
+        console.print()
+        console.print(_Panel(
+            _Text.from_markup(
+                "\n"
+                "  [bold yellow]No configuration found.[/]\n"
+                "  [dim]Launching the setup wizard...[/]\n"
+            ),
+            border_style="yellow",
+            padding=(0, 2),
+        ))
+        console.print()
+        time.sleep(0.8)
+        from cli.setup import run_setup_wizard
+        run_setup_wizard()
+        return  # wizard calls _restart(); execution stops here
+
+    # ── Case B: config exists but not yet verified ──────────────────────────
+    if not verified.exists():
+        try:
+            cfg = _load()
+        except Exception:
+            return  # broken config — let normal startup surface the error
+
+        t = _Table(box=None, show_header=False, padding=(0, 2))
+        t.add_column("k", style="dim",  width=10)
+        t.add_column("v", style="bold")
+        t.add_row("Config",  str(found_path))
+        t.add_row("Actor",   cfg.models.actor.model)
+        t.add_row("Checker", cfg.models.checker.model)
+        t.add_row("Policy",  cfg.models.policy.model)
+        dafny_val = cfg.verification.binary_path
+        dafny_display = (
+            f"[green]{dafny_val}[/]" if dafny_val not in ("dafny", "LOCAL_DAFNY_INSTALL")
+            else "[yellow]dafny  (relies on PATH)[/]"
+        )
+        t.add_row("Dafny",   dafny_display)
+
+        console.print()
+        console.print(_Panel(
+            t,
+            title="[bold]Configuration found — is this correct?[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        ))
+        console.print()
+
+        from cli.setup import _confirm
+        if _confirm("Continue with this configuration?", default=True):
+            verified.touch()
+        else:
+            from cli.setup import run_setup_wizard
+            run_setup_wizard()
+
+    # Case C: verified → fall through silently
+
+
 def start_repl() -> None:
     """Launch the interactive REPL."""
-    # Rule 1: clear terminal noise from previous session
+    # Rule 0: config gate — auto-wizard on first run, confirmation on first boot.
+    # Runs before the logo so the screen isn't cluttered before setup completes.
+    console.clear()
+    _startup_config_check()
+
+    # Rule 1: clear again (setup wizard may have left output), then begin startup
     console.clear()
 
     session = Session()
 
-    # Detect config source
-    import os
-    env_config = os.environ.get("HPEMA_CONFIG", "hpema_config.yaml")
+    # Detect config source — use the same discovery logic as the loader
+    from backend.config import find_config_path as _fcp
+    _found = _fcp()
+    env_config = str(_found) if _found else "hpema_config.yaml"
     session.config_source = env_config
 
     # Rule 2: logo first, 1.5s pause, then config info
@@ -1088,14 +1175,12 @@ def start_repl() -> None:
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
 
-    # Welcome / setup prompt if no API keys are detected
+    # Welcome screen if API keys are missing even after config check
     from cli.setup import models_are_configured, show_welcome_screen
     if not models_are_configured():
         show_welcome_screen()
-        # Don't block — let the user type /setup themselves or proceed anyway
 
     # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
-    # Chat bar is naturally blocked until this returns.
     wait_for_layers_ready(config, session.stage)
 
     # Build input function — prompt_toolkit if available, plain fallback otherwise

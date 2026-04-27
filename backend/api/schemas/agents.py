@@ -8,7 +8,7 @@ the model literally cannot produce malformed output.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,9 +30,10 @@ class CodeCandidate(BaseModel):
         description="Actor's chain-of-thought explaining design decisions",
     )
     language: str = Field(default="Python", description="Target language of generated code")
-    annotations: dict[str, str] = Field(
+    annotations: dict[str, Any] = Field(
         default_factory=dict,
-        description="Metadata annotations (e.g., traceability tags)",
+        description="Metadata annotations (e.g., traceability tags). Values may be "
+                    "strings, lists, or nested dicts — models use these freely.",
     )
 
 

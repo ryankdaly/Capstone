@@ -25,12 +25,12 @@ if TYPE_CHECKING:
 
 def _build_orchestrator() -> PipelineOrchestrator:
     """Wire up the orchestrator with all dependencies from config."""
-    from backend.config import PROJECT_ROOT
+    from backend.config import resolve_data_path
     config = load_config()
     registry = ModelRegistry(config)
     retriever = StandardsRetriever(
-        persist_dir=str(PROJECT_ROOT / config.policies.chromadb_dir),
-        auto_ingest_path=str(PROJECT_ROOT / config.policies.standards_dir),
+        persist_dir=str(resolve_data_path(config.policies.chromadb_dir, "chromadb")),
+        auto_ingest_path=str(resolve_data_path(config.policies.standards_dir, "standards")),
     )
     return PipelineOrchestrator(
         llm_client=LLMClient(registry),

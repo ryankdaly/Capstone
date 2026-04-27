@@ -26,6 +26,8 @@ class CheckerAgent(BaseAgent):
         standard: str = kwargs.get("standard", "DO_178C")
         retry_hint: str | None = kwargs.get("retry_hint")
         dafny_contracts: "DafnyContracts | None" = kwargs.get("dafny_contracts")
+        dafny_unverified_spec: str | None = kwargs.get("dafny_unverified_spec")
+        dafny_solver_output: str | None = kwargs.get("dafny_solver_output")
         test_fix_hint: str | None = kwargs.get("test_fix_hint")
 
         parts = [
@@ -34,6 +36,22 @@ class CheckerAgent(BaseAgent):
             "## Task\nReview this code for correctness, safety issues, and undefined behavior. "
             "Generate test cases. Do NOT comment on Dafny specifications — focus only on the source code.",
         ]
+
+        if dafny_unverified_spec and dafny_unverified_spec.strip():
+            hint_lines = [
+                "## Dafny Specification ⚠ (did not verify — use for inspiration only)",
+                "A Dafny specification was generated for this code but **failed to verify**. "
+                "The spec may contain logical errors or overly strong postconditions. "
+                "Do NOT assert its ensures clauses as facts. Instead, absorb the intended "
+                "contract — the preconditions and postconditions capture what the author "
+                "meant — and use them to write more targeted, boundary-aware test cases.",
+            ]
+            if dafny_solver_output and dafny_solver_output.strip():
+                hint_lines.append(
+                    f"### Verification failure (Dafny output)\n```\n{dafny_solver_output[:800]}\n```"
+                )
+            hint_lines.append(f"### Unverified spec\n```dafny\n{dafny_unverified_spec}\n```")
+            parts.append("\n".join(hint_lines))
 
         if dafny_contracts and dafny_contracts.has_contracts:
             contract_lines = [

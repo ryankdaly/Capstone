@@ -18,6 +18,8 @@ class ResolvedModel:
     endpoint: str
     model: str
     api_key: str
+    family: str = "generic"
+    enable_thinking: bool = False
     extra_body: dict = field(default_factory=dict)
 
 
@@ -32,6 +34,8 @@ class ModelRegistry:
             endpoint=cfg.endpoint,
             model=cfg.model,
             api_key=cfg.api_key,
+            family=cfg.family,
+            enable_thinking=cfg.enable_thinking,
             extra_body=cfg.extra_body,
         )
 

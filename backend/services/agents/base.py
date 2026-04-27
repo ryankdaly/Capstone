@@ -20,48 +20,109 @@ from backend.services.llm.client import LLMClient, ThinkLoopError, _strip_think_
 logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "llm" / "prompts"
-_AGENT_LOG = Path(__file__).resolve().parent.parent.parent.parent / "logs" / "agent.log"
-_agent_log_lock = threading.Lock()
+_LOG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
+
+# One lock per agent role — created on first use so no import-time side effects.
+_log_locks: dict[str, threading.Lock] = {}
+_log_locks_mutex = threading.Lock()
+
+
+def _role_lock(role: str) -> threading.Lock:
+    with _log_locks_mutex:
+        if role not in _log_locks:
+            _log_locks[role] = threading.Lock()
+        return _log_locks[role]
+
 
 # --------------------------------------------------------------------------- #
-# Debug log helper                                                             #
+# Per-agent pretty log                                                         #
 # --------------------------------------------------------------------------- #
 
-_DIVIDER = "=" * 80
-_SEP     = "-" * 80
+_HEAVY = "═" * 80
+_LIGHT = "─" * 40
+
+
+def _section(title: str) -> str:
+    """Return a labelled section divider: ── TITLE ──────..."""
+    pad = _LIGHT[len(title) + 4:]
+    return f"── {title} ──{pad}"
+
+
+_PIPELINE_AGENT_ROLES = ("actor", "checker", "dafny_architect", "policy")
+
+
+def write_run_header(header: str) -> None:
+    """Prepend a run-separator block to every agent log file (thread-safe, never raises).
+
+    Called once per pipeline run so each per-agent log clearly delineates runs.
+    """
+    try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        for role in _PIPELINE_AGENT_ROLES:
+            log_path = _LOG_DIR / f"{role}.log"
+            with _role_lock(role):
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(header)
+    except Exception:
+        pass
+
 
 def _write_agent_log(
     role: str,
+    system_prompt: str,
     user_prompt: str,
     full_raw: str,
     full_stripped: str,
     parse_ok: bool,
     parse_error: str | None = None,
 ) -> None:
-    """Append one agent response record to agent.log (thread-safe, never raises)."""
+    """Append one agent call record to logs/{role}.log (thread-safe, never raises).
+
+    Format (human-readable, grep-friendly):
+        ════ ACTOR · 2026-04-25T14:32:17.483Z · OK ════
+        ── SYSTEM PROMPT ──
+        <full system prompt>
+        ── USER PROMPT ──
+        <user prompt>
+        ── RAW RESPONSE ──
+        <raw LLM output>
+        ── STRIPPED RESPONSE ──
+        <think-tag-stripped output>  (or "(same as raw)")
+    """
     try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        log_path = _LOG_DIR / f"{role}.log"
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         status = "OK" if parse_ok else f"PARSE_FAIL: {parse_error}"
+        header = f" {role.upper()} · {ts} · {status} "
+        # Centre the header inside the heavy divider
+        heavy_line = _HEAVY
+        header_line = header.center(80, "═")
+
+        stripped_display = full_stripped if full_stripped != full_raw else "(same as raw)"
+
         lines = [
-            _DIVIDER,
-            f"AGENT : {role}",
-            f"TIME  : {ts}",
-            f"STATUS: {status}",
-            _SEP,
-            "USER PROMPT:",
+            "",
+            heavy_line,
+            header_line,
+            heavy_line,
+            "",
+            _section("SYSTEM PROMPT"),
+            system_prompt,
+            "",
+            _section("USER PROMPT"),
             user_prompt,
-            _SEP,
-            "RAW RESPONSE:",
+            "",
+            _section("RAW RESPONSE"),
             full_raw,
-            _SEP,
-            "STRIPPED RESPONSE:",
-            full_stripped if full_stripped != full_raw else "(same as raw)",
-            _DIVIDER,
+            "",
+            _section("STRIPPED RESPONSE"),
+            stripped_display,
             "",
         ]
-        with _agent_log_lock:
-            with _AGENT_LOG.open("a", encoding="utf-8") as fh:
-                fh.write("\n".join(lines))
+        with _role_lock(role):
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
     except Exception:
         pass  # debug log must never crash the pipeline
 
@@ -108,10 +169,10 @@ class BaseAgent(ABC):
                 max_tokens=self.max_tokens,
             )
         except Exception as exc:
-            _write_agent_log(self.role, user_prompt, "(non-streaming — raw not captured)", "", False, str(exc))
+            _write_agent_log(self.role, self._system_prompt, user_prompt, "(non-streaming — raw not captured)", "", False, str(exc))
             raise
 
-        _write_agent_log(self.role, user_prompt, "(non-streaming — raw not captured)", "", True)
+        _write_agent_log(self.role, self._system_prompt, user_prompt, "(non-streaming — raw not captured)", "", True)
         logger.info("Agent [%s] completed", self.role)
         return result
 
@@ -131,7 +192,17 @@ class BaseAgent(ABC):
         Falls back to a single-token yield (non-streaming) when the endpoint
         does not support streaming — callers are unaffected.
         """
-        user_prompt = self._build_user_prompt(**kwargs)
+        try:
+            user_prompt = self._build_user_prompt(**kwargs)
+        except Exception as exc:
+            logger.error("Agent [%s] _build_user_prompt failed: %s", self.role, exc, exc_info=True)
+            _write_agent_log(
+                self.role, self._system_prompt,
+                f"[PROMPT BUILD FAILED — {type(exc).__name__}: {exc}]",
+                "", "", False, str(exc),
+            )
+            raise
+
         logger.info("Agent [%s] starting (streaming)", self.role)
 
         chunks: list[str] = []
@@ -148,8 +219,22 @@ class BaseAgent(ABC):
         except ThinkLoopError as exc:
             partial = "".join(chunks)
             _write_agent_log(
-                self.role, user_prompt,
+                self.role, self._system_prompt, user_prompt,
                 partial + f"\n[ABORTED — ThinkLoopError: {exc}]",
+                "", False, str(exc),
+            )
+            raise
+        except Exception as exc:
+            # Any other stream error (HTTP error, timeout, JSON decode, etc.)
+            # was silently swallowing the failure without writing to the agent log.
+            partial = "".join(chunks)
+            logger.error(
+                "Agent [%s] stream error after %d chunks: %s",
+                self.role, len(chunks), exc, exc_info=True,
+            )
+            _write_agent_log(
+                self.role, self._system_prompt, user_prompt,
+                partial + f"\n[STREAM ERROR — {type(exc).__name__}: {exc}]",
                 "", False, str(exc),
             )
             raise
@@ -165,7 +250,7 @@ class BaseAgent(ABC):
                 result = self._llm.parse_structured(
                     candidate, self._output_schema(), role=self.role
                 )
-                _write_agent_log(self.role, user_prompt, full_raw, full_stripped, True)
+                _write_agent_log(self.role, self._system_prompt, user_prompt, full_raw, full_stripped, True)
                 logger.info("Agent [%s] completed", self.role)
                 yield result
                 return
@@ -177,7 +262,7 @@ class BaseAgent(ABC):
                     self.role, label, exc,
                 )
 
-        _write_agent_log(self.role, user_prompt, full_raw, full_stripped, False, str(parse_error))
+        _write_agent_log(self.role, self._system_prompt, user_prompt, full_raw, full_stripped, False, str(parse_error))
         raise ValueError(
             f"Agent [{self.role}] failed to parse LLM output. "
             f"Last error: {parse_error}. "
