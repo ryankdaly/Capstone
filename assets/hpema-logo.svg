@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 185" width="680" height="185">
+  <defs>
+    <linearGradient id="hpema-text-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#87CEFF"/>
+      <stop offset="22%"  stop-color="#6AAFD6"/>
+      <stop offset="44%"  stop-color="#4D92BE"/>
+      <stop offset="66%"  stop-color="#3175A6"/>
+      <stop offset="83%"  stop-color="#1C5A8E"/>
+      <stop offset="100%" stop-color="#112E55"/>
+    </linearGradient>
+    <linearGradient id="hpema-sep-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#3175A6" stop-opacity="0"/>
+      <stop offset="35%"  stop-color="#4D92BE" stop-opacity="1"/>
+      <stop offset="65%"  stop-color="#4D92BE" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#3175A6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="hpema-border-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1C5A8E" stop-opacity="0.6"/>
+      <stop offset="50%"  stop-color="#4D92BE" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#1C5A8E" stop-opacity="0.6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Card background -->
+  <rect width="680" height="185" fill="#090E1A" rx="12"/>
+  <!-- Subtle border -->
+  <rect width="678" height="183" x="1" y="1" fill="none" stroke="url(#hpema-border-grad)" stroke-width="1" rx="11"/>
+
+  <!-- Main HPEMA logotype -->
+  <text
+    x="340"
+    y="128"
+    font-family="'Courier New', Courier, monospace"
+    font-size="106"
+    font-weight="bold"
+    text-anchor="middle"
+    letter-spacing="10"
+    fill="url(#hpema-text-grad)">HPEMA</text>
+
+  <!-- Separator -->
+  <rect x="100" y="148" width="480" height="1" fill="url(#hpema-sep-grad)"/>
+
+  <!-- Full name subtitle -->
+  <text
+    x="340"
+    y="170"
+    font-family="'Courier New', Courier, monospace"
+    font-size="12"
+    text-anchor="middle"
+    letter-spacing="3.5"
+    fill="#4D92BE"
+    opacity="0.85">HIERARCHICAL · POLICY-ENFORCED · MULTI-AGENT</text>
+</svg>
