@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 150" width="500" height="150">
+
+  <!-- Deep extrusion shadow: +2,+2 offset, near-black navy -->
+  <text x="8"  y="26"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">██╗  ██╗██████╗ ███████╗███╗   ███╗ █████╗ </text>
+  <text x="8"  y="48"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">██║  ██║██╔══██╗██╔════╝████╗ ████║██╔══██╗</text>
+  <text x="8"  y="70"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">███████║██████╔╝█████╗  ██╔████╔██║███████║</text>
+  <text x="8"  y="92"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">██╔══██║██╔═══╝ ██╔══╝  ██║╚██╔╝██║██╔══██║</text>
+  <text x="8"  y="114" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">██║  ██║██║     ███████╗██║ ╚═╝ ██║██║  ██║</text>
+  <text x="8"  y="136" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#030912">╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝</text>
+
+  <!-- Mid extrusion shadow: +1,+1 offset, dark navy -->
+  <text x="7"  y="25"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">██╗  ██╗██████╗ ███████╗███╗   ███╗ █████╗ </text>
+  <text x="7"  y="47"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">██║  ██║██╔══██╗██╔════╝████╗ ████║██╔══██╗</text>
+  <text x="7"  y="69"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">███████║██████╔╝█████╗  ██╔████╔██║███████║</text>
+  <text x="7"  y="91"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">██╔══██║██╔═══╝ ██╔══╝  ██║╚██╔╝██║██╔══██║</text>
+  <text x="7"  y="113" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">██║  ██║██║     ███████╗██║ ╚═╝ ██║██║  ██║</text>
+  <text x="7"  y="135" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#071122">╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝</text>
+
+  <!-- Foreground: top-to-bottom blue gradient, one color per line (matches CLI exactly) -->
+  <text x="6"  y="24"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#87CEFF">██╗  ██╗██████╗ ███████╗███╗   ███╗ █████╗ </text>
+  <text x="6"  y="46"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#6AAFD6">██║  ██║██╔══██╗██╔════╝████╗ ████║██╔══██╗</text>
+  <text x="6"  y="68"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#4D92BE">███████║██████╔╝█████╗  ██╔████╔██║███████║</text>
+  <text x="6"  y="90"  xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#3175A6">██╔══██║██╔═══╝ ██╔══╝  ██║╚██╔╝██║██╔══██║</text>
+  <text x="6"  y="112" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#1C5A8E">██║  ██║██║     ███████╗██║ ╚═╝ ██║██║  ██║</text>
+  <text x="6"  y="134" xml:space="preserve" font-family="'DejaVu Sans Mono','Courier New',Courier,monospace" font-size="18" fill="#112E55">╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝</text>
+
+</svg>
