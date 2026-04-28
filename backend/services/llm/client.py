@@ -640,7 +640,7 @@ def _extract_json(text: str) -> str | None:
     if fence_match:
         return fence_match.group(1)
 
-    # Try the first { ... } spanning the entire content
+    # Try the greedy span from first { to last } — works for single clean JSON.
     brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
     if brace_match:
         candidate = brace_match.group(1)
@@ -649,6 +649,22 @@ def _extract_json(text: str) -> str | None:
             return candidate
         except json.JSONDecodeError:
             pass
+
+    # Greedy span failed (e.g. LLM emitted two concatenated JSON blocks with a
+    # corrupt first attempt). Scan all { positions from right-to-left and return
+    # the last valid JSON object found — LLMs typically correct themselves last.
+    for start in sorted(
+        [m.start() for m in re.finditer(r"\{", text)], reverse=True
+    ):
+        last_brace = text.rfind("}", start)
+        if last_brace == -1:
+            continue
+        candidate = text[start : last_brace + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
 
     return None
 
