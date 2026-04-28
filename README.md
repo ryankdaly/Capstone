@@ -17,7 +17,7 @@
 
 ## Overview
 
-HPEMA is a multi-agent pipeline that generates, verifies, and certifies source code against safety standards such as DO-178C, MISRA-C, and NASA-STD-8739.8. It was built for aerospace and safety-critical engineering contexts where the consequences of a software defect are measured not in dollars but in lives.
+HPEMA (Hierarchical Policy-Enforced Multi-Agent) is a multi-agent pipeline that generates, verifies, and certifies source code against safety standards such as DO-178C, MISRA-C, and NASA-STD-8739.8. It was built for aerospace and safety-critical engineering contexts where the consequences of a software defect are measured not in dollars but in lives.
 
 Unlike every other AI coding assistant available today, HPEMA does not rely on model behavior to produce correct output. Instead, it enforces three independent, mathematically grounded guarantees on every piece of code it produces: structural correctness through constrained decoding, logical correctness through formal proof, and regulatory correctness through live policy enforcement. Any one of these guarantees in isolation is impressive. Together, they form a defense-in-depth architecture for AI-generated code.
 
@@ -437,60 +437,123 @@ Each agent produces a live-updating panel as it runs. Here is what each panel te
 
 ---
 
-## Running on VT ARC (HPC Cluster)
+## Self-Hosting with vLLM (Local or Remote GPU)
 
-HPEMA runs on Virginia Tech's ARC cluster against vLLM-served models on GPU nodes. This deployment requires no external API keys and demonstrates a fully air-gapped, on-premise architecture.
+If you have access to a machine with a GPU and prefer not to rely on external API providers, you can run HPEMA entirely against your own vLLM server. vLLM exposes an OpenAI-compatible API; from HPEMA's perspective it is identical to any other endpoint. No external API keys are required, and the entire pipeline runs air-gapped within your own infrastructure.
 
-### 1. Log In to ARC
+### Prerequisites
 
-```bash
-ssh pid@falcon1.arc.vt.edu
-```
+- A machine with at least one NVIDIA GPU (16 GB VRAM minimum for a 7B model; 40 GB for 70B-class models)
+- Python 3.10+ on that machine
+- CUDA 12.x drivers
 
-Replace `pid` with your VT login ID. At the password prompt, enter your VT password immediately followed by a comma and the six-digit OTP from Duo Mobile, with no spaces: `yourpassword,123456`.
-
-### 2. Reserve a GPU Node
+### 1. Install vLLM
 
 ```bash
-salloc --account=muataz --gres=gpu:1 --cpus-per-task=16 --partition=l40s_normal_q
+pip install vllm
 ```
 
-When the reservation is granted, note the node name shown in the output (e.g. `fal038`).
+### 2. Start a vLLM Server
 
-### 3. SSH into the GPU Node
+Launch one vLLM instance per agent role, each on a different port. You can use the same model for all agents on a single GPU, or different models on different GPUs:
 
 ```bash
-ssh fal038      # use whichever node was assigned
-nvidia-smi      # confirm GPU is available
+# Single model for all agents (simplest setup)
+python -m vllm.entrypoints.openai.api_server \
+  --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --port 8001
+
+# Or, one model per agent role on multiple GPUs
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2.5-Coder-32B-Instruct \
+  --port 8001 --tensor-parallel-size 2 &    # actor
+
+python -m vllm.entrypoints.openai.api_server \
+  --model microsoft/Phi-4 \
+  --port 8002 &                              # checker + dafny architect
+
+python -m vllm.entrypoints.openai.api_server \
+  --model mistralai/Mistral-Small-3.2-24B-Instruct \
+  --port 8003 &                              # policy
 ```
 
-### 4. Activate the Environment
+Wait until each server prints `Application startup complete.` before proceeding.
+
+### 3. Point HPEMA at Your Server
+
+Create a config file that references your local endpoints:
+
+```yaml
+# local/configs/hpema_config.vllm.yaml
+models:
+  actor:
+    endpoint: "http://localhost:8001/v1"
+    model: "mistralai/Mistral-7B-Instruct-v0.3"
+    api_key_env: "HPEMA_API_KEY"            # set to any non-empty string
+
+  checker:
+    endpoint: "http://localhost:8001/v1"    # same server if sharing one GPU
+    model: "mistralai/Mistral-7B-Instruct-v0.3"
+    api_key_env: "HPEMA_API_KEY"
+
+  policy:
+    endpoint: "http://localhost:8001/v1"
+    model: "mistralai/Mistral-7B-Instruct-v0.3"
+    api_key_env: "HPEMA_API_KEY"
+
+  dafny_architect:
+    endpoint: "http://localhost:8001/v1"
+    model: "mistralai/Mistral-7B-Instruct-v0.3"
+    api_key_env: "HPEMA_API_KEY"
+
+policies:
+  standards_dir: "data/standards"
+  chromadb_dir: "data/chromadb"
+  default_standard: "DO_178C"
+
+verification:
+  prover: "dafny"
+  timeout_seconds: 120
+  binary_path: "/usr/local/bin/dafny"
+
+pipeline:
+  max_iterations: 3
+  stage: "policy"
+```
 
 ```bash
-module load Python/3.11.5-GCCcore-13.2.0
-cd /projects/meng/Capstone
-source .venv/bin/activate
+export HPEMA_API_KEY=local          # any non-empty value; vLLM ignores it
+export HPEMA_CONFIG=local/configs/hpema_config.vllm.yaml
+python -m cli.main
 ```
 
-### 5. Start HPEMA
+### 4. Constrained Decoding
+
+vLLM supports JSON schema constrained decoding natively via `guided_json`. HPEMA detects this capability automatically from the model family profile and enables it when available. This is the strongest form of the structural safety guarantee: the model cannot emit tokens that violate the output schema, at the token level, during generation. No post-processing or retry loop is needed.
+
+If your model family profile does not list `supports_json_schema: true`, HPEMA falls back to prompt-only structured output with JSON extraction; the pipeline still works but the structural guarantee becomes probabilistic rather than formal.
+
+### Remote GPU Access
+
+If your GPU machine is not local (a university HPC cluster, a cloud VM, a coworker's workstation), the setup is identical except the endpoint URL uses the remote host's IP or hostname instead of `localhost`. Start vLLM on the remote machine, ensure the port is reachable from your local machine (SSH tunnel or open firewall rule), and set the endpoint accordingly:
+
+```yaml
+# Config on your local machine, pointing at the remote vLLM server
+models:
+  actor:
+    endpoint: "http://192.168.1.50:8001/v1"     # remote host IP
+    model: "mistralai/Mistral-7B-Instruct-v0.3"
+    api_key_env: "HPEMA_API_KEY"
+```
+
+Or through an SSH tunnel:
 
 ```bash
-bash ml/slurm/start_tmux.sh
+# On your local machine: forward remote port 8001 to local port 8001
+ssh -L 8001:localhost:8001 user@remote-gpu-host
+
+# Then use localhost in your config as if the server were local
 ```
-
-This script launches a tmux session with two panes: the left pane runs vLLM (loading model weights), and the right pane runs the HPEMA CLI (waiting for vLLM to finish starting). Wait for the vLLM pane to print `Application startup complete.` before sending your first prompt.
-
-### Tmux Navigation
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+b` then arrow key | Move between panes |
-| `Ctrl+b` then `z` | Maximize or restore the current pane |
-| `Ctrl+b` then `x`, then `y` | Close the current pane |
-
-### Shutting Down Properly
-
-Kill both panes with `Ctrl+b` then `x` then `y` for each. Then type `exit` repeatedly until you see `salloc: Job allocation has been revoked.` This releases the GPU reservation back to the cluster.
 
 ---
 
