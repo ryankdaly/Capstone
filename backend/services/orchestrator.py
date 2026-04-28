@@ -141,6 +141,8 @@ class PipelineOrchestrator:
         )
         best_score: float = -1.0
         best_iteration: int = 0
+        # Stash verified Dafny spec to skip architect on next iteration.
+        _cached_dafny_spec: str | None = None
 
         # Actor-only has no feedback loop. Checker+ can loop on Dafny/Checker feedback.
         effective_max_iterations = (
@@ -239,7 +241,42 @@ class PipelineOrchestrator:
                     _dafny_retry_hint: str | None = None
                     dafny_contracts: DafnyContracts | None = None
 
-                    for _cycle in range(1, _DAFNY_MAX_CYCLES + 1):
+                    # ── Fast path: reuse verified spec from prior iteration ──
+                    _used_cached_spec = False
+                    if _cached_dafny_spec is not None:
+                        logger.info(
+                            "Iteration %d: trying cached Dafny spec (skip architect).", i,
+                        )
+                        yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
+                        _cache_vr = await self._dafny.verify(_cached_dafny_spec)
+                        yield self._event(
+                            run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
+                            {
+                                "verified": _cache_vr.verified,
+                                "solver_output": _cache_vr.solver_output,
+                                "failing_assertions": _cache_vr.failing_assertions,
+                                "execution_time_seconds": _cache_vr.execution_time_seconds,
+                                "cycle": 0,
+                                "cached": True,
+                            },
+                        )
+                        if _cache_vr.verified:
+                            _used_cached_spec = True
+                            code_candidate.dafny_spec = _cached_dafny_spec
+                            has_dafny_spec = True
+                            verification_result = _cache_vr
+                            dafny_contracts = extract_contracts(_cached_dafny_spec)
+                            logger.info(
+                                "Cached Dafny spec still verifies — skipping architect.",
+                            )
+                        else:
+                            logger.info(
+                                "Cached Dafny spec failed verification — regenerating.",
+                            )
+                            _cached_dafny_spec = None
+
+                    _dafny_cycles = range(1, _DAFNY_MAX_CYCLES + 1) if not _used_cached_spec else range(0)
+                    for _cycle in _dafny_cycles:
                         # ── Dafny Architect LLM ──────────────────────────────────────
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_architect")
                         self._audit.log(run_id, "agent_start", agent="dafny_architect",
@@ -315,6 +352,7 @@ class PipelineOrchestrator:
                         if _cycle_verification.verified or not has_dafny_spec:
                             if _cycle_verification.verified:
                                 dafny_contracts = extract_contracts(code_candidate.dafny_spec)
+                                _cached_dafny_spec = code_candidate.dafny_spec
                                 logger.info(
                                     "Extracted %d requires + %d ensures from Dafny spec for '%s'",
                                     len(dafny_contracts.requires),
@@ -562,9 +600,16 @@ class PipelineOrchestrator:
                     iteration.feedback = feedback
 
                 # Best-so-far tracking — detect regressions across iterations
+                # Use granular test pass ratio instead of binary pass/fail so
+                # iteration with 8/9 tests beats one with 6/10.
+                if test_result and test_result.executed and test_result.total > 0:
+                    test_score = test_result.passed / test_result.total
+                else:
+                    test_score = 1.0 if tests_ok else 0.0
+
                 score = (
                     (1.0 if checker_ok else 0.0)
-                    + (1.0 if tests_ok else 0.0)
+                    + test_score
                     + (0.5 if dafny_ok else 0.0)
                     + (0.25 if has_dafny_spec else 0.0)
                 )
@@ -572,7 +617,7 @@ class PipelineOrchestrator:
                     policy_ok = policy_verdict is not None and policy_verdict.compliant
                     score += 1.0 if policy_ok else 0.0
 
-                if score > best_score:
+                if score >= best_score:
                     best_score = score
                     best_iteration = i
                 elif i > 1 and score < best_score and feedback is not None:
@@ -607,6 +652,12 @@ class PipelineOrchestrator:
             else:
                 state.status = PipelineStatus.FAILED
                 state.error = f"Failed to converge after {effective_max_iterations} iterations"
+                # Still expose best iteration's code so re-run commands work.
+                if best_iteration > 0 and best_iteration <= len(state.iterations):
+                    best_iter = state.iterations[best_iteration - 1]
+                    if best_iter.code_candidate is not None:
+                        state.final_code = best_iter.code_candidate.source_code
+                        state.final_proof = best_iter.code_candidate.dafny_spec
 
         except Exception as e:
             logger.exception("Pipeline error in run %s", run_id)

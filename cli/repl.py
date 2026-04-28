@@ -1038,6 +1038,214 @@ def _show_audit(session: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Build-mode dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _do_inline_chat(line: str, session: Session) -> None:
+    """Stream a chat response inline — used for CONVERSE intent and explicit chat mode."""
+    import asyncio as _asyncio
+    from cli.display import _DynamicSpinner
+    from cli.runner import chat_stream
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    console.print()
+    collected: list[str] = []
+
+    class _ChatPanel:
+        def __init__(self) -> None:
+            self._spinner = _DynamicSpinner("actor")
+
+        def __rich__(self):
+            text = "".join(collected)
+            if not text:
+                return self._spinner.__rich__()
+            return Panel(Markdown(text), title="[bold bright_blue]HPEMA[/]",
+                         border_style="bright_blue", padding=(1, 2))
+
+    live = Live(_ChatPanel(), refresh_per_second=12, console=console)
+    live.start()
+    try:
+        response = _asyncio.run(chat_stream(line, on_token=collected.append))
+        live.stop()
+        session.chat_history.append({"role": "user", "content": line})
+        session.chat_history.append({"role": "assistant", "content": response})
+        console.print(Panel(Markdown(response), title="[bold bright_blue]HPEMA[/]",
+                            border_style="bright_blue", padding=(1, 2)))
+    except KeyboardInterrupt:
+        live.stop()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        live.stop()
+        show_error(str(e))
+
+
+def _do_rerun_checker(session: Session) -> None:
+    """Re-run the checker + tests on the last pipeline code."""
+    from cli.runner import run_checker_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Checker on last code  |  Standard: {session.standard}  |  Language: {session.language}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_checker_only(
+            code=code,
+            standard=session.standard,
+            language=session.language,
+            display=display,
+            run_tests=session.run_tests,
+        )
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_rerun_dafny(session: Session) -> None:
+    """Re-run the Dafny architect + verifier on the last pipeline code."""
+    from cli.runner import run_dafny_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Dafny on last code  |  Language: {session.language}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_dafny_only(code=code, language=session.language, display=display)
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_rerun_policy(session: Session) -> None:
+    """Re-run the policy agent on the last pipeline code."""
+    from cli.runner import run_policy_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Policy on last code  |  Standard: {session.standard}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_policy_only(code=code, standard=session.standard, display=display)
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_full_pipeline(line: str, session: Session, pt_session: object | None) -> None:
+    """Run the full pipeline for a GENERATE intent."""
+    console.print()
+    console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
+
+    session.agents_running = True
+    retry_context = ""
+    requirement_text = line
+
+    try:
+        while True:
+            display = DisplayManager()
+            run_start = time.monotonic()
+
+            try:
+                state = run_pipeline(
+                    requirement=requirement_text,
+                    standard=session.standard,
+                    language=session.language,
+                    max_iterations=session.max_iterations,
+                    display=display,
+                    stage=session.stage,
+                    run_tests=session.run_tests,
+                    retry_context=retry_context,
+                )
+            except KeyboardInterrupt:
+                display.cleanup()
+                console.print("\n  [yellow]Pipeline interrupted.[/]")
+                break
+            except Exception as e:
+                display.cleanup()
+                show_error(str(e))
+                break
+
+            elapsed = time.monotonic() - run_start
+
+            if state is not None:
+                session.history.append(RunRecord(
+                    requirement=requirement_text,
+                    state=state,
+                    standard=session.standard,
+                    language=session.language,
+                    stage=session.stage.value,
+                    elapsed_seconds=elapsed,
+                ))
+
+            if state is None or state.status.value != "failed":
+                break
+
+            # --- Retry prompt ---
+            error_dump = display.build_error_dump()
+            console.print()
+            console.print(
+                "  [bold yellow]All iterations failed.[/]  "
+                "Feed error dump into a new run?"
+            )
+
+            if not _PT_AVAILABLE or pt_session is None:
+                answer = console.input(
+                    "  [bold]Retry loop?[/] [dim][Y/n][/] "
+                ).strip().lower()
+                do_retry = answer in ("", "y", "yes")
+            else:
+                try:
+                    answer = pt_session.prompt(  # type: ignore[union-attr]
+                        "  Retry loop? [Y/n] ",
+                    ).strip().lower()
+                    do_retry = answer in ("", "y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    do_retry = False
+
+            if not do_retry:
+                break
+
+            retry_context = error_dump
+            console.print(
+                f"  [dim]Retrying with {len(error_dump)} chars of error context …[/]"
+            )
+            console.print()
+    finally:
+        session.agents_running = False
+
+
+# ---------------------------------------------------------------------------
 # REPL entry point
 # ---------------------------------------------------------------------------
 
@@ -1267,138 +1475,32 @@ def start_repl() -> None:
                 break
             continue
 
-        # --- Chat mode: direct LLM conversation, no pipeline ---
+        # --- Chat mode (explicit): direct LLM conversation, no pipeline ---
         if session.mode == "chat":
-            import asyncio as _asyncio
-            from cli.display import _DynamicSpinner
-            from cli.runner import chat_stream
-            from rich.live import Live
-            from rich.markdown import Markdown
-            from rich.panel import Panel
-            console.print()
-
-            collected: list[str] = []
-
-            class _ChatPanel:
-                """Live renderable: spinner until first token, then growing panel."""
-
-                def __init__(self) -> None:
-                    self._spinner = _DynamicSpinner("actor")
-
-                def __rich__(self):
-                    text = "".join(collected)
-                    if not text:
-                        return self._spinner.__rich__()
-                    return Panel(
-                        Markdown(text),
-                        title="[bold bright_blue]HPEMA[/]",
-                        border_style="bright_blue",
-                        padding=(1, 2),
-                    )
-
-            chat_panel = _ChatPanel()
-            live = Live(chat_panel, refresh_per_second=12, console=console)
-            live.start()
-            try:
-                response = _asyncio.run(
-                    chat_stream(line, on_token=collected.append)
-                )
-                live.stop()
-                session.chat_history.append({"role": "user", "content": line})
-                session.chat_history.append({"role": "assistant", "content": response})
-                # Final render (in case Live ended before last refresh)
-                console.print(Panel(
-                    Markdown(response),
-                    title="[bold bright_blue]HPEMA[/]",
-                    border_style="bright_blue",
-                    padding=(1, 2),
-                ))
-            except KeyboardInterrupt:
-                live.stop()
-                console.print("\n  [yellow]Chat interrupted.[/]")
-            except Exception as e:
-                live.stop()
-                show_error(str(e))
+            _do_inline_chat(line, session)
             continue
 
-        # --- Build mode: run the full pipeline ---
-        console.print()
-        console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
+        # --- Build mode: classify intent, then dispatch ---
+        from cli.intent import Intent, classify as _classify
 
-        session.agents_running = True
-        retry_context = ""
-        requirement_text = line
+        classified = _classify(line, has_history=bool(session.history))
 
-        try:
-            while True:
-                display = DisplayManager()
-                run_start = time.monotonic()
+        if classified.intent == Intent.CONVERSE:
+            # Off-topic or ambiguous — answer inline without switching modes
+            _do_inline_chat(line, session)
+            continue
 
-                try:
-                    state = run_pipeline(
-                        requirement=requirement_text,
-                        standard=session.standard,
-                        language=session.language,
-                        max_iterations=session.max_iterations,
-                        display=display,
-                        stage=session.stage,
-                        run_tests=session.run_tests,
-                        retry_context=retry_context,
-                    )
-                except KeyboardInterrupt:
-                    display.cleanup()
-                    console.print("\n  [yellow]Pipeline interrupted.[/]")
-                    break
-                except Exception as e:
-                    display.cleanup()
-                    show_error(str(e))
-                    break
+        if classified.intent == Intent.RERUN_CHECKER:
+            _do_rerun_checker(session)
+            continue
 
-                elapsed = time.monotonic() - run_start
+        if classified.intent == Intent.RERUN_DAFNY:
+            _do_rerun_dafny(session)
+            continue
 
-                if state is not None:
-                    session.history.append(RunRecord(
-                        requirement=requirement_text,
-                        state=state,
-                        standard=session.standard,
-                        language=session.language,
-                        stage=session.stage.value,
-                        elapsed_seconds=elapsed,
-                    ))
+        if classified.intent == Intent.RERUN_POLICY:
+            _do_rerun_policy(session)
+            continue
 
-                # Only offer retry when pipeline failed (not cancelled/error)
-                if state is None or state.status.value != "failed":
-                    break
-
-                # --- Retry prompt ---
-                error_dump = display.build_error_dump()
-                console.print()
-                console.print(
-                    "  [bold yellow]All iterations failed.[/]  "
-                    "Feed error dump into a new run?"
-                )
-
-                if not _PT_AVAILABLE:
-                    answer = console.input(
-                        "  [bold]Retry loop?[/] [dim][Y/n][/] "
-                    ).strip().lower()
-                    do_retry = answer in ("", "y", "yes")
-                else:
-                    try:
-                        answer = _pt_session.prompt(  # type: ignore[name-defined]
-                            "  Retry loop? [Y/n] ",
-                        ).strip().lower()
-                        do_retry = answer in ("", "y", "yes")
-                    except (EOFError, KeyboardInterrupt):
-                        do_retry = False
-
-                if not do_retry:
-                    break
-
-                retry_context = error_dump
-                console.print(
-                    f"  [dim]Retrying with {len(error_dump)} chars of error context …[/]"
-                )
-                console.print()
-        finally:
-            session.agents_running = False
+        # --- GENERATE: full pipeline ---
+        _do_full_pipeline(line, session, _pt_session if _PT_AVAILABLE else None)

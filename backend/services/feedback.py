@@ -35,6 +35,23 @@ def compose_feedback(
     """
     priority_parts: list[str] = []
 
+    # Compute test pass ratio to gate low-priority feedback.
+    # When most tests pass, the actor should focus on failing tests only —
+    # not rewrite working code to address cosmetic or style issues.
+    test_pass_ratio = 1.0
+    if test_result and test_result.executed and test_result.total > 0:
+        test_pass_ratio = test_result.passed / test_result.total
+
+    mostly_passing = test_pass_ratio >= 0.7
+
+    # When mostly passing, prepend a directive so the actor doesn't nuke
+    # working logic to chase low-priority feedback.
+    if mostly_passing and test_result and test_result.executed and test_result.failed > 0:
+        priority_parts.append(
+            "MOSTLY PASSING — fix ONLY the failing test(s) below. "
+            "Do NOT rewrite working logic or address style issues."
+        )
+
     # Priority 0: Actual test execution failures (highest priority — real evidence)
     if test_result and test_result.executed and test_result.failed > 0:
         failing_names = [
@@ -68,7 +85,7 @@ def compose_feedback(
                 + "; ".join(verification_result.failing_assertions[:5])
             )
 
-    # Priority 2: Critical checker issues
+    # Priority 2: Critical checker issues (always included — safety hazards)
     if checker_report and checker_report.verdict == CheckerVerdict.FAIL:
         critical = [
             i for i in checker_report.issues if i.severity == Severity.CRITICAL
@@ -79,15 +96,15 @@ def compose_feedback(
                 + "; ".join(i.description for i in critical[:3])
             )
 
-    # Priority 3: Policy violations
+    # Priority 3: Policy violations — always included (gates convergence)
     if policy_verdict and not policy_verdict.compliant:
         violations_summary = "; ".join(
             f"[{v.rule_id}] {v.description}" for v in policy_verdict.violations[:5]
         )
         priority_parts.append(f"POLICY VIOLATIONS: {violations_summary}")
 
-    # Priority 4: Non-critical checker issues
-    if checker_report:
+    # Priority 4: Non-critical checker issues — suppress when mostly passing
+    if not mostly_passing and checker_report:
         non_critical = [
             i
             for i in checker_report.issues
