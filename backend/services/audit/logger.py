@@ -81,10 +81,17 @@ class AuditLogger:
             data=data or {},
         )
 
-        # 1. Append to per-run JSONL file
+        # 1. Append to per-run JSONL file (canonical audit record)
         jsonl_path = self._log_dir / f"{run_id}.jsonl"
-        with open(jsonl_path, "a") as f:
-            f.write(entry.model_dump_json() + "\n")
+        try:
+            with open(jsonl_path, "a") as f:
+                f.write(entry.model_dump_json() + "\n")
+        except OSError as exc:
+            logger.error(
+                "AUDIT WRITE FAILED for run %s event '%s': %s — entry not persisted",
+                run_id, event_type, exc,
+            )
+            raise
 
         # 2. Insert into SQLite (skipped if DB is unavailable)
         if self._db_enabled:

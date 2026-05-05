@@ -33,8 +33,8 @@ async def test_verify_success(mock_wait, mock_exec, runner):
     # Mock the output (stdout, stderr)
     mock_wait.return_value = (b"Dafny program verifier finished with 1 verified, 0 errors\n", b"")
 
-    result = await runner.verify("method Foo() {}")
-    
+    result = await runner.verify("method Foo() ensures true {}")
+
     assert result.verified is True
     assert result.prover == "dafny"
     assert "1 verified, 0 errors" in result.solver_output
@@ -58,8 +58,8 @@ Dafny program verifier finished with 0 verified, 2 errors
 """
     mock_wait.return_value = (stdout, b"")
 
-    result = await runner.verify("method Bad() { assert false; }")
-    
+    result = await runner.verify("method Bad() ensures true { assert false; }")
+
     assert result.verified is False
     assert len(result.failing_assertions) == 2
     assert "A postcondition might not hold" in result.failing_assertions[0]
@@ -77,7 +77,7 @@ async def test_verify_timeout(mock_exec, runner):
     
     # Force wait_for to raise a TimeoutError
     with patch("backend.services.verification.dafny_runner.asyncio.wait_for", side_effect=asyncio.TimeoutError):
-        result = await runner.verify("method Infinite() {}")
+        result = await runner.verify("method Infinite() ensures true {}")
         
     assert result.verified is False
     assert "timed out" in result.solver_output
@@ -88,7 +88,7 @@ async def test_verify_timeout(mock_exec, runner):
 @patch("backend.services.verification.dafny_runner.asyncio.create_subprocess_exec", side_effect=FileNotFoundError)
 async def test_verify_binary_not_found(mock_exec, runner):
     """Test that missing binary paths (like Dafny not being installed) return a clean failure."""
-    result = await runner.verify("method NotFound() {}")
+    result = await runner.verify("method NotFound() ensures true {}")
     assert result.verified is False
     assert "Dafny binary not found" in result.solver_output
 

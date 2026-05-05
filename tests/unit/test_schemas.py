@@ -30,7 +30,7 @@ class TestCodeCandidate:
         cc = CodeCandidate(source_code="int main() { return 0; }")
         assert cc.source_code == "int main() { return 0; }"
         assert cc.dafny_spec == ""
-        assert cc.language == "C"
+        assert cc.language == "Python"
 
     def test_full(self):
         cc = CodeCandidate(

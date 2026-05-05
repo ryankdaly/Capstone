@@ -48,6 +48,7 @@ class DafnyRunner:
         self._binary = _resolve_binary(binary_path or settings.verification.binary_path)
         self._timeout = timeout or settings.verification.timeout_seconds
         self._solver_path = solver_path or settings.verification.solver_path
+        logger.debug("Dafny binary resolved to: %s", self._binary)
 
     async def verify(self, dafny_source: str) -> VerificationResult:
         """Write the Dafny source to a temp file and run verification."""
@@ -108,6 +109,7 @@ class DafnyRunner:
             )
         except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()
             return VerificationResult(
                 verified=False,
                 prover="dafny",

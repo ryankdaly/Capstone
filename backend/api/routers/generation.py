@@ -40,11 +40,14 @@ async def generate(
     formal_proof = ""
     compliance_status = False
 
-    if last_event and last_event.data.get("status") in (
-        PipelineStatus.COMPLETED.value,
-        PipelineStatus.AWAITING_APPROVAL.value,
-    ):
-        compliance_status = True
+    state = orchestrator.last_state
+    if state:
+        generated_code = state.final_code or ""
+        formal_proof = state.final_proof or ""
+        compliance_status = state.status in (
+            PipelineStatus.COMPLETED,
+            PipelineStatus.AWAITING_APPROVAL,
+        )
 
     return GenerationResponse(
         generated_code=generated_code,

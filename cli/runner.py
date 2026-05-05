@@ -93,11 +93,8 @@ async def chat_stream(message: str, on_token: Callable[[str], None]) -> str:
         ):
             chunks.append(token)
             on_token(token)
-    except Exception:
+    finally:
         await client.aclose()
-        raise
-
-    await client.aclose()
     return "".join(chunks)
 
 
