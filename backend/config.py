@@ -128,6 +128,7 @@ class PoliciesConfig(BaseModel):
 class VerificationConfig(BaseModel):
     prover: str = "dafny"
     timeout_seconds: int = 120
+    zombie_threshold_seconds: int = 30  # prompt user to kill Dafny after this many seconds
     binary_path: str = "dafny"
     solver_path: str | None = None  # e.g. /opt/homebrew/bin/z3; None = let Dafny find Z3 on PATH
 

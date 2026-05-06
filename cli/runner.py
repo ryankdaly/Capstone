@@ -49,6 +49,9 @@ async def _run_async(
     display: DisplayManager,
 ) -> PipelineState | None:
     orchestrator = _build_orchestrator()
+    # Expose the orchestrator on the display manager so the CLI can call
+    # orchestrator.cancel_dafny() if the user wants to kill a zombie process.
+    display._orchestrator = orchestrator  # type: ignore[attr-defined]
     try:
         async for event in orchestrator.run(request):
             display.handle_event(event)
@@ -245,6 +248,16 @@ async def _run_dafny_only_async(
     architect = DafnyArchitectAgent(client)
     dafny_runner = DafnyRunner()
 
+    # Create a cancel event and expose it via a stub so the display's kill
+    # watcher can call cancel_dafny() the same way it does for the orchestrator.
+    _cancel = asyncio.Event()
+
+    class _CancelStub:
+        def cancel_dafny(self) -> None:
+            _cancel.set()
+
+    display._orchestrator = _CancelStub()  # type: ignore[attr-defined]
+
     dafny_result = None
     try:
         display.handle_event(_make_event(StreamEventType.AGENT_START, "dafny_architect"))
@@ -277,7 +290,10 @@ async def _run_dafny_only_async(
     if dafny_result is not None and dafny_result.dafny_source.strip():
         try:
             display.handle_event(_make_event(StreamEventType.AGENT_START, "dafny_verifier"))
-            vr = await dafny_runner.verify(dafny_result.dafny_source)
+            vr = await dafny_runner.verify(
+                dafny_result.dafny_source,
+                cancel_event=_cancel,
+            )
             display.handle_event(_make_event(
                 StreamEventType.AGENT_OUTPUT, "dafny_verifier",
                 {

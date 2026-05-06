@@ -3,6 +3,7 @@
 Renders agent activity with live spinners, syntax-highlighted code,
 color-coded verdicts, and a final summary panel.
 """
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -161,18 +162,25 @@ class _StreamingPanel:
 
     Token chunks are appended via ``add_token()`` from the event handler; the
     Rich refresh thread calls ``__rich__()`` at 12 fps to pick up changes.
+
+    When ``zombie_mode`` is set to True, the panel switches to a prominent
+    warning style indicating the process may be stuck and offering a kill
+    option.
     """
 
     _DOT_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _VERB_INTERVAL = 5.0
 
-    def __init__(self, agent: str) -> None:
+    def __init__(self, agent: str, zombie_threshold: float = 30.0) -> None:
         name, color = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "white"))
         self._name = name
         self._color = color
+        self._agent = agent
         self._verbs = _AGENT_VERBS.get(agent, ["working"])
         self._start = time.monotonic()
         self._chunks: list[str] = []  # GIL-safe for CPython append + read
+        self._zombie_threshold = zombie_threshold
+        self.zombie_mode = False  # set by the zombie watcher thread
 
     def add_token(self, token: str) -> None:
         self._chunks.append(token)
@@ -193,6 +201,44 @@ class _StreamingPanel:
             visible_text = full_text
 
         body = _render_stream_text(full_text, visible_text)
+
+        # --- Zombie warning ---
+        # Auto-detect zombie state from elapsed time for agents that are
+        # pure subprocess waits (dafny_verifier).  For LLM-streaming agents
+        # the threshold is ignored since tokens are visibly flowing.
+        is_dafny_agent = self._agent in ("dafny_verifier", "checker_dafny")
+        zombie_active = self.zombie_mode or (
+            is_dafny_agent and elapsed >= self._zombie_threshold and not self._chunks
+        )
+
+        if zombie_active:
+            # Build a prominent zombie warning
+            warn = Text()
+            warn.append("\n")
+            warn.append("  ⚠  ", style="bold yellow")
+            warn.append("Dafny may be stuck  ", style="bold yellow")
+            warn.append(f"({elapsed:.0f}s elapsed)\n", style="dim yellow")
+            warn.append("  Press ", style="yellow")
+            warn.append("k", style="bold white on red")
+            warn.append(" to kill Dafny  ", style="yellow")
+            warn.append("or ", style="yellow")
+            warn.append("Ctrl+C", style="bold white on red")
+            warn.append(" to cancel the entire pipeline\n", style="yellow")
+            body = Group(body, warn) if full_text else warn
+
+            title = Text()
+            title.append(f" {frame} ", style="bold yellow")
+            title.append(self._name, style="bold yellow")
+            title.append(" — ", style="yellow")
+            title.append("POSSIBLY ZOMBIED", style="bold blink red")
+            title.append(f"  {elapsed:.1f}s", style="dim")
+
+            return Panel(
+                body,
+                title=title,
+                border_style="yellow",
+                padding=(0, 1),
+            )
 
         title = Text()
         title.append(f" {frame} ", style=f"bold {self._color}")
@@ -273,6 +319,11 @@ class DisplayManager:
         # Live panel — active between AGENT_START and AGENT_OUTPUT
         self._live: Live | None = None
         self._streaming_panel: _StreamingPanel | None = None
+        # Orchestrator reference — set by runner.py so we can cancel Dafny
+        self._orchestrator: Any = None
+        # Zombie kill watcher thread
+        self._kill_watcher_stop = threading.Event()
+        self._kill_watcher_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Live panel helpers
@@ -281,7 +332,13 @@ class DisplayManager:
     def _start_spinner(self, agent: str) -> None:
         """Start a live streaming panel for the given agent."""
         self._stop_spinner()
-        self._streaming_panel = _StreamingPanel(agent)
+        # Load zombie threshold from config
+        try:
+            from backend.config import settings as _settings
+            zombie_threshold = float(_settings.verification.zombie_threshold_seconds)
+        except Exception:
+            zombie_threshold = 30.0
+        self._streaming_panel = _StreamingPanel(agent, zombie_threshold=zombie_threshold)
         self._live = Live(
             self._streaming_panel,
             refresh_per_second=12,
@@ -296,10 +353,77 @@ class DisplayManager:
             self._live.stop()
             self._live = None
         self._streaming_panel = None
+        self._stop_kill_watcher()
 
     def cleanup(self) -> None:
         """Force-stop any running live panel. Call from exception handlers."""
         self._stop_spinner()
+        self._stop_kill_watcher()
+
+    # ------------------------------------------------------------------
+    # Dafny zombie kill watcher — background thread that listens for 'k'
+    # ------------------------------------------------------------------
+
+    def _start_kill_watcher(self) -> None:
+        """Start a background thread that listens for 'k' to kill Dafny."""
+        self._stop_kill_watcher()
+        self._kill_watcher_stop.clear()
+        self._kill_watcher_thread = threading.Thread(
+            target=self._kill_watcher_loop,
+            daemon=True,
+            name="dafny-kill-watcher",
+        )
+        self._kill_watcher_thread.start()
+
+    def _stop_kill_watcher(self) -> None:
+        """Signal the kill watcher thread to stop."""
+        self._kill_watcher_stop.set()
+        if self._kill_watcher_thread is not None:
+            self._kill_watcher_thread.join(timeout=0.5)
+            self._kill_watcher_thread = None
+
+    def _kill_watcher_loop(self) -> None:
+        """Thread target: poll stdin for 'k' keypress using raw terminal mode.
+
+        Reads single characters without requiring Enter.  Falls back to a no-op
+        on platforms where raw mode is unavailable (Windows without msvcrt, etc.).
+        """
+        import sys
+        try:
+            import tty
+            import termios
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)  # single-char reads, no echo
+                while not self._kill_watcher_stop.is_set():
+                    # Use select to avoid blocking forever
+                    import select
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.25)
+                    if rlist:
+                        ch = sys.stdin.read(1)
+                        if ch.lower() == "k":
+                            self._do_kill_dafny()
+                            break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            # Raw mode unavailable (e.g. piped stdin, Windows) — degrade
+            # gracefully.  The user can still Ctrl+C to cancel.
+            pass
+
+    def _do_kill_dafny(self) -> None:
+        """Kill the Dafny process via the orchestrator's cancel event."""
+        if self._orchestrator is not None and hasattr(self._orchestrator, "cancel_dafny"):
+            self._orchestrator.cancel_dafny()
+            # Update the spinner panel to show it was killed
+            if self._streaming_panel is not None:
+                self._streaming_panel.zombie_mode = False
+                self._streaming_panel._chunks.append("\n[Dafny killed by user]")
+        else:
+            # Fallback: no orchestrator reference — log a warning
+            pass
 
     def handle_event(self, event: StreamEvent) -> None:
         """Route a stream event to the appropriate display method."""
@@ -329,9 +453,16 @@ class DisplayManager:
             # Start a streaming panel labelled "checker_dafny".
             console.print()
             self._start_spinner("checker_dafny")
+            # Start kill watcher so user can press 'k' during Dafny
+            self._start_kill_watcher()
             return
         if agent == "dafny_verifier":
-            # Panel already started by the checker AGENT_START — skip.
+            # If the panel was already started by checker, just start the
+            # kill watcher.  Otherwise start a fresh panel (standalone run).
+            if self._streaming_panel is None:
+                console.print()
+                self._start_spinner("dafny_verifier")
+            self._start_kill_watcher()
             return
         if agent == "test_runner":
             self._start_spinner("test_runner")

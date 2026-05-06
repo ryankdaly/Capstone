@@ -13,6 +13,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 from backend.api.schemas.agents import VerificationResult
 from backend.config import settings
@@ -44,13 +45,35 @@ class DafnyRunner:
         binary_path: str | None = None,
         timeout: int | None = None,
         solver_path: str | None = None,
+        zombie_threshold: int | None = None,
     ) -> None:
         self._binary = _resolve_binary(binary_path or settings.verification.binary_path)
         self._timeout = timeout or settings.verification.timeout_seconds
         self._solver_path = solver_path or settings.verification.solver_path
+        self._zombie_threshold = (
+            zombie_threshold
+            if zombie_threshold is not None
+            else settings.verification.zombie_threshold_seconds
+        )
 
-    async def verify(self, dafny_source: str) -> VerificationResult:
-        """Write the Dafny source to a temp file and run verification."""
+    async def verify(
+        self,
+        dafny_source: str,
+        cancel_event: asyncio.Event | None = None,
+        on_zombie: Callable[[], None] | None = None,
+    ) -> VerificationResult:
+        """Write the Dafny source to a temp file and run verification.
+
+        Parameters
+        ----------
+        cancel_event:
+            If set while Dafny is running, the subprocess is killed
+            immediately and a "killed by user" result is returned.
+        on_zombie:
+            Called once when the Dafny process has been running longer than
+            ``zombie_threshold_seconds``.  The CLI uses this to display a
+            "press Ctrl+C to kill" prompt.
+        """
         if not dafny_source.strip():
             return VerificationResult(
                 verified=False,
@@ -77,14 +100,23 @@ class DafnyRunner:
             spec_path = Path(f.name)
 
         try:
-            result = await self._run_dafny(spec_path)
+            result = await self._run_dafny(
+                spec_path,
+                cancel_event=cancel_event,
+                on_zombie=on_zombie,
+            )
         finally:
             spec_path.unlink(missing_ok=True)
 
         result.execution_time_seconds = round(time.monotonic() - start, 2)
         return result
 
-    async def _run_dafny(self, spec_path: Path) -> VerificationResult:
+    async def _run_dafny(
+        self,
+        spec_path: Path,
+        cancel_event: asyncio.Event | None = None,
+        on_zombie: Callable[[], None] | None = None,
+    ) -> VerificationResult:
         cmd = [self._binary, "verify", str(spec_path)]
         if self._solver_path:
             cmd += ["--solver-path", self._solver_path]
@@ -95,9 +127,6 @@ class DafnyRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout
-            )
         except FileNotFoundError:
             logger.warning("Dafny binary not found at %s", self._binary)
             logger.warning("Spec Path is %s", spec_path)
@@ -106,13 +135,63 @@ class DafnyRunner:
                 prover="dafny",
                 solver_output=f"Dafny binary not found: {self._binary}. Install Dafny to enable formal verification.",
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            return VerificationResult(
-                verified=False,
-                prover="dafny",
-                solver_output=f"Verification timed out after {self._timeout}s",
-            )
+
+        # Poll the process so we can react to zombie threshold and cancel events
+        zombie_fired = False
+        start = time.monotonic()
+
+        while True:
+            # Check for user-requested cancellation
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info("Dafny process killed by user (cancel_event set)")
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                return VerificationResult(
+                    verified=False,
+                    prover="dafny",
+                    solver_output="Dafny verification killed by user.",
+                    failing_assertions=["User cancelled Dafny verification"],
+                )
+
+            # Fire zombie callback once after threshold
+            elapsed = time.monotonic() - start
+            if (
+                not zombie_fired
+                and on_zombie is not None
+                and elapsed >= self._zombie_threshold
+            ):
+                zombie_fired = True
+                on_zombie()
+
+            # Check hard timeout
+            if elapsed >= self._timeout:
+                logger.warning("Dafny timed out after %ds", self._timeout)
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                return VerificationResult(
+                    verified=False,
+                    prover="dafny",
+                    solver_output=f"Verification timed out after {self._timeout}s",
+                )
+
+            # Poll: wait up to 1s for the process to exit
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+                # Process exited — break out of the poll loop
+                break
+            except asyncio.TimeoutError:
+                # Process still running — continue polling
+                continue
+
+        # Process has finished — read stdout and stderr
+        stdout_bytes = await proc.stdout.read() if proc.stdout else b""
+        stderr_bytes = await proc.stderr.read() if proc.stderr else b""
 
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")

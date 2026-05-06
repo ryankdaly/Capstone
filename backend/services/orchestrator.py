@@ -7,6 +7,7 @@ state machine that gives total control over the feedback loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -87,6 +88,15 @@ class PipelineOrchestrator:
 
         # Exposed after run() completes — the CLI reads this.
         self.last_state: PipelineState | None = None
+
+        # Dafny cancellation — set by cancel_dafny() to kill a zombie process.
+        self._dafny_cancel: asyncio.Event = asyncio.Event()
+        # True while Dafny verifier subprocess is running (read by display layer).
+        self.dafny_running: bool = False
+
+    def cancel_dafny(self) -> None:
+        """Signal the in-flight Dafny subprocess to terminate immediately."""
+        self._dafny_cancel.set()
 
     async def run(
         self, request: PipelineRequest
@@ -248,7 +258,13 @@ class PipelineOrchestrator:
                             "Iteration %d: trying cached Dafny spec (skip architect).", i,
                         )
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
-                        _cache_vr = await self._dafny.verify(_cached_dafny_spec)
+                        self._dafny_cancel.clear()
+                        self.dafny_running = True
+                        _cache_vr = await self._dafny.verify(
+                            _cached_dafny_spec,
+                            cancel_event=self._dafny_cancel,
+                        )
+                        self.dafny_running = False
                         yield self._event(
                             run_id, StreamEventType.AGENT_OUTPUT, "dafny_verifier",
                             {
@@ -333,7 +349,13 @@ class PipelineOrchestrator:
 
                         # ── Dafny Verifier ────────────────────────────────────────────
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
-                        _cycle_verification = await self._dafny.verify(code_candidate.dafny_spec)
+                        self._dafny_cancel.clear()
+                        self.dafny_running = True
+                        _cycle_verification = await self._dafny.verify(
+                            code_candidate.dafny_spec,
+                            cancel_event=self._dafny_cancel,
+                        )
+                        self.dafny_running = False
                         verification_result = _cycle_verification
 
                         yield self._event(
