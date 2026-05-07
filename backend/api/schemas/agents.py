@@ -8,9 +8,9 @@ the model literally cannot produce malformed output.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -30,9 +30,10 @@ class CodeCandidate(BaseModel):
         description="Actor's chain-of-thought explaining design decisions",
     )
     language: str = Field(default="Python", description="Target language of generated code")
-    annotations: dict[str, str] = Field(
+    annotations: dict[str, Any] = Field(
         default_factory=dict,
-        description="Metadata annotations (e.g., traceability tags)",
+        description="Metadata annotations (e.g., traceability tags). Values may be "
+                    "strings, lists, or nested dicts — models use these freely.",
     )
 
 
@@ -66,6 +67,20 @@ class Issue(BaseModel):
     severity: Severity = Severity.MAJOR
     line_reference: Optional[str] = None
     suggested_fix: str = ""
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _coerce_severity(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return _SEVERITY_ALIAS.get(v.lower(), v)
+        return v
+
+    @field_validator("line_reference", mode="before")
+    @classmethod
+    def _coerce_line_reference(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        return str(v)
 
 
 class CheckerVerdict(str, Enum):
@@ -111,11 +126,25 @@ class RiskLevel(str, Enum):
     CRITICAL = "critical"
 
 
+_SEVERITY_ALIAS: dict[str, str] = {
+    "low": "minor",
+    "medium": "major",
+    "high": "critical",
+}
+
+
 class PolicyViolation(BaseModel):
     rule_id: str = Field(..., description="Standard clause reference (e.g., DO-178C §6.3.1)")
     description: str
     severity: Severity = Severity.MAJOR
     standard: str = ""
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _coerce_severity(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return _SEVERITY_ALIAS.get(v.lower(), v)
+        return v
 
 
 class PolicyVerdict(BaseModel):
@@ -126,6 +155,22 @@ class PolicyVerdict(BaseModel):
     violations: list[PolicyViolation] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     reasoning_trace: str = ""
+
+    @field_validator("recommendations", mode="before")
+    @classmethod
+    def _coerce_recommendation_dicts(cls, v: Any) -> list[str]:
+        if not isinstance(v, list):
+            return v
+        out = []
+        for item in v:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                parts = [str(item[k]) for k in ("rule_id", "description") if k in item]
+                out.append(": ".join(parts) if parts else str(item))
+            else:
+                out.append(str(item))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +207,7 @@ class FeedbackMessage(BaseModel):
     checker_feedback: Optional[CheckerReport] = None
     verification_feedback: Optional[VerificationResult] = None
     policy_feedback: Optional[PolicyVerdict] = None
+    test_feedback: Optional["TestRunResult"] = None
     priority_summary: str = Field(
         default="",
         description="Orchestrator-composed summary prioritizing critical failures",

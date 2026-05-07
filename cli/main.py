@@ -18,6 +18,36 @@ import typer
 from rich.console import Console
 
 
+def _load_hpema_env() -> None:
+    """Load API keys from ~/.hpema/.env into os.environ on every startup.
+
+    Keys already set in the shell environment take priority (no overwrite).
+    Never raises — a missing or malformed .env file is silently ignored.
+    """
+    import re as _re
+    try:
+        from backend.config import hpema_home
+        env_file = hpema_home() / ".env"
+        if not env_file.exists():
+            return
+        for line in env_file.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            stripped = stripped.removeprefix("export ")
+            m = _re.match(r'^([A-Z_][A-Z0-9_]*)=(.+)', stripped)
+            if m:
+                key = m.group(1)
+                val = m.group(2).strip('"\'')
+                if key not in os.environ:
+                    os.environ[key] = val
+    except Exception:
+        pass
+
+
+_load_hpema_env()
+
+
 def _configure_logging() -> None:
     """Route all log output to a file; keep the terminal clean.
 

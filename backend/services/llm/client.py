@@ -1,9 +1,11 @@
 """Async OpenAI-compatible LLM client.
 
-Single wrapper used by all agents. Supports constrained decoding via
-response_format (guided_json) when the server supports it (vLLM / OpenAI).
-Falls back to prompt-only JSON enforcement for providers that don't support
-the json_schema response_format (Groq, Anthropic, older endpoints, etc.).
+Single wrapper used by all agents.  Capability flags (constrained decoding,
+system role, thinking kwargs) are read from the family profile declared in
+hpema_config.yaml — not discovered at runtime.  This eliminates wasted API
+calls caused by sending wrong kwargs to models that reject them.
+
+See backend/services/llm/profiles.py for the family registry.
 """
 
 from __future__ import annotations
@@ -14,34 +16,23 @@ import logging
 import re
 from typing import Any, AsyncGenerator, Type
 
-from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
 from pydantic import BaseModel, ValidationError
 
 from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
+from backend.services.llm.profiles import ModelFamilyProfile, get_profile
 
 logger = logging.getLogger(__name__)
 
-# Error substrings that indicate the provider rejected the response_format param.
-_CONSTRAINED_DECODING_ERRORS = (
-    "response_format",
-    "json_schema",
-    "guided_json",
-    "unsupported",
-    "not supported",
-    "invalid_request_error",
-)
-
-# Error substrings that indicate the provider doesn't support the system role
-# (e.g. Gemma family models via NVIDIA API, some Mistral endpoints).
-_NO_SYSTEM_ROLE_ERRORS = (
-    "system role not supported",
-    "system role is not supported",
-    "does not support system",
-    "system messages are not supported",
-)
-
 # 400 errors that are transient platform failures, not capability gaps.
-# These should be retried like a 500, not treated as permanent incompatibilities.
+# Retried like 500s — do NOT treat as permanent profile mismatches.
 _TRANSIENT_REQUEST_ERRORS = (
     "degraded",
     "function cannot be invoked",
@@ -51,15 +42,17 @@ _TRANSIENT_REQUEST_ERRORS = (
 
 
 class LLMClient:
-    """Async client that talks to any OpenAI-compatible endpoint."""
+    """Async client that talks to any OpenAI-compatible endpoint.
+
+    Capability flags (constrained decoding, system role, thinking kwargs) are
+    read from the model's family profile — not discovered at runtime.  This
+    eliminates wasted API calls caused by sending wrong kwargs to models that
+    reject them.  Transient errors (500, 429, DEGRADED 400s) are still retried.
+    """
 
     def __init__(self, registry: ModelRegistry | None = None) -> None:
         self._registry = registry or ModelRegistry()
         self._clients: dict[str, AsyncOpenAI] = {}
-        # Track capability gaps per endpoint so we skip the overhead of a
-        # failing first attempt on subsequent calls to the same endpoint.
-        self._no_constrained_decoding: set[str] = set()
-        self._no_system_role: set[str] = set()
 
     def _get_client(self, model: ResolvedModel) -> AsyncOpenAI:
         """Lazily create one AsyncOpenAI client per unique endpoint."""
@@ -69,191 +62,217 @@ class LLMClient:
                 api_key=model.api_key or "unused",
                 # Explicit timeouts: fail fast on connection problems, allow
                 # up to 3 min for large models to stream their first token.
-                # Without this httpx defaults to 600 s, making hangs invisible.
                 timeout=180.0,
             )
         return self._clients[model.endpoint]
 
-    def _messages(self, endpoint: str, system_prompt: str, user_prompt: str) -> list[dict]:
-        """Build the messages list for a chat request.
+    # ── Profile helpers ──────────────────────────────────────────────────────
 
-        For endpoints that don't support the system role (e.g. Gemma via
-        NVIDIA API), the system content is prepended to the first user
-        message so the model still receives its full instructions.
+    def _messages(
+        self,
+        profile: ModelFamilyProfile,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> list[dict]:
+        """Build messages list according to the family profile.
+
+        For families that don't support the system role (Gemma 3), system
+        content is prepended to the first user message.
         """
-        if endpoint in self._no_system_role:
+        if not profile.supports_system_role:
             return [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-    async def aclose(self) -> None:
-        """Close all httpx connection pools while the event loop is still open.
+    def _thinking_kwargs(
+        self,
+        resolved: ResolvedModel,
+        profile: ModelFamilyProfile,
+    ) -> tuple[dict, dict]:
+        """Return (extra_body, extra_params) for thinking based on profile + config.
 
-        Must be called before asyncio.run() returns. Without this, Python 3.10+
-        prints 'Event loop is closed' noise when the GC finalizes the
-        AsyncOpenAI clients after the loop has already been shut down.
+        extra_body  — merged into the API call's extra_body field
+        extra_params — merged into top-level API call kwargs (e.g. reasoning_effort)
         """
+        mode = profile.thinking_mode
+        want = resolved.enable_thinking
+
+        if mode in ("none", "always"):
+            # "none": no thinking capability
+            # "always": thinks natively — no control kwargs needed
+            extra_body: dict = {}
+            extra_params: dict = {}
+        elif mode == "toggle-off":
+            # Off by default; activate only when explicitly requested
+            if want:
+                extra_body = dict(profile.thinking_on_extra_body)
+                extra_params = dict(profile.thinking_on_extra_params)
+            else:
+                extra_body = {}
+                extra_params = {}
+        elif mode == "toggle-on":
+            # On by default; must explicitly disable if not wanted
+            if want:
+                extra_body = dict(profile.thinking_on_extra_body)
+                extra_params = dict(profile.thinking_on_extra_params)
+            else:
+                extra_body = dict(profile.thinking_off_extra_body)
+                extra_params = dict(profile.thinking_off_extra_params)
+        else:
+            extra_body = {}
+            extra_params = {}
+
+        # Merge model-level extra_body overrides on top (never mutates profile)
+        if resolved.extra_body:
+            extra_body = {**extra_body, **resolved.extra_body}
+
+        return extra_body, extra_params
+
+    def _build_kwargs(
+        self,
+        resolved: ResolvedModel,
+        profile: ModelFamilyProfile,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: type[BaseModel] | None,
+        temperature: float,
+        max_tokens: int,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """Assemble the full kwargs dict for one API call using the family profile."""
+        use_constrained = (
+            response_schema is not None and profile.supports_json_schema
+        )
+
+        eff_system = (
+            system_prompt + _json_prompt_suffix(response_schema)
+            if response_schema and not use_constrained
+            else system_prompt
+        )
+
+        extra_body, extra_params = self._thinking_kwargs(resolved, profile)
+
+        max_tok_key = "max_completion_tokens" if profile.uses_max_completion_tokens else "max_tokens"
+        kwargs: dict[str, Any] = {
+            "model": resolved.model,
+            "messages": self._messages(profile, eff_system, user_prompt),
+            "temperature": temperature,
+            max_tok_key: max_tokens,
+            **extra_params,
+        }
+        if stream:
+            kwargs["stream"] = True
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if use_constrained:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema.__name__,
+                    "schema": response_schema.model_json_schema(),
+                },
+            }
+
+        logger.info(
+            "LLM call | role=%s family=%s model=%s constrained=%s "
+            "thinking_mode=%s enable_thinking=%s",
+            resolved.model.split("/")[-1],  # short name
+            resolved.family,
+            resolved.model,
+            use_constrained,
+            profile.thinking_mode,
+            resolved.enable_thinking,
+        )
+        return kwargs
+
+    # ── Transient-error retry ────────────────────────────────────────────────
+
+    async def _api_call(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
+        """Execute one chat completion, retrying only on transient errors.
+
+        Retries:
+          - InternalServerError (500)
+          - RateLimitError (429)
+          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS
+            (NVIDIA NIM "DEGRADED function", platform unavailability)
+
+        All other 400s are re-raised immediately — they indicate a profile
+        misconfiguration, not a transient failure.
+        """
+        # 5 → 10 → 30 → 30 → … up to 8 retries (~3.5 min total back-off ceiling)
+        _delays = [5, 10, 30, 30, 30, 30, 30, 30]
+        max_attempts = len(_delays) + 1
+        for attempt in range(max_attempts):
+            try:
+                return await client.chat.completions.create(**kwargs)
+            except (APITimeoutError, APIConnectionError) as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                delay = _delays[attempt]
+                print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] {type(exc).__name__}: {exc}", flush=True)
+                await asyncio.sleep(delay)
+            except (InternalServerError, RateLimitError) as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                delay = _delays[attempt]
+                print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] {type(exc).__name__}: {str(exc)[:80]}", flush=True)
+                await asyncio.sleep(delay)
+            except BadRequestError as exc:
+                if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
+                    if attempt == max_attempts - 1:
+                        raise
+                    delay = _delays[attempt]
+                    print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] transient 400: {str(exc)[:80]}", flush=True)
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+
+    # ── Public interface ─────────────────────────────────────────────────────
+
+    async def aclose(self) -> None:
+        """Close all httpx connection pools (call before event loop shuts down)."""
         for client in self._clients.values():
             await client.close()
         self._clients.clear()
-
-    async def _api_call(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
-        """Execute one chat completion, retrying on transient server errors.
-
-        Retries on:
-          - InternalServerError (500): EngineCore crash, vLLM restart
-          - RateLimitError (429): upstream throttling
-          - BadRequestError (400) matching _TRANSIENT_REQUEST_ERRORS: NVIDIA NIM
-            "DEGRADED function" and similar platform-unavailability messages
-
-        Genuine 400s (wrong response_format, unsupported system role) do NOT
-        match _TRANSIENT_REQUEST_ERRORS and are re-raised immediately so the
-        outer capability-detection loop in generate() can handle them.
-        """
-        delays = [5, 15]  # seconds between attempts 1→2 and 2→3
-        for attempt, delay in enumerate([-1] + delays):  # attempt 0 has no pre-sleep
-            if delay >= 0:
-                logger.warning(
-                    "Transient API error — retrying in %ds (attempt %d/3)...",
-                    delay, attempt + 1,
-                )
-                await asyncio.sleep(delay)
-            try:
-                return await client.chat.completions.create(**kwargs)
-            except (InternalServerError, RateLimitError) as exc:
-                if attempt == len(delays):
-                    raise
-                logger.warning("API error (%s): %s", type(exc).__name__, exc)
-            except BadRequestError as exc:
-                # Some providers (NVIDIA NIM) return 400 for transient platform
-                # failures ("DEGRADED function cannot be invoked"). These are not
-                # capability gaps — retry them like a 500. Genuine 400s (wrong
-                # response_format, unsupported system role) do NOT match these
-                # patterns and are re-raised immediately for the outer loop.
-                if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
-                    if attempt == len(delays):
-                        raise
-                    logger.warning("Transient 400 from API (%s): %s", type(exc).__name__, exc)
-                else:
-                    raise
 
     async def generate(
         self,
         role: str,
         system_prompt: str,
         user_prompt: str,
-        response_schema: Type[BaseModel] | None = None,
+        response_schema: type[BaseModel] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 4096,
         extra_params: dict[str, Any] | None = None,
     ) -> str:
-        """Send a chat completion request and return the raw response text.
+        """Send a chat completion and return the raw response text.
 
-        Parameters
-        ----------
-        role : str
-            Agent role name (actor, checker, policy) — resolved via registry.
-        system_prompt : str
-            System message for the agent.
-        user_prompt : str
-            User/task message.
-        response_schema : Type[BaseModel] | None
-            If provided, requests constrained decoding so the model's output
-            matches the schema. Falls back to prompt-only JSON if the provider
-            doesn't support response_format=json_schema.
-        temperature : float
-            Sampling temperature.
-        max_tokens : int
-            Max tokens to generate.
-        extra_params : dict | None
-            Additional params passed to the API (e.g., vLLM-specific flags).
+        Kwargs are built from the model's family profile — no runtime discovery.
         """
         resolved = self._registry.get(role)
+        profile = get_profile(resolved.family)
         client = self._get_client(resolved)
-        endpoint = resolved.endpoint
 
-        kwargs_base: dict[str, Any] = {
-            "model": resolved.model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if extra_params:
-            kwargs_base.update(extra_params)
-        # Model-level extra_body (e.g. chat_template_kwargs for NVIDIA NIM) is
-        # passed via the openai SDK's extra_body so it lands in the JSON payload
-        # without the SDK stripping unknown fields.
-        if resolved.extra_body:
-            kwargs_base["extra_body"] = resolved.extra_body
-
-        # Retry loop — each pass may discover one new capability gap and adapt.
-        # At most 3 attempts: (1) preferred mode, (2) one fallback, (3) both fallbacks.
-        for _attempt in range(3):
-            use_constrained = (
-                response_schema is not None
-                and endpoint not in self._no_constrained_decoding
-            )
-
-            # In prompt-only mode inject the schema into the system prompt so
-            # the model knows what structure to produce without response_format.
-            eff_system = (
-                system_prompt + _json_prompt_suffix(response_schema)
-                if response_schema and not use_constrained
-                else system_prompt
-            )
-
-            kwargs: dict[str, Any] = {
-                **kwargs_base,
-                "messages": self._messages(endpoint, eff_system, user_prompt),
-            }
-
-            if use_constrained:
-                kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_schema.__name__,
-                        "schema": response_schema.model_json_schema(),
-                    },
-                }
-
-            logger.info(
-                "LLM request to %s [%s] model=%s constrained=%s no_system_role=%s",
-                role, endpoint, resolved.model, use_constrained,
-                endpoint in self._no_system_role,
-            )
-
-            try:
-                response = await self._api_call(client, kwargs)
-                content = response.choices[0].message.content or ""
-                content = _strip_think_tags(content)
-                logger.debug("LLM response from %s: %s chars", role, len(content))
-                return content
-            except BadRequestError as exc:
-                err_lower = str(exc).lower()
-                if any(kw in err_lower for kw in _NO_SYSTEM_ROLE_ERRORS):
-                    logger.info(
-                        "Endpoint %s does not support system role — "
-                        "retrying with system content merged into user message.",
-                        endpoint,
-                    )
-                    self._no_system_role.add(endpoint)
-                elif response_schema is not None and any(
-                    kw in err_lower for kw in _CONSTRAINED_DECODING_ERRORS
-                ):
-                    logger.info(
-                        "Endpoint %s does not support constrained decoding — "
-                        "retrying with prompt-only JSON enforcement.",
-                        endpoint,
-                    )
-                    self._no_constrained_decoding.add(endpoint)
-                else:
-                    raise
-
-        raise RuntimeError(
-            f"Request to {endpoint} failed after 3 fallback attempts. "
-            "Model may not be compatible with this pipeline."
+        kwargs = self._build_kwargs(
+            resolved, profile, system_prompt, user_prompt,
+            response_schema, temperature, max_tokens,
         )
+        if extra_params:
+            kwargs.update(extra_params)
+
+        response = await self._api_call(client, kwargs)
+        content = response.choices[0].message.content or ""
+
+        # Some reasoning models (o-series, step) route output through
+        # reasoning_content when constrained decoding is active.
+        if not content and response.choices:
+            msg = response.choices[0].message
+            content = getattr(msg, "reasoning_content", None) or ""
+
+        logger.debug("LLM response from %s: %d chars", role, len(content))
+        return content
 
     def parse_structured(self, raw: str, response_model: Type[BaseModel], role: str = "?") -> BaseModel:
         """Parse raw LLM text into a Pydantic model.
@@ -332,7 +351,7 @@ class LLMClient:
         role: str,
         system_prompt: str,
         user_prompt: str,
-        response_schema: Type[BaseModel] | None = None,
+        response_schema: type[BaseModel] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 4096,
         extra_params: dict[str, Any] | None = None,
@@ -342,71 +361,88 @@ class LLMClient:
         Yields raw string chunks as they arrive from the model. Callers should
         accumulate them and call ``parse_structured()`` on the joined text.
 
-        Graceful fallback: if the endpoint does not support streaming (or the
-        streaming call fails for any reason), this falls back to a single
-        blocking ``generate()`` call and yields the full response as one chunk.
-        Models without streaming support therefore behave identically from the
-        caller's perspective — they just don't produce intermediate tokens.
+        Graceful fallback: if the streaming call fails for any reason, falls
+        back to a single blocking ``generate()`` call and yields the full
+        response as one chunk.  Models without streaming support behave
+        identically from the caller's perspective.
         """
         resolved = self._registry.get(role)
+        profile = get_profile(resolved.family)
         client = self._get_client(resolved)
-        endpoint = resolved.endpoint
 
-        kwargs_base: dict[str, Any] = {
-            "model": resolved.model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
+        kwargs = self._build_kwargs(
+            resolved, profile, system_prompt, user_prompt,
+            response_schema, temperature, max_tokens, stream=True,
+        )
         if extra_params:
-            kwargs_base.update(extra_params)
-        if resolved.extra_body:
-            kwargs_base["extra_body"] = resolved.extra_body
+            kwargs.update(extra_params)
 
         use_constrained = (
-            response_schema is not None
-            and endpoint not in self._no_constrained_decoding
+            response_schema is not None and profile.supports_json_schema
         )
-        eff_system = (
-            system_prompt + _json_prompt_suffix(response_schema)
-            if response_schema and not use_constrained
-            else system_prompt
-        )
-        kwargs: dict[str, Any] = {
-            **kwargs_base,
-            "messages": self._messages(endpoint, eff_system, user_prompt),
-        }
-        if use_constrained:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": response_schema.__name__,
-                    "schema": response_schema.model_json_schema(),
-                },
-            }
 
-        # Attempt streaming — fall back to non-streaming on any failure.
+        # Attempt streaming — fall back on any error (profile mis-config, network, etc.)
         stream_obj = None
         try:
             stream_obj = await client.chat.completions.create(**kwargs)
         except Exception as exc:
             logger.warning(
-                "Streaming request failed for %s (%s: %s) — falling back.",
+                "Streaming request failed for %s (%s: %s) — falling back to "
+                "blocking generate(). Check family profile if this is a 400.",
                 role, type(exc).__name__, exc,
             )
 
         if stream_obj is not None:
+            detector = _ThinkLoopDetector(role)
+            yielded_any = False
             try:
                 async for chunk in stream_obj:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-                return  # streaming complete
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    # Primary content field (all standard models)
+                    token = delta.content or ""
+
+                    # Reasoning models may route output through reasoning_content
+                    # when response_format=json_schema is active — delta.content
+                    # stays empty for the whole stream.  Accumulate reasoning tokens
+                    # so the empty-stream fallback is not triggered, but only yield
+                    # them if no regular content ever arrives (they are raw reasoning,
+                    # not structured output).
+                    if not token:
+                        token = getattr(delta, "reasoning_content", None) or ""
+
+                    if token:
+                        detector.feed(token)  # raises ThinkLoopError if loop found
+                        yielded_any = True
+                        yield token
+            except ThinkLoopError:
+                logger.warning(
+                    "Think loop detected for %s — aborting stream and re-raising "
+                    "for retry.",
+                    role,
+                )
+                raise  # propagate up through run_streaming → orchestrator retry
             except Exception as exc:
                 logger.warning(
                     "Streaming interrupted for %s (%s: %s) — falling back.",
                     role, type(exc).__name__, exc,
                 )
                 # Fall through to non-streaming fallback below.
+            else:
+                if not yielded_any and use_constrained:
+                    # Model returned HTTP 200 but emitted zero content tokens
+                    # while constrained decoding was active — silent capability gap.
+                    # Fall through to prompt-only non-streaming fallback.
+                    logger.info(
+                        "Empty stream with constrained decoding for %s — "
+                        "falling back to prompt-only non-streaming call. "
+                        "Consider setting supports_json_schema=False in the profile.",
+                        role,
+                    )
+                else:
+                    return  # streaming completed successfully
 
         # Non-streaming fallback: yields the full response as one chunk.
         logger.info("Using non-streaming fallback for %s", role)
@@ -420,6 +456,97 @@ class LLMClient:
             extra_params=extra_params,
         )
         yield text
+
+
+class ThinkLoopError(RuntimeError):
+    """Raised when a streaming model is detected to be stuck in a think loop.
+
+    This is a soft, retryable failure — the orchestrator retry logic will
+    start a fresh request which re-initialises the KV cache and typically
+    breaks the loop.
+    """
+
+
+class _ThinkLoopDetector:
+    """Monitors a raw token stream for runaway <think> loops.
+
+    Two independent signals, either sufficient to abort:
+
+    1. **Hard cap** — total chars accumulated inside ``<think>`` blocks
+       exceeds ``THINK_CHAR_CAP``.  Catches slow but genuine loops that
+       would otherwise run to the model's full ``max_tokens`` budget.
+
+    2. **Repetition detector** — scans the most recent ``SCAN_WINDOW``
+       chars of think content for any ``SNIPPET_LEN``-char substring that
+       appears at least ``REPEAT_THRESHOLD`` times.  Catches tight
+       "I should reconsider…I should reconsider…" loops early, usually
+       within 1–2 seconds of the loop starting.
+
+    Call ``feed(chunk)`` for each streaming token; it raises
+    ``ThinkLoopError`` the moment a loop is confirmed.
+    """
+
+    THINK_CHAR_CAP    = 8_000   # total think chars before hard abort
+    SCAN_WINDOW       = 2_000   # recent think chars to scan for repeats
+    SNIPPET_LEN       = 60      # pattern length to test for repetition
+    REPEAT_THRESHOLD  = 5       # how many times a snippet must repeat
+    CHECK_INTERVAL    = 400     # check once per this many new raw chars
+
+    def __init__(self, role: str) -> None:
+        self._role        = role
+        self._raw         = ""   # all streamed chars so far
+        self._think_chars = 0    # total chars inside <think> blocks
+        self._last_check  = 0    # len(_raw) at last check
+
+    # ------------------------------------------------------------------
+
+    def feed(self, chunk: str) -> None:
+        """Accumulate *chunk* and raise ThinkLoopError if a loop is found."""
+        self._raw += chunk
+        if len(self._raw) - self._last_check < self.CHECK_INTERVAL:
+            return
+        self._last_check = len(self._raw)
+        self._think_chars = _count_think_chars(self._raw)
+        self._check()
+
+    def _check(self) -> None:
+        if self._think_chars > self.THINK_CHAR_CAP:
+            raise ThinkLoopError(
+                f"Agent [{self._role}] think block exceeded "
+                f"{self.THINK_CHAR_CAP} chars ({self._think_chars} seen) — "
+                "aborting stream to trigger retry."
+            )
+
+        think_content = _extract_think_content(self._raw)
+        if len(think_content) < self.SNIPPET_LEN * self.REPEAT_THRESHOLD:
+            return
+
+        recent = think_content[-self.SCAN_WINDOW:]
+        stride = self.SNIPPET_LEN // 2   # overlapping scan for better coverage
+        for start in range(0, len(recent) - self.SNIPPET_LEN, stride):
+            snippet = recent[start : start + self.SNIPPET_LEN]
+            if recent.count(snippet) >= self.REPEAT_THRESHOLD:
+                raise ThinkLoopError(
+                    f"Agent [{self._role}] think loop detected: "
+                    f"a {self.SNIPPET_LEN}-char pattern repeated "
+                    f"{recent.count(snippet)}× in the last "
+                    f"{len(recent)} think chars — aborting stream."
+                )
+
+
+def _extract_think_content(text: str) -> str:
+    """Return the concatenated content of all <think> blocks (open or closed)."""
+    # Closed blocks
+    parts = re.findall(r"<think>(.*?)</think>", text, re.DOTALL)
+    # Unclosed trailing block
+    unclosed = re.search(r"<think>((?:(?!</think>).)*)\Z", text, re.DOTALL)
+    if unclosed:
+        parts.append(unclosed.group(1))
+    return "".join(parts)
+
+
+def _count_think_chars(text: str) -> int:
+    return len(_extract_think_content(text))
 
 
 def _json_prompt_suffix(schema: Type[BaseModel]) -> str:
@@ -438,6 +565,8 @@ def _json_prompt_suffix(schema: Type[BaseModel]) -> str:
         "\n\n---",
         "IMPORTANT: Respond with a single valid JSON object ONLY.",
         "No markdown fences, no prose, no explanation — raw JSON only.",
+        "If you use internal reasoning tags (<think>), place the JSON AFTER them.",
+        "The JSON must appear as the final content in your response.",
     ]
     if required:
         lines.append(f"Required fields: {', '.join(required)}")
@@ -525,7 +654,7 @@ def _extract_json(text: str) -> str | None:
     if fence_match:
         return fence_match.group(1)
 
-    # Try the first { ... } spanning the entire content
+    # Try the greedy span from first { to last } — works for single clean JSON.
     brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
     if brace_match:
         candidate = brace_match.group(1)
@@ -534,6 +663,22 @@ def _extract_json(text: str) -> str | None:
             return candidate
         except json.JSONDecodeError:
             pass
+
+    # Greedy span failed (e.g. LLM emitted two concatenated JSON blocks with a
+    # corrupt first attempt). Scan all { positions from right-to-left and return
+    # the last valid JSON object found — LLMs typically correct themselves last.
+    for start in sorted(
+        [m.start() for m in re.finditer(r"\{", text)], reverse=True
+    ):
+        last_brace = text.rfind("}", start)
+        if last_brace == -1:
+            continue
+        candidate = text[start : last_brace + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
 
     return None
 
@@ -552,11 +697,23 @@ def _extract_json_dict(text: str) -> dict:
 def _strip_think_tags(text: str) -> str:
     """Remove <think>...</think> blocks produced by reasoning models.
 
-    Models like Gemma 4 (enable_thinking=True), DeepSeek-R1, and QwQ emit
-    chain-of-thought inside these tags before the actual response. We want
-    only the final answer — the think block content is discarded.
+    Handles three cases:
+    - Standard closed blocks: ``<think>…</think>`` followed by the response.
+    - Unclosed blocks: model hit the token limit while still reasoning, so
+      the closing ``</think>`` is absent.  We strip from ``<think>`` to end-of-
+      text so the caller sees an empty string (and can fall back to searching
+      the original text for embedded JSON).
+    - JSON embedded inside the think block: some models write their answer
+      inside ``<think>`` rather than after it.  Stripping here returns empty;
+      the caller is expected to retry on the original text.
     """
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    # 1. Remove all fully-closed think blocks.
+    stripped = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+    # 2. Remove any remaining unclosed ``<think>`` prefix (model stopped mid-think).
+    stripped = re.sub(r"<think>.*$", "", stripped, flags=re.DOTALL).strip()
+
+    return stripped
 
 
 def _fix_code_formatting(raw_json: str) -> str:

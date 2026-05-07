@@ -1,0 +1,90 @@
+name: Release
+
+# Triggers on every push to main.
+# Creates a GitHub Release and uploads the source distribution (.tar.gz).
+# Users install with:  pipx install hpema-X.Y.Z.tar.gz
+#                  or: uv tool install hpema-X.Y.Z.tar.gz
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create GitHub Releases
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for version tagging
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              d = tomllib.load(f)
+          print(d['project']['version'])
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: tag_check
+        run: |
+          if git ls-remote --tags origin "refs/tags/v${{ steps.version.outputs.version }}" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build source distribution
+        if: steps.tag_check.outputs.exists == 'false'
+        run: python -m build --sdist
+
+      - name: Create GitHub Release
+        if: steps.tag_check.outputs.exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          SDIST="dist/hpema-${VERSION}.tar.gz"
+
+          gh release create "$TAG" \
+            --title "HPEMA $TAG" \
+            --notes "## Install
+
+          \`\`\`bash
+          # Option A — pipx (recommended, puts \`hpema\` on PATH automatically)
+          pipx install $SDIST
+
+          # Option B — uv tool (same effect)
+          uv tool install $SDIST
+
+          # Option C — pip into active environment
+          pip install $SDIST
+          \`\`\`
+
+          After install, run \`hpema\` — the setup wizard will configure your API keys.
+
+          ## What's in this release
+          See [CHANGELOG](https://github.com/${{ github.repository }}/commits/main) for changes since the previous tag." \
+            "$SDIST"
+
+      - name: Skip (tag already exists)
+        if: steps.tag_check.outputs.exists == 'true'
+        run: echo "Tag ${{ steps.version.outputs.tag }} already exists — skipping release."

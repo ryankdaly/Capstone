@@ -51,7 +51,9 @@ _CMD_META: dict[str, str] = {
     "/history":    "show run history [N]",
     "/audit":      "traceability matrix",
     "/config":     "show config or set config file path",
+    "/setup":      "configure API keys and model endpoints",
     "/help":       "show all commands",
+    "/scroll":     "terminal scrollmode",
     "/quit":       "exit HPEMA",
     "/exit":       "exit HPEMA",
 }
@@ -262,9 +264,9 @@ def _set_config(path: str, session: Session) -> None:
     env_file = os.path.join(project_root, ".env")
 
     if os.path.isfile(env_file):
-        restart_cmd = f"source {env_file} && HPEMA_CONFIG={path} python -m cli.main"
+        restart_cmd = f"source {env_file} && HPEMA_CONFIG={path} {sys.executable} -m cli.main"
     else:
-        restart_cmd = f"HPEMA_CONFIG={path} python -m cli.main"
+        restart_cmd = f"HPEMA_CONFIG={path} {sys.executable} -m cli.main"
 
     os.execv("/bin/bash", ["/bin/bash", "-c", restart_cmd])
     # os.execv replaces the process — code below never reached
@@ -283,6 +285,9 @@ def _handle_command(line: str, session: Session) -> bool:
     if cmd in ("/quit", "/exit", "/q"):
         _show_goodbye(session)
         return False
+
+    elif cmd == "/setup":
+        _run_setup(session)
 
     elif cmd == "/help":
         show_help()
@@ -361,6 +366,9 @@ def _handle_command(line: str, session: Session) -> bool:
 
     elif cmd == "/checker":
         _show_checker(session, arg)
+    
+    elif cmd == "/scroll":
+        _scroll_mode(session)
 
     elif cmd == "/dafny":
         _show_dafny(session, arg)
@@ -740,6 +748,252 @@ def _parse_iteration_arg(arg: str, total: int) -> int | None:
 
     return n - 1
 
+# ---------------------------------------------------------------------------
+# Scroll
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Scroll — curses-based in-terminal pager, no tmux required
+# ---------------------------------------------------------------------------
+
+def _scroll_mode(session: Session) -> None:
+    """Full-screen arrow-key pager over session output. No tmux required.
+
+    Keys:
+      ↑ / k          scroll up one line
+      ↓ / j          scroll down one line
+      PgUp / u       scroll up half a page
+      PgDn / d       scroll down half a page
+      Home / g       jump to top
+      End  / G       jump to bottom
+      q / Esc        return to REPL
+    """
+    import curses
+    import io
+    from rich.console import Console as _Console
+    from rich.syntax import Syntax as _Syntax
+
+    # ------------------------------------------------------------------
+    # 1. Render session to plain-text lines
+    # ------------------------------------------------------------------
+    buf_io = io.StringIO()
+    buf_console = _Console(
+        file=buf_io,
+        width=min(console.width, 200),
+        highlight=False,
+        markup=True,
+        no_color=True,
+    )
+
+    if not session.history:
+        buf_console.print("  No runs yet — type a requirement to start.\n")
+    else:
+        for i, record in enumerate(session.history, start=1):
+            state = record.state
+            sep = "─" * 80
+            buf_console.print(f"\n{sep}")
+            buf_console.print(
+                f"  Run {i:>3}  │  {record.requirement[:72]}\n"
+                f"  {state.status.value.upper()}"
+                f"  ·  {record.standard}"
+                f"  ·  {record.language}"
+                f"  ·  {record.elapsed_seconds:.1f}s"
+            )
+            buf_console.print(sep)
+
+            if state.final_code:
+                lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada"}
+                lang = lang_map.get(record.language, "c")
+                buf_console.print(
+                    f"\n  ── Source Code ({len(state.final_code.splitlines())} lines) ──\n"
+                )
+                buf_console.print(
+                    _Syntax(state.final_code, lang, theme="ansi_dark",
+                            line_numbers=True, padding=1)
+                )
+
+            if state.final_proof:
+                buf_console.print(
+                    f"\n  ── Dafny Specification"
+                    f" ({len(state.final_proof.splitlines())} lines) ──\n"
+                )
+                buf_console.print(
+                    _Syntax(state.final_proof, "csharp", theme="ansi_dark",
+                            line_numbers=True, padding=1)
+                )
+
+            if state.iterations:
+                last_iter = state.iterations[-1]
+                if last_iter.checker_report:
+                    cr = last_iter.checker_report
+                    buf_console.print(
+                        f"\n  ── Checker: {cr.verdict.value.upper()}"
+                        f"  ({len(cr.issues)} issues,"
+                        f" {len(cr.test_cases)} tests) ──"
+                    )
+                    for issue in cr.issues:
+                        buf_console.print(
+                            f"     [{issue.severity.value.upper()}]"
+                            f" {issue.description}"
+                        )
+                if last_iter.test_result and last_iter.test_result.executed:
+                    tr = last_iter.test_result
+                    buf_console.print(
+                        f"  ── Tests: {tr.passed}/{tr.total} passed ──"
+                    )
+                if last_iter.verification_result:
+                    vr = last_iter.verification_result
+                    buf_console.print(
+                        f"  ── Dafny: {'VERIFIED' if vr.verified else 'FAILED'} ──"
+                    )
+                if last_iter.policy_verdict:
+                    pv = last_iter.policy_verdict
+                    pc = "COMPLIANT" if pv.compliant else "NON-COMPLIANT"
+                    buf_console.print(
+                        f"  ── Policy: {pc}"
+                        f"  Risk: {pv.risk_level.value.upper()} ──"
+                    )
+                    for v in last_iter.policy_verdict.violations:
+                        buf_console.print(f"     [{v.rule_id}] {v.description}")
+
+        buf_console.print("\n")
+
+    raw_text = buf_io.getvalue()
+    # Strip any residual ANSI escape codes so curses sees clean text
+    import re
+    ansi_escape = re.compile(r"\x1B[@-_][0-?]*[ -/]*[@-~]")
+    lines: list[str] = [
+        ansi_escape.sub("", line)
+        for line in raw_text.splitlines()
+    ]
+
+    # ------------------------------------------------------------------
+    # 2. Hand off to curses pager
+    # ------------------------------------------------------------------
+    try:
+        curses.wrapper(_curses_pager, lines)
+    except curses.error:
+        # Terminal too small or curses unavailable — fall back to less/python pager
+        _fallback_pager(raw_text)
+
+
+def _curses_pager(stdscr, lines: list[str]) -> None:
+    """Curses inner loop — called by curses.wrapper."""
+    import curses
+
+    curses.curs_set(0)          # hide cursor
+    stdscr.keypad(True)         # enable arrow / PgUp / PgDn key constants
+    curses.use_default_colors() # transparent background
+
+    top = 0   # index of the topmost visible line
+
+    while True:
+        rows, cols = stdscr.getmaxyx()
+        content_rows = rows - 1   # last row reserved for the status bar
+
+        # Clamp top to valid range
+        max_top = max(0, len(lines) - content_rows)
+        top = max(0, min(top, max_top))
+
+        # Draw visible lines
+        stdscr.erase()
+        for screen_row, line_idx in enumerate(range(top, top + content_rows)):
+            if line_idx >= len(lines):
+                break
+            # Truncate to terminal width to avoid curses wrap errors
+            text = lines[line_idx][:cols - 1]
+            try:
+                stdscr.addstr(screen_row, 0, text)
+            except curses.error:
+                pass  # writing to the last cell of last row raises — ignore
+
+        # Status bar
+        pct = int(top / max_top * 100) if max_top else 100
+        at_end = top >= max_top
+        end_marker = " [END]" if at_end else ""
+        status = (
+            f"  HPEMA scroll  "
+            f"line {top + 1}/{len(lines)}  "
+            f"{pct}%{end_marker}"
+            f"  ── ↑↓ / jk  PgUp/PgDn  g/G  q:quit"
+        )
+        status = status[:cols - 1].ljust(cols - 1)
+        try:
+            stdscr.attron(curses.A_REVERSE)
+            stdscr.addstr(rows - 1, 0, status)
+            stdscr.attroff(curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        # Input
+        key = stdscr.getch()
+
+        if key in (ord("q"), ord("Q"), 27):          # q / Q / Esc
+            break
+        elif key in (curses.KEY_UP, ord("k")):
+            top -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            top += 1
+        elif key in (curses.KEY_PPAGE, ord("u")):     # PgUp / u
+            top -= content_rows // 2
+        elif key in (curses.KEY_NPAGE, ord("d")):     # PgDn / d
+            top += content_rows // 2
+        elif key in (curses.KEY_HOME, ord("g")):
+            top = 0
+        elif key in (curses.KEY_END, ord("G")):
+            top = max_top
+
+
+def _fallback_pager(text: str) -> None:
+    """less → more → built-in line pager. Used when curses is unavailable."""
+    import os, shutil, subprocess, tempfile
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="hpema_scroll_",
+        delete=False, encoding="utf-8",
+    )
+    try:
+        tmp.write(text)
+        tmp.flush()
+        tmp.close()
+
+        pager_env = os.environ.get("PAGER", "").strip()
+        if pager_env:
+            cmd = pager_env.split() + [tmp.name]
+        elif shutil.which("less"):
+            cmd = ["less", "-RXF", "--", tmp.name]
+        elif shutil.which("more"):
+            cmd = ["more", tmp.name]
+        else:
+            _python_pager(text)
+            return
+        try:
+            subprocess.run(cmd, check=False)
+        except FileNotFoundError:
+            _python_pager(text)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _python_pager(text: str, page_size: int = 40) -> None:
+    """Last-resort line-by-line pager for environments with nothing else."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        print("\n".join(lines[i : i + page_size]))
+        i += page_size
+        if i < len(lines):
+            try:
+                ans = input("\n-- more -- (Enter to continue, q to quit) ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ans.strip().lower() == "q":
+                break
 
 # ---------------------------------------------------------------------------
 # Audit
@@ -784,39 +1038,357 @@ def _show_audit(session: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Build-mode dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _do_inline_chat(line: str, session: Session) -> None:
+    """Stream a chat response inline — used for CONVERSE intent and explicit chat mode."""
+    import asyncio as _asyncio
+    from cli.display import _DynamicSpinner
+    from cli.runner import chat_stream
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    console.print()
+    collected: list[str] = []
+
+    class _ChatPanel:
+        def __init__(self) -> None:
+            self._spinner = _DynamicSpinner("actor")
+
+        def __rich__(self):
+            text = "".join(collected)
+            if not text:
+                return self._spinner.__rich__()
+            return Panel(Markdown(text), title="[bold bright_blue]HPEMA[/]",
+                         border_style="bright_blue", padding=(1, 2))
+
+    live = Live(_ChatPanel(), refresh_per_second=12, console=console)
+    live.start()
+    try:
+        response = _asyncio.run(chat_stream(line, on_token=collected.append))
+        live.stop()
+        session.chat_history.append({"role": "user", "content": line})
+        session.chat_history.append({"role": "assistant", "content": response})
+        console.print(Panel(Markdown(response), title="[bold bright_blue]HPEMA[/]",
+                            border_style="bright_blue", padding=(1, 2)))
+    except KeyboardInterrupt:
+        live.stop()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        live.stop()
+        show_error(str(e))
+
+
+def _do_rerun_checker(session: Session) -> None:
+    """Re-run the checker + tests on the last pipeline code."""
+    from cli.runner import run_checker_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Checker on last code  |  Standard: {session.standard}  |  Language: {session.language}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_checker_only(
+            code=code,
+            standard=session.standard,
+            language=session.language,
+            display=display,
+            run_tests=session.run_tests,
+        )
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_rerun_dafny(session: Session) -> None:
+    """Re-run the Dafny architect + verifier on the last pipeline code."""
+    from cli.runner import run_dafny_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Dafny on last code  |  Language: {session.language}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_dafny_only(code=code, language=session.language, display=display)
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_rerun_policy(session: Session) -> None:
+    """Re-run the policy agent on the last pipeline code."""
+    from cli.runner import run_policy_only
+
+    if not session.last_state or not session.last_state.final_code:
+        console.print("  [dim]No code from a previous run. Generate code first.[/]")
+        return
+
+    code = session.last_state.final_code
+    console.print()
+    console.print(f"  [dim]Re-running Policy on last code  |  Standard: {session.standard}[/]")
+    display = DisplayManager()
+    session.agents_running = True
+    try:
+        run_policy_only(code=code, standard=session.standard, display=display)
+    except KeyboardInterrupt:
+        display.cleanup()
+        console.print("\n  [yellow]Interrupted.[/]")
+    except Exception as e:
+        display.cleanup()
+        show_error(str(e))
+    finally:
+        session.agents_running = False
+
+
+def _do_full_pipeline(line: str, session: Session, pt_session: object | None) -> None:
+    """Run the full pipeline for a GENERATE intent."""
+    console.print()
+    console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
+
+    session.agents_running = True
+    retry_context = ""
+    requirement_text = line
+
+    try:
+        while True:
+            display = DisplayManager()
+            run_start = time.monotonic()
+
+            try:
+                state = run_pipeline(
+                    requirement=requirement_text,
+                    standard=session.standard,
+                    language=session.language,
+                    max_iterations=session.max_iterations,
+                    display=display,
+                    stage=session.stage,
+                    run_tests=session.run_tests,
+                    retry_context=retry_context,
+                )
+            except KeyboardInterrupt:
+                display.cleanup()
+                console.print("\n  [yellow]Pipeline interrupted.[/]")
+                break
+            except Exception as e:
+                display.cleanup()
+                show_error(str(e))
+                break
+
+            elapsed = time.monotonic() - run_start
+
+            if state is not None:
+                session.history.append(RunRecord(
+                    requirement=requirement_text,
+                    state=state,
+                    standard=session.standard,
+                    language=session.language,
+                    stage=session.stage.value,
+                    elapsed_seconds=elapsed,
+                ))
+
+            if state is None or state.status.value != "failed":
+                break
+
+            # --- Retry prompt ---
+            error_dump = display.build_error_dump()
+            console.print()
+            console.print(
+                "  [bold yellow]All iterations failed.[/]  "
+                "Feed error dump into a new run?"
+            )
+
+            if not _PT_AVAILABLE or pt_session is None:
+                answer = console.input(
+                    "  [bold]Retry loop?[/] [dim][Y/n][/] "
+                ).strip().lower()
+                do_retry = answer in ("", "y", "yes")
+            else:
+                try:
+                    answer = pt_session.prompt(  # type: ignore[union-attr]
+                        "  Retry loop? [Y/n] ",
+                    ).strip().lower()
+                    do_retry = answer in ("", "y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    do_retry = False
+
+            if not do_retry:
+                break
+
+            retry_context = error_dump
+            console.print(
+                f"  [dim]Retrying with {len(error_dump)} chars of error context …[/]"
+            )
+            console.print()
+    finally:
+        session.agents_running = False
+
+
+# ---------------------------------------------------------------------------
 # REPL entry point
 # ---------------------------------------------------------------------------
 
+def _run_setup(session: Session | None = None) -> None:
+    """Launch the interactive setup wizard (called by /setup command or on startup)."""
+    from cli.setup import run_setup_wizard
+    run_setup_wizard()
+    # If we returned (no restart), reload config into the live session
+    if session is not None:
+        try:
+            new_cfg = load_config()
+            session.standard       = new_cfg.policies.default_standard
+            session.max_iterations = new_cfg.pipeline.max_iterations
+            session.model          = new_cfg.models.actor.model
+            from backend.config import find_config_path as _fcp2
+            _f2 = _fcp2()
+            session.config_source = str(_f2) if _f2 else ""
+        except Exception:
+            pass
+        console.print("  [dim]Session config reloaded from new settings.[/]\n")
+
+
+def _startup_config_check() -> None:
+    """Gate that runs before the logo/startup sequence.
+
+    Three cases:
+      A. No config found anywhere     → auto-launch /setup wizard (blocks).
+      B. Config found, never verified → show a summary panel, ask to confirm
+                                        or re-run /setup. Writes ~/.hpema/.config_verified
+                                        on confirmation so this prompt is shown exactly once.
+      C. Config found and verified    → silent pass-through; proceed normally.
+    """
+    from rich.panel import Panel as _Panel
+    from rich.table import Table as _Table
+    from rich.text import Text as _Text
+    from backend.config import hpema_home, find_config_path, load_config as _load
+
+    home     = hpema_home()
+    verified = home / ".config_verified"
+
+    # ── Determine whether ANY config is reachable (single source of truth) ──
+    found_path   = find_config_path()
+    config_found = found_path is not None
+
+    # ── Case A: no config → auto-launch wizard ──────────────────────────────
+    if not config_found:
+        console.print()
+        console.print(_Panel(
+            _Text.from_markup(
+                "\n"
+                "  [bold yellow]No configuration found.[/]\n"
+                "  [dim]Launching the setup wizard...[/]\n"
+            ),
+            border_style="yellow",
+            padding=(0, 2),
+        ))
+        console.print()
+        time.sleep(0.8)
+        from cli.setup import run_setup_wizard
+        run_setup_wizard()
+        return  # wizard calls _restart(); execution stops here
+
+    # ── Case B: config exists but not yet verified ──────────────────────────
+    if not verified.exists():
+        try:
+            cfg = _load()
+        except Exception:
+            return  # broken config — let normal startup surface the error
+
+        t = _Table(box=None, show_header=False, padding=(0, 2))
+        t.add_column("k", style="dim",  width=10)
+        t.add_column("v", style="bold")
+        t.add_row("Config",  str(found_path))
+        t.add_row("Actor",   cfg.models.actor.model)
+        t.add_row("Checker", cfg.models.checker.model)
+        t.add_row("Policy",  cfg.models.policy.model)
+        dafny_val = cfg.verification.binary_path
+        dafny_display = (
+            f"[green]{dafny_val}[/]" if dafny_val not in ("dafny", "LOCAL_DAFNY_INSTALL")
+            else "[yellow]dafny  (relies on PATH)[/]"
+        )
+        t.add_row("Dafny",   dafny_display)
+
+        console.print()
+        console.print(_Panel(
+            t,
+            title="[bold]Configuration found — is this correct?[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        ))
+        console.print()
+
+        from cli.setup import _confirm
+        if _confirm("Continue with this configuration?", default=True):
+            verified.touch()
+        else:
+            from cli.setup import run_setup_wizard
+            run_setup_wizard()
+
+    # Case C: verified → fall through silently
+
+
 def start_repl() -> None:
     """Launch the interactive REPL."""
-    # Rule 1: clear terminal noise from previous session
+    # Rule 0: config gate — auto-wizard on first run, confirmation on first boot.
+    # Runs before the logo so the screen isn't cluttered before setup completes.
+    console.clear()
+    _startup_config_check()
+
+    # Rule 1: clear again (setup wizard may have left output), then begin startup
     console.clear()
 
     session = Session()
 
-    # Detect config source
-    import os
-    env_config = os.environ.get("HPEMA_CONFIG", "hpema_config.yaml")
+    # Detect config source — use the same discovery logic as the loader
+    from backend.config import find_config_path as _fcp
+    _found = _fcp()
+    env_config = str(_found) if _found else "hpema_config.yaml"
     session.config_source = env_config
 
     # Rule 2: logo first, 1.5s pause, then config info
     show_logo()
     time.sleep(1.5)
+    config = load_config()
     show_startup_info(
         config_source=env_config,
         model=session.model,
         standard=session.standard,
         language=session.language,
         stage=session.stage,
+        models_config=config.models,
     )
 
     # Show large warning if running in disconnected (partial pipeline) mode
     if session.is_disconnected:
         show_disconnected_warning(session.stage)
 
+    # Welcome screen if API keys are missing even after config check
+    from cli.setup import models_are_configured, show_welcome_screen
+    if not models_are_configured():
+        show_welcome_screen()
+
     # Rule 3: animated layer connectivity check — polls until all layers ready or Ctrl+S
-    # Chat bar is naturally blocked until this returns.
-    config = load_config()
     wait_for_layers_ready(config, session.stage)
 
     # Build input function — prompt_toolkit if available, plain fallback otherwise
@@ -903,93 +1475,32 @@ def start_repl() -> None:
                 break
             continue
 
-        # --- Chat mode: direct LLM conversation, no pipeline ---
+        # --- Chat mode (explicit): direct LLM conversation, no pipeline ---
         if session.mode == "chat":
-            import asyncio as _asyncio
-            from cli.display import _DynamicSpinner
-            from cli.runner import chat_stream
-            from rich.live import Live
-            from rich.markdown import Markdown
-            from rich.panel import Panel
-            console.print()
-
-            collected: list[str] = []
-
-            class _ChatPanel:
-                """Live renderable: spinner until first token, then growing panel."""
-
-                def __init__(self) -> None:
-                    self._spinner = _DynamicSpinner("actor")
-
-                def __rich__(self):
-                    text = "".join(collected)
-                    if not text:
-                        return self._spinner.__rich__()
-                    return Panel(
-                        Markdown(text),
-                        title="[bold bright_blue]HPEMA[/]",
-                        border_style="bright_blue",
-                        padding=(1, 2),
-                    )
-
-            chat_panel = _ChatPanel()
-            live = Live(chat_panel, refresh_per_second=12, console=console)
-            live.start()
-            try:
-                response = _asyncio.run(
-                    chat_stream(line, on_token=collected.append)
-                )
-                live.stop()
-                session.chat_history.append({"role": "user", "content": line})
-                session.chat_history.append({"role": "assistant", "content": response})
-                # Final render (in case Live ended before last refresh)
-                console.print(Panel(
-                    Markdown(response),
-                    title="[bold bright_blue]HPEMA[/]",
-                    border_style="bright_blue",
-                    padding=(1, 2),
-                ))
-            except KeyboardInterrupt:
-                live.stop()
-                console.print("\n  [yellow]Chat interrupted.[/]")
-            except Exception as e:
-                live.stop()
-                show_error(str(e))
+            _do_inline_chat(line, session)
             continue
 
-        # --- Build mode: run the full pipeline ---
-        console.print()
-        console.print(f"  [dim]Standard: {session.standard}  |  Language: {session.language}  |  Max iterations: {session.max_iterations}[/]")
+        # --- Build mode: classify intent, then dispatch ---
+        from cli.intent import Intent, classify as _classify
 
-        display = DisplayManager()
-        run_start = time.monotonic()
-        session.agents_running = True
+        classified = _classify(line, has_history=bool(session.history))
 
-        try:
-            state = run_pipeline(
-                requirement=line,
-                standard=session.standard,
-                language=session.language,
-                max_iterations=session.max_iterations,
-                display=display,
-                stage=session.stage,
-                run_tests=session.run_tests,
-            )
-            elapsed = time.monotonic() - run_start
-            if state is not None:
-                session.history.append(RunRecord(
-                    requirement=line,
-                    state=state,
-                    standard=session.standard,
-                    language=session.language,
-                    stage=session.stage.value,
-                    elapsed_seconds=elapsed,
-                ))
-        except KeyboardInterrupt:
-            display.cleanup()
-            console.print("\n  [yellow]Pipeline interrupted.[/]")
-        except Exception as e:
-            display.cleanup()
-            show_error(str(e))
-        finally:
-            session.agents_running = False
+        if classified.intent == Intent.CONVERSE:
+            # Off-topic or ambiguous — answer inline without switching modes
+            _do_inline_chat(line, session)
+            continue
+
+        if classified.intent == Intent.RERUN_CHECKER:
+            _do_rerun_checker(session)
+            continue
+
+        if classified.intent == Intent.RERUN_DAFNY:
+            _do_rerun_dafny(session)
+            continue
+
+        if classified.intent == Intent.RERUN_POLICY:
+            _do_rerun_policy(session)
+            continue
+
+        # --- GENERATE: full pipeline ---
+        _do_full_pipeline(line, session, _pt_session if _PT_AVAILABLE else None)

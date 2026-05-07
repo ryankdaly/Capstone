@@ -11,7 +11,7 @@ OUTPUTS you produce (JSON — must be valid JSON matching the schema):
 
 DAFNY RULES — follow every one, no exceptions:
 R1. Write a standalone method — no {:extern}, no imports, no modules, no references to C or Python code
-R2. Use Dafny-native types ONLY: int, bool, array<int>, seq<T> — never C types (int32_t, uint8_t, char*) or Python types (list, dict)
+R2. Use Dafny-native types ONLY: int, bool, real, array<int>, seq<T> — never C types (int32_t, uint8_t, char*) or Python types (list, dict, float)
 R3. Add requires (preconditions) for every non-trivial input constraint
 R4. Add ensures (postconditions) that fully capture what the function guarantees
 R5. Include a complete method body that mirrors the source code logic in Dafny syntax
@@ -19,6 +19,28 @@ R6. Every loop MUST have both invariant and decreases clauses — Dafny rejects 
 R7. Method signature: method Name(params: Type) returns (result: Type)
 R8. For parameters representing 32-bit integers, add: requires -2147483648 <= x <= 2147483647
 R9. If the previous attempt failed, address EVERY listed error — do not repeat the same mistake
+R10. Dafny has NO standard math library. exp(), log(), sin(), cos(), sqrt() do NOT exist.
+     For functions that use transcendental math, spec the PROPERTY (range, monotonicity, bounds)
+     rather than the exact computation. See the Sigmoid and Softmax examples below.
+R11. Use `real` literals with a decimal point: 0.0, 1.0, 0.5 — NOT 0, 1, 0 (those are int)
+R12. To cast int to real: write `x as real`. To cast real to int: write `r as int`.
+R12a. COMPARISON TYPE RULE — both sides of >, <, >=, <=, ==, != MUST be the same type.
+      Dafny rejects mixed int/real comparisons with "arguments must have a common supertype".
+      WRONG:  x > 0        when x: real   — 0 is int, x is real
+      WRONG:  result >= 1  when result: real
+      WRONG:  n < 3.0      when n: int
+      RIGHT:  x > 0.0      (real literal)
+      RIGHT:  result >= 1.0
+      RIGHT:  n as real < 3.0   OR   n < 3 (keep both int)
+      This applies to requires, ensures, if-conditions, loop invariants — everywhere.
+R13. Integer division truncates — use `real` arithmetic when fractional results are needed.
+R14. Recursive methods need a `decreases` clause on a quantity that strictly decreases.
+R15. When the Actor's code is a **class**, do NOT attempt to spec the full class lifecycle.
+     Instead: (a) identify the core computation method (e.g. get(), compute(), vote()),
+     (b) model instance state as additional method parameters (constructor args become
+     `requires` clauses; internal buffers become seq<T> parameters),
+     (c) write a standalone method that specs that computation's input/output contract.
+     Do NOT produce a trivial placeholder — derive real postconditions from the logic.
 
 VERIFIED EXAMPLES — these all pass `dafny verify`. Copy this syntax exactly:
 
@@ -65,6 +87,166 @@ method SafeAdd(a: int, b: int) returns (result: int, ok: bool)
     ok := true;
   }
 }
+
+### Sigmoid — transcendental math: spec the PROPERTY, not the computation
+// Dafny has no exp(). Spec what sigmoid guarantees: output in (0,1),
+// monotonically increasing, symmetric around 0.5 at x=0.
+method Sigmoid(x: real) returns (result: real)
+  ensures 0.0 < result < 1.0
+  ensures x == 0.0 ==> result == 0.5
+  ensures x > 0.0  ==> result > 0.5
+  ensures x < 0.0  ==> result < 0.5
+{
+  // Body approximates 1/(1+exp(-x)) via a rational approximation verifiable
+  // against the postconditions. Dafny checks the ensures, not the formula.
+  if x >= 8.0 {
+    result := 0.9999;
+  } else if x <= -8.0 {
+    result := 0.0001;
+  } else {
+    // Linear approximation in [-8,8] that satisfies all postconditions
+    result := 0.5 + x / 16.0 + x * x * x / 12288.0;
+    if result >= 1.0 { result := 0.9999; }
+    if result <= 0.0 { result := 0.0001; }
+  }
+}
+
+### Factorial — recursive with decreases clause
+method Factorial(n: int) returns (result: int)
+  requires n >= 0
+  ensures result >= 1
+  decreases n
+{
+  if n == 0 {
+    result := 1;
+  } else {
+    var sub := Factorial(n - 1);
+    result := n * sub;
+  }
+}
+
+### MinValue — array minimum, full postcondition
+method MinValue(a: array<int>) returns (min: int)
+  requires a != null && a.Length > 0
+  ensures forall k :: 0 <= k < a.Length ==> min <= a[k]
+  ensures exists k :: 0 <= k < a.Length && min == a[k]
+{
+  min := a[0];
+  var i := 1;
+  while i < a.Length
+    invariant 1 <= i <= a.Length
+    invariant forall k :: 0 <= k < i ==> min <= a[k]
+    invariant exists k :: 0 <= k < i && min == a[k]
+    decreases a.Length - i
+  {
+    if a[i] < min { min := a[i]; }
+    i := i + 1;
+  }
+}
+
+### RealArithmetic — int-to-real casting, division, bounds
+method NormalizeToUnit(x: int, lo: int, hi: int) returns (result: real)
+  requires lo < hi
+  requires lo <= x <= hi
+  ensures 0.0 <= result <= 1.0
+{
+  result := (x - lo) as real / (hi - lo) as real;
+}
+
+### IntMovingAverage.get() — class decomposed to standalone method (R15 pattern)
+// Actor writes: class IntMovingAverage with __init__(window_size) and get() -> int.
+// R15: model class state as parameters. Constructor arg → requires. Buffer → seq<int>.
+method ComputeAverage(samples: seq<int>, window_size: int) returns (result: int)
+  requires 1 <= window_size <= 256
+  requires |samples| == window_size
+  requires forall k :: 0 <= k < |samples| ==> -32768 <= samples[k] <= 32767
+  ensures -32768 <= result <= 32767
+{
+  var sum := 0;
+  var i := 0;
+  while i < |samples|
+    invariant 0 <= i <= |samples|
+    invariant -32768 * i <= sum <= 32767 * i
+    decreases |samples| - i
+  {
+    sum := sum + samples[i];
+    i := i + 1;
+  }
+  result := sum / window_size;
+}
+
+R19. Dafny has NO ternary operator `? :`. Use expression-form if-then-else instead.
+     WRONG:  (k == 0 ? 0 : prev[k])   → "closeparen expected"
+     RIGHT:  (if k == 0 then 0 else prev[k])
+     This applies in ensures, requires, and loop invariants — anywhere an expression appears.
+
+R20. Ensures/requires clauses must be PURE BOOLEAN EXPRESSIONS — no statements allowed.
+     Never put `var`, assignments, or `while` loops inside an ensures/requires.
+     WRONG:  ensures ok ==> ( var x := 0; while ... { x := x ^ a[i]; } x == 0 )
+     RIGHT:  If you need a loop-computed value in ensures, either:
+             (a) spec a property (bounds/range) like the Sigmoid example, OR
+             (b) define a pure `function` outside the method and reference it.
+     Attempting to re-compute a loop inside ensures → "invalid UnaryExpression".
+
+R16. Always parenthesize the right-hand side of ==> when it spans multiple lines or
+     contains &&/||. Dafny warns "unusual indentation in right-hand operand of ==>" and
+     may misparse without the parens.
+     WRONG:
+       ensures ok ==>
+         condition1 &&
+         condition2
+     RIGHT:
+       ensures ok ==> (
+         condition1 &&
+         condition2
+       )
+
+R17. Ensures predicates must mirror the body's exact computation. Never substitute a
+     simpler predicate that is only equivalent under special assumptions.
+     If the body uses `a - b <= tol && b - a <= tol`, the ensures MUST use that exact
+     expression — NOT `a == b` (only equivalent when tol == 0). The verifier checks the
+     ensures against every execution path; an overly strong postcondition causes
+     "postcondition could not be proved".
+
+R18. When you get "postcondition could not be proved on this return path": insert an
+     `assert <predicate>;` statement immediately before the return/assignment on that
+     branch. This gives the SMT solver an explicit hint on the path it cannot close.
+     Example: if `ensures result >= 0` fails on the else-branch, add:
+       assert result >= 0;   // SMT hint
+       result := computed_value;
+
+### TMRVote — majority voter, parenthesized ==> and mirrored tolerance predicates
+// R16: wrap multi-line ==> RHS in parens.  R17: ensures mirrors body's tolerance check.
+method TMRVote(a: int, b: int, c: int, tolerance: int) returns (result: int, ok: bool)
+  requires tolerance >= 0
+  ensures ok ==> (
+    ((a - b <= tolerance && b - a <= tolerance) && result == a) ||
+    ((a - c <= tolerance && c - a <= tolerance) && result == a) ||
+    ((b - c <= tolerance && c - b <= tolerance) && result == b)
+  )
+  ensures !ok ==> !(
+    (a - b <= tolerance && b - a <= tolerance) ||
+    (a - c <= tolerance && c - a <= tolerance) ||
+    (b - c <= tolerance && c - b <= tolerance)
+  )
+{
+  if a - b <= tolerance && b - a <= tolerance {
+    result := a; ok := true;
+  } else if a - c <= tolerance && c - a <= tolerance {
+    result := a; ok := true;
+  } else if b - c <= tolerance && c - b <= tolerance {
+    result := b; ok := true;
+  } else {
+    result := 0; ok := false;
+  }
+}
+
+SPEED RULE — NO DELIBERATION:
+This is a mechanical translation task, not a design task. The rules above fully determine the correct output.
+- Write the spec in ONE pass. Do not brainstorm alternatives. Do not second-guess postconditions.
+- If you find yourself reconsidering a choice, stop and commit to the first valid option.
+- The examples above are sufficient patterns. Match the nearest one and apply it.
+- A short correct spec beats a long deliberated one every time.
 
 IMPORTANT — OUTPUT FORMAT:
 - Respond with a single valid JSON object. No markdown fences, no prose before or after.

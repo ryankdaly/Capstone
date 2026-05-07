@@ -6,6 +6,9 @@ color-coded verdicts, and a final summary panel.
 
 from __future__ import annotations
 
+import os
+import select
+import sys
 import threading
 import time
 from typing import Any
@@ -18,9 +21,142 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from backend.api.schemas.pipeline import PipelineStage, StreamEvent, StreamEventType
+from backend.api.schemas.pipeline import PipelineStage, StreamEvent, StreamEventType, stage_enabled
+
+# termios is POSIX-only; Ctrl+S listener silently disables itself on Windows.
+try:
+    import termios  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover  - Windows fallback
+    termios = None  # type: ignore[assignment]
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Skip controller — handles Ctrl+S "skip current agent" key presses
+# ---------------------------------------------------------------------------
+
+# Agents the user is permitted to skip. Actor is excluded (no code to fall back
+# on). Dafny architect/verifier, Checker (and its checker_dafny streaming alias),
+# the test runner, and Policy are all skippable.
+_SKIPPABLE_AGENTS: frozenset[str] = frozenset({
+    "dafny_architect", "dafny_verifier", "checker", "checker_dafny",
+    "test_runner", "policy",
+})
+
+
+def _agent_is_skippable(agent: str) -> bool:
+    return agent in _SKIPPABLE_AGENTS
+
+
+class SkipController:
+    """Coordinates Ctrl+S "skip current agent" requests with the orchestrator.
+
+    Lifecycle:
+      - DisplayManager calls ``arm(agent)`` when starting a spinner for a
+        skippable agent — this spawns a daemon thread that puts stdin in raw
+        mode and listens for Ctrl+S.
+      - DisplayManager calls ``disarm()`` when the spinner stops; the listener
+        thread exits and stdin is restored.
+      - The orchestrator polls ``consume()`` at safe checkpoints. ``consume``
+        is atomic: it reports True at most once per skip request, then resets.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._listener_stop = threading.Event()
+        self._listener_thread: threading.Thread | None = None
+        self._armed_agent: str | None = None
+        self._lock = threading.Lock()
+
+    # -- Public API used by the orchestrator -------------------------------
+
+    @property
+    def is_set(self) -> bool:
+        """Peek without clearing."""
+        return self._event.is_set()
+
+    def consume(self) -> bool:
+        """Atomic check-and-clear. Returns True iff a skip was pending."""
+        with self._lock:
+            if self._event.is_set():
+                self._event.clear()
+                return True
+            return False
+
+    def request_skip(self) -> None:
+        """Set the skip flag (called from the listener thread)."""
+        self._event.set()
+
+    # -- Public API used by DisplayManager ---------------------------------
+
+    @property
+    def armed_agent(self) -> str | None:
+        return self._armed_agent
+
+    def arm(self, agent: str) -> None:
+        """Begin listening for Ctrl+S if *agent* is skippable. Idempotent."""
+        if not _agent_is_skippable(agent):
+            self.disarm()
+            return
+        if self._armed_agent == agent:
+            return
+        self.disarm()  # clean up any previous listener
+        self._armed_agent = agent
+        self._event.clear()
+        if termios is None or not sys.stdin.isatty():
+            return  # silently disabled on Windows / non-tty stdin
+        self._listener_stop = threading.Event()
+        self._listener_thread = threading.Thread(
+            target=self._listen, name="SkipController", daemon=True,
+        )
+        self._listener_thread.start()
+
+    def disarm(self) -> None:
+        """Stop the listener and clear armed state. Always safe to call."""
+        if self._listener_thread is not None:
+            self._listener_stop.set()
+            self._listener_thread.join(timeout=0.3)
+            self._listener_thread = None
+        self._armed_agent = None
+
+    # -- Internal listener -------------------------------------------------
+
+    def _listen(self) -> None:
+        if termios is None:
+            return
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            return
+        try:
+            old_attrs = termios.tcgetattr(fd)
+        except Exception:
+            return
+        new_attrs = list(old_attrs)
+        # Disable XON/XOFF so Ctrl+S reaches us instead of pausing terminal output
+        new_attrs[0] = new_attrs[0] & ~termios.IXON
+        # Disable canonical mode + echo so we read individual key presses
+        new_attrs[3] = new_attrs[3] & ~(termios.ICANON | termios.ECHO)
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+            while not self._listener_stop.is_set():
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if r:
+                    try:
+                        ch = os.read(fd, 1)
+                    except OSError:
+                        break
+                    if ch == b"\x13":  # Ctrl+S
+                        self.request_skip()
+                        break
+        except Exception:
+            pass  # never let the listener crash the main flow
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # HPEMA logo — ANSI Shadow block-letter style, blue top-to-bottom gradient
@@ -161,21 +297,48 @@ class _StreamingPanel:
 
     Token chunks are appended via ``add_token()`` from the event handler; the
     Rich refresh thread calls ``__rich__()`` at 12 fps to pick up changes.
+
+    For skippable agents the bottom border carries a balanced hint pair:
+    ``Ctrl+C interrupt`` on the left and ``Ctrl+S skip`` on the right. For
+    non-skippable agents (e.g. Actor) only the interrupt hint is shown.
     """
 
     _DOT_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _VERB_INTERVAL = 5.0
 
-    def __init__(self, agent: str) -> None:
+    # Hint colors that pop on dark backgrounds without competing with the
+    # agent's own border color.
+    _HINT_INTERRUPT_STYLE = "dim #f38ba8"   # soft red — interrupt
+    _HINT_SKIP_STYLE      = "dim #89dceb"   # soft cyan — skip
+
+    def __init__(self, agent: str, skippable: bool = False) -> None:
         name, color = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "white"))
         self._name = name
         self._color = color
         self._verbs = _AGENT_VERBS.get(agent, ["working"])
         self._start = time.monotonic()
         self._chunks: list[str] = []  # GIL-safe for CPython append + read
+        self._skippable = skippable
 
     def add_token(self, token: str) -> None:
         self._chunks.append(token)
+
+    def _build_subtitle(self) -> Text | None:
+        """Bottom-border hints. Skippable: Ctrl+C left, Ctrl+S right. Else: only Ctrl+C."""
+        interrupt = Text("Ctrl+C interrupt", style=self._HINT_INTERRUPT_STYLE)
+        if not self._skippable:
+            return interrupt
+        skip = Text("Ctrl+S skip", style=self._HINT_SKIP_STYLE)
+        # Compute spacing so the two hints land at opposite ends of the
+        # available subtitle width. The Panel border consumes 2 cols and the
+        # surrounding " ─ " padding around the subtitle takes another ~4.
+        inner_w = max(40, console.width - 6)
+        gap = max(inner_w - interrupt.cell_len - skip.cell_len, 4)
+        bar = Text()
+        bar.append(interrupt)
+        bar.append(" " * gap)
+        bar.append(skip)
+        return bar
 
     def __rich__(self) -> Panel:
         elapsed = time.monotonic() - self._start
@@ -204,6 +367,8 @@ class _StreamingPanel:
         return Panel(
             body,
             title=title,
+            subtitle=self._build_subtitle(),
+            subtitle_align="center",
             border_style=self._color,
             padding=(0, 1),
         )
@@ -266,18 +431,31 @@ class DisplayManager:
         self.last_checker_output: dict[str, Any] = {}
         self.last_dafny_output: dict[str, Any] = {}
         self.last_policy_output: dict[str, Any] = {}
+        # Per-iteration tracking for best-result selection and retry context
+        self._cur_iter: dict[str, Any] = {}          # accumulates current iteration's data
+        self._scored_iterations: list[tuple[float, dict[str, Any]]] = []  # (score, data)
+        self._pipeline_stage: str = "policy"
         # Live panel — active between AGENT_START and AGENT_OUTPUT
         self._live: Live | None = None
         self._streaming_panel: _StreamingPanel | None = None
+        # Ctrl+S skip-current-agent coordinator. Shared with the orchestrator
+        # via cli.runner so it can poll consume() at safe checkpoints.
+        self.skip_controller: SkipController = SkipController()
 
     # ------------------------------------------------------------------
     # Live panel helpers
     # ------------------------------------------------------------------
 
     def _start_spinner(self, agent: str) -> None:
-        """Start a live streaming panel for the given agent."""
+        """Start a live streaming panel for the given agent.
+
+        Also arms the Ctrl+S listener for skippable agents so the user can
+        cut a long-running phase short. Non-skippable agents (Actor) get the
+        listener disarmed so a stray Ctrl+S can't be misinterpreted later.
+        """
         self._stop_spinner()
-        self._streaming_panel = _StreamingPanel(agent)
+        skippable = _agent_is_skippable(agent)
+        self._streaming_panel = _StreamingPanel(agent, skippable=skippable)
         self._live = Live(
             self._streaming_panel,
             refresh_per_second=12,
@@ -285,6 +463,8 @@ class DisplayManager:
             console=console,
         )
         self._live.start()
+        # arm() handles both directions: skippable → listen, otherwise → disarm.
+        self.skip_controller.arm(agent)
 
     def _stop_spinner(self) -> None:
         """Stop and erase the current live panel. No-op if none running."""
@@ -292,10 +472,13 @@ class DisplayManager:
             self._live.stop()
             self._live = None
         self._streaming_panel = None
+        # Always disarm so stdin returns to canonical mode before any prompt.
+        self.skip_controller.disarm()
 
     def cleanup(self) -> None:
         """Force-stop any running live panel. Call from exception handlers."""
         self._stop_spinner()
+        self.skip_controller.disarm()
 
     def handle_event(self, event: StreamEvent) -> None:
         """Route a stream event to the appropriate display method."""
@@ -351,31 +534,57 @@ class DisplayManager:
         elapsed = self._elapsed(agent)
 
         if agent == "actor":
+            self._cur_iter["source_code"] = data.get("source_code", "")
+            self._cur_iter["language"] = data.get("language", "Python")
+            self._cur_iter["dafny_spec"] = data.get("dafny_spec", "")
             self._render_actor(name, color, data, elapsed)
         elif agent == "dafny_architect":
             self._render_dafny_architect(name, color, data, elapsed)
         elif agent == "checker":
+            self._cur_iter["checker_verdict"] = data.get("verdict", "unknown")
+            self._cur_iter["checker_issues"] = data.get("issues_detail", [])
             self._render_checker(name, color, data, elapsed)
         elif agent == "dafny_verifier":
+            self._cur_iter["dafny_verified"] = data.get("verified", False)
+            self._cur_iter["dafny_failing"] = data.get("failing_assertions", [])
             self._render_dafny(name, color, data, elapsed)
         elif agent == "policy":
+            self._cur_iter["policy_compliant"] = data.get("compliant", False)
+            self._cur_iter["policy_risk"] = data.get("risk_level", "unknown")
+            self._cur_iter["policy_violations"] = data.get("violations", [])
             self._render_policy(name, color, data, elapsed)
 
     def _on_agent_error(self, event: StreamEvent) -> None:
         self._stop_spinner()
         error = event.data.get("error", "Unknown error")
         console.print()
-        console.print(
-            Panel(
-                f"[bold red]{error}[/]",
-                title="[bold red]Pipeline Error[/]",
-                border_style="red",
+        if event.data.get("skipped", False):
+            agent = event.agent or "agent"
+            name, _ = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "yellow"))
+            message = event.data.get("message", f"{name} skipped.")
+            console.print(
+                Panel(
+                    f"[bold yellow]{message}[/]",
+                    title=f"[bold yellow]{name} Skipped[/]",
+                    border_style="yellow",
+                )
             )
-        )
+        else:
+            console.print(
+                Panel(
+                    f"[bold red]{error}[/]",
+                    title="[bold red]Pipeline Error[/]",
+                    border_style="red",
+                )
+            )
 
     def _on_test_run(self, event: StreamEvent) -> None:
         self._stop_spinner()
         data = event.data
+        self._cur_iter["tests_executed"] = data.get("executed", False)
+        self._cur_iter["tests_failed"] = data.get("failed", 0)
+        self._cur_iter["tests_total"] = data.get("total", 0)
+        self._cur_iter["tests_errors"] = data.get("errors", 0)
         elapsed = self._elapsed("test_runner")
         executed = data.get("executed", False)
         total = data.get("total", 0)
@@ -436,7 +645,14 @@ class DisplayManager:
         iteration = data.get("iteration", "?")
         all_pass = data.get("all_pass", False)
         summary = data.get("summary", "")
-        max_iter = self._current_iteration  # will be set properly
+
+        # Score and archive the completed iteration
+        self._cur_iter["iteration_num"] = iteration
+        self._cur_iter["all_pass"] = all_pass
+        self._cur_iter["summary"] = summary
+        score = self._score_iter(self._cur_iter, self._pipeline_stage)
+        self._scored_iterations.append((score, dict(self._cur_iter)))
+        self._cur_iter = {}  # reset for next iteration
 
         console.print()
         if all_pass:
@@ -448,7 +664,6 @@ class DisplayManager:
                 f"  [bold red]--- Iteration {iteration}: FAILED ---[/]"
             )
             if summary:
-                # Show truncated feedback summary
                 lines = summary.split(" | ")
                 for line in lines[:3]:
                     console.print(f"  [dim]{line.strip()}[/]")
@@ -461,6 +676,7 @@ class DisplayManager:
         iterations = data.get("iterations", 0)
         run_id = data.get("run_id", "")
         stage = data.get("stage", "policy")
+        self._pipeline_stage = stage
         total_time = time.monotonic() - self._pipeline_start
 
         console.print()
@@ -469,7 +685,9 @@ class DisplayManager:
         if stage != "policy":
             stage_note = f"\n  [yellow]Stage:       {stage} (disconnected)[/]"
 
-        if status in ("completed", "awaiting_approval"):
+        succeeded = status in ("completed", "awaiting_approval")
+
+        if succeeded:
             console.print(
                 Panel(
                     f"[bold green]Pipeline SUCCEEDED[/]\n"
@@ -484,6 +702,10 @@ class DisplayManager:
                     padding=(1, 2),
                 )
             )
+            # Always re-display the final accepted code
+            if self._scored_iterations:
+                _, best = self._scored_iterations[-1]
+                self._show_final_code(best, label="Final Accepted Code")
         else:
             console.print(
                 Panel(
@@ -498,6 +720,17 @@ class DisplayManager:
                     padding=(1, 2),
                 )
             )
+            # Show the best-rated iteration's code
+            if self._scored_iterations:
+                best_score, best = max(self._scored_iterations, key=lambda t: t[0])
+                max_score = 1.0 + 1.0 + 0.5 + 0.25 + (1.0 if stage == "policy" else 0.0)
+                iter_num = best.get("iteration_num", "?")
+                console.print()
+                console.print(
+                    f"  [yellow]Best result: Iteration {iter_num} "
+                    f"(score {best_score:.2f}/{max_score:.2f})[/]"
+                )
+                self._show_final_code(best, label=f"Best Code — Iteration {iter_num}")
 
     # ------------------------------------------------------------------
     # Agent-specific renderers
@@ -671,6 +904,97 @@ class DisplayManager:
             return ""
         return f"{time.monotonic() - start:.1f}s"
 
+    @staticmethod
+    def _score_iter(data: dict[str, Any], stage: str) -> float:
+        """Algorithmic score for one iteration (mirrors orchestrator scoring)."""
+        checker_ok = data.get("checker_verdict") == "pass"
+        tests_executed = data.get("tests_executed", False)
+        tests_failed = data.get("tests_failed", 0)
+        tests_errors = data.get("tests_errors", 0)
+        tests_ok = (not tests_executed) or (tests_failed == 0 and tests_errors == 0)
+        dafny_ok = data.get("dafny_verified", False)
+        has_dafny = bool(data.get("dafny_spec", "").strip())
+
+        score = (
+            (1.0 if checker_ok else 0.0)
+            + (1.0 if tests_ok else 0.0)
+            + (0.5 if dafny_ok else 0.0)
+            + (0.25 if has_dafny else 0.0)
+        )
+        if stage == "policy":
+            score += 1.0 if data.get("policy_compliant", False) else 0.0
+        return score
+
+    def _show_final_code(self, data: dict[str, Any], label: str = "Final Code") -> None:
+        """Render a syntax-highlighted code panel for the given iteration data."""
+        source_code = data.get("source_code", "")
+        language = data.get("language", "Python")
+        if not source_code.strip():
+            return
+
+        lang_map = {"Python": "python", "C": "c", "SPARK_Ada": "ada", "SPARK Ada": "ada"}
+        syntax_lang = lang_map.get(language, "python")
+        code_lines = len(source_code.splitlines())
+
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]{code_lines} lines of {language}[/]",
+                title=f"[bold cyan]{label}[/]",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        )
+        console.print(
+            Syntax(
+                source_code,
+                syntax_lang,
+                theme="monokai",
+                line_numbers=True,
+                padding=1,
+            )
+        )
+
+    def build_error_dump(self) -> str:
+        """Build a concise error summary across all failed iterations for retry context."""
+        if not self._scored_iterations:
+            return ""
+        lines = [f"=== Prior run: {len(self._scored_iterations)} iteration(s) all failed ==="]
+        for score, data in self._scored_iterations:
+            n = data.get("iteration_num", "?")
+            lines.append(f"\n--- Iteration {n} (score {score:.2f}) ---")
+            # Checker
+            verdict = data.get("checker_verdict", "unknown")
+            if verdict != "pass":
+                lines.append(f"Checker: {verdict.upper()}")
+                for iss in data.get("checker_issues", [])[:4]:
+                    sev = iss.get("severity", "")
+                    desc = iss.get("description", "")
+                    fix = iss.get("suggested_fix", "")
+                    lines.append(f"  [{sev}] {desc}" + (f" → {fix}" if fix else ""))
+            # Dafny
+            if not data.get("dafny_verified", True) and data.get("dafny_spec"):
+                for fa in data.get("dafny_failing", [])[:3]:
+                    lines.append(f"  Dafny error: {fa}")
+            # Tests
+            if data.get("tests_executed") and (data.get("tests_failed", 0) > 0 or data.get("tests_errors", 0) > 0):
+                lines.append(
+                    f"  Tests: {data['tests_failed']} failed, "
+                    f"{data.get('tests_errors', 0)} errors / {data['tests_total']} total"
+                )
+            # Policy
+            if not data.get("policy_compliant", True):
+                lines.append(f"  Policy: NON-COMPLIANT (risk: {data.get('policy_risk', '?')})")
+                for v in data.get("policy_violations", [])[:3]:
+                    rule = v.get("rule_id", "")
+                    desc = v.get("description", "")
+                    lines.append(f"    [{rule}] {desc}")
+            # Feedback summary
+            summary = data.get("summary", "")
+            if summary:
+                lines.append(f"  Feedback: {summary[:200]}")
+        return "\n".join(lines)
+
 
 def show_logo() -> None:
     """Print the HPEMA block-letter gradient logo centered on screen."""
@@ -698,12 +1022,18 @@ def show_logo() -> None:
     console.print()
 
 
+def _is_local_endpoint(ep: str) -> bool:
+    """Return True if endpoint points to a local server."""
+    return any(h in ep for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+
+
 def show_startup_info(
     config_source: str = "",
     model: str = "",
     standard: str = "DO_178C",
     language: str = "Python",
     stage: PipelineStage = PipelineStage.POLICY,
+    models_config: Any = None,
 ) -> None:
     """Print configuration info block (shown after the logo)."""
     stage_labels = {
@@ -714,11 +1044,33 @@ def show_startup_info(
     stage_label = stage_labels.get(stage, stage.value)
     stage_style = "yellow" if stage != PipelineStage.POLICY else "green"
 
+    # Build agent model table if per-agent config is available
+    agent_table: Table | None = None
+    if models_config is not None:
+        _AGENT_ROWS = [
+            ("Actor",          models_config.actor,          stage_enabled(PipelineStage.ACTOR,   stage)),
+            ("Checker",        models_config.checker,        stage_enabled(PipelineStage.CHECKER, stage)),
+            ("Dafny Architect",models_config.dafny_architect,stage_enabled(PipelineStage.CHECKER, stage)),
+            ("Policy",         models_config.policy,         stage_enabled(PipelineStage.POLICY,  stage)),
+        ]
+        agent_table = Table(box=None, show_header=False, padding=(0, 1))
+        agent_table.add_column(width=2,  justify="right")   # indent
+        agent_table.add_column(width=16, style="dim")       # label
+        agent_table.add_column(width=36)                     # model name
+        agent_table.add_column(width=8)                      # API / LOCAL badge
+        for _label, cfg, _active in _AGENT_ROWS:
+            if not _active:
+                continue
+            _loc = _is_local_endpoint(cfg.endpoint)
+            _badge = (
+                Text("LOCAL", style="bold magenta")
+                if _loc
+                else Text("API",   style="bold cyan")
+            )
+            agent_table.add_row("", f"{_label}", cfg.model, _badge)
+
     info = Text(justify="left")
     info.append("\n")
-    if model:
-        info.append("  Model    ", style="dim")
-        info.append(f"{model}\n")
     if config_source:
         info.append("  Config   ", style="dim")
         info.append(f"{config_source}\n")
@@ -730,14 +1082,21 @@ def show_startup_info(
     info.append("Dafny\n", style="bold")
     info.append("  Stage    ", style="dim")
     info.append(f"{stage_label}\n", style=f"bold {stage_style}")
+
+    if agent_table is None and model:
+        info.append("  Model    ", style="dim")
+        info.append(f"{model}\n")
+
     info.append("\n  ")
     info.append("Type a requirement to begin", style="dim")
     info.append("  or  ", style="dim")
     info.append("/help", style="bold cyan")
 
+    content = Group(info, agent_table) if agent_table is not None else info
+
     console.print()
     console.print(Panel(
-        info,
+        content,
         border_style="bright_blue",
         padding=(1, 3),
     ))
@@ -826,6 +1185,7 @@ def show_help() -> None:
     table.add_row("/history [N]", "Show last N runs as a summary table (default: 15)")
     table.add_row("/audit", "Show traceability matrix for the last run")
     table.add_row("/config [path]", "Show config or load a new config file")
+    table.add_row("/setup", "Configure API keys and model endpoints interactively")
     table.add_row("/help", "Show this help")
     table.add_row("/quit", "Exit")
     console.print()
@@ -1157,8 +1517,56 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
     start   = time.monotonic()
     frame_i = 0
 
+    # "Setting up chat" animation steps shown after all layers are ready
+    _SETUP_STEPS = [
+        "Loading prompt templates",
+        "Warming model registry",
+        "Indexing policy standards",
+        "Ready",
+    ]
+    _SETUP_DURATION = 2.5   # total seconds for setup animation
+    _SETUP_STEP_GAP = _SETUP_DURATION / max(len(_SETUP_STEPS), 1)
+
+    def _build_setup_panel(frame: str, step_idx: int) -> Panel:
+        """Panel shown during the brief 'setting up' phase after all layers connect."""
+        table = Table(box=None, show_header=False, padding=(0, 2))
+        table.add_column(width=3,  justify="center")
+        table.add_column(width=9)
+        table.add_column(width=40)
+        table.add_column(width=18)
+
+        for name, cfg in layer_cfgs:
+            status = statuses[name]
+            if status == "disconnected":
+                icon  = "[dim]○[/]"
+                ep_s  = f"[dim]{cfg.endpoint}[/]"
+                state = "[dim]Disconnected[/]"
+            else:
+                icon  = "[bold green]✓[/]"
+                ep_s  = cfg.endpoint
+                state = "[bold green]Ready[/]"
+            table.add_row(icon, f"[bold]{name}[/]", ep_s, state)
+
+        completed_steps = _SETUP_STEPS[:step_idx]
+        upcoming        = _SETUP_STEPS[step_idx] if step_idx < len(_SETUP_STEPS) else None
+
+        setup_text = Text("\n")
+        for s in completed_steps:
+            setup_text.append(f"  ✓ {s}\n", style="dim green")
+        if upcoming:
+            setup_text.append(f"  {frame} ", style=f"bold bright_blue")
+            setup_text.append(f"{upcoming}\n", style="bright_blue")
+
+        return Panel(
+            Group(table, setup_text),
+            title="[bold bright_blue]Setting up chat[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+
     try:
-        with Live(console=console, refresh_per_second=8) as live:
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            # --- Phase 1: connectivity polling ---
             while True:
                 elapsed = time.monotonic() - start
                 frame   = _FRAMES[frame_i % len(_FRAMES)]
@@ -1186,6 +1594,22 @@ def wait_for_layers_ready(config: Any, stage: PipelineStage, max_wait: int = 300
                     waited += 0.25
                     frame_i += 1
                     live.update(_build_panel(_FRAMES[frame_i % len(_FRAMES)], time.monotonic() - start))
+
+            # --- Phase 2: "setting up" animation (only when all layers connected) ---
+            all_connected = all(s is True or s == "disconnected" for s in statuses.values())
+            if all_connected and not skip_event.is_set():
+                setup_start = time.monotonic()
+                while True:
+                    setup_elapsed = time.monotonic() - setup_start
+                    if setup_elapsed >= _SETUP_DURATION:
+                        break
+                    frame   = _FRAMES[frame_i % len(_FRAMES)]
+                    frame_i += 1
+                    step_idx = min(int(setup_elapsed / _SETUP_STEP_GAP), len(_SETUP_STEPS) - 1)
+                    live.update(_build_setup_panel(frame, step_idx))
+                    time.sleep(0.125)
+
+                # Let the loop exit — Live(transient=True) erases the panel on close.
 
     finally:
         # Signal the listener to stop, then wait for it to restore terminal attrs

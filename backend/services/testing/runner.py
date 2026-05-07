@@ -11,6 +11,7 @@ import logging
 import re
 import shutil
 import tempfile
+import textwrap
 import time
 from pathlib import Path
 
@@ -119,20 +120,21 @@ class TestRunner:
                 lines.append("")
                 continue
 
-            # Otherwise, wrap bare assertion(s) in a test function
-            # Handle multi-line snippets
-            snippet_lines = tc.splitlines()
+            # Otherwise, wrap bare assertion(s) in a test function.
+            # textwrap.dedent removes the common leading whitespace so that
+            # relative indentation within the snippet (for/if/with bodies)
+            # is preserved when we re-indent everything by 4 spaces.
+            dedented = textwrap.dedent(tc)
             lines.append(f"def test_case_{i}():")
-            for sl in snippet_lines:
-                # Strip any `if __name__` guards
-                stripped = sl.strip()
-                if stripped.startswith("if __name__"):
+            for sl in dedented.splitlines():
+                bare = sl.strip()
+                if bare.startswith("if __name__"):
                     continue
-                if stripped.startswith("print("):
+                if bare.startswith("print("):
                     continue
-                # Indent under the test function
-                if stripped:
-                    lines.append(f"    {stripped}")
+                if bare:
+                    # sl has relative indentation; prepend 4 spaces for the func body
+                    lines.append(f"    {sl}")
             lines.append("")
 
         return "\n".join(lines)

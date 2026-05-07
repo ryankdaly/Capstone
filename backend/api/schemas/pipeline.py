@@ -4,10 +4,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Skip signal — duck-typed coordinator for "skip current agent" key presses
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class SkipSignal(Protocol):
+    """Minimal interface the orchestrator needs from a skip coordinator.
+
+    The CLI's :class:`cli.display.SkipController` implements this. Backend
+    code stays decoupled from the CLI by depending only on this Protocol.
+    """
+
+    @property
+    def is_set(self) -> bool:  # pragma: no cover - protocol only
+        """Peek without clearing."""
+        ...
+
+    def consume(self) -> bool:  # pragma: no cover - protocol only
+        """Atomic check-and-clear. Returns True iff a skip was pending."""
+        ...
 
 from backend.api.schemas.agents import (
     CheckerReport,
@@ -58,6 +80,10 @@ class PipelineRequest(BaseModel):
     max_iterations: int = Field(default=3, ge=1, le=10)
     stage: PipelineStage = PipelineStage.POLICY  # default: full pipeline
     run_tests: bool = Field(default=True, description="Execute checker test cases via pytest")
+    retry_context: str = Field(
+        default="",
+        description="Error/warning dump from a prior failed run; fed to the Actor as initial context",
+    )
 
 
 # ---------------------------------------------------------------------------
