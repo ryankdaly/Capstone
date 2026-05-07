@@ -1,0 +1,5 @@
+model,n_prompts,mean_delta_CSS,W_plus,p_value,effect_r,significant_p05,effect_size,mean_tokens_solo,mean_tokens_hpema,mean_token_overhead,mean_cost_solo_usd,mean_cost_hpema_usd,mean_incremental_cost_usd,mean_delta_css_per_usd
+deepseek-v4-flash,19,0.1052,99.0,0.8721,0.0369,no,small,2119.0,53904.0,29.643,0.000554,0.009333,0.008779,12.5514
+deepseek-v4-pro,17,0.1233,98.0,0.3088,0.2468,no,small,2405.0,53293.0,24.442,0.001981,0.029418,0.027437,5.6828
+gpt-5.4-mini,10,0.1196,33.0,0.5751,0.1773,no,small,716.0,50892.0,84.118,0.002449,0.10972,0.107272,0.95
+qwen3-coder,13,0.2804,91.0,0.0015,0.8819,yes,large,668.0,41294.0,58.652,0.0,0.0,0.0,nan

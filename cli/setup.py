@@ -167,6 +167,16 @@ PROVIDERS: list[dict[str, Any]] = [
         "needs_key":      True,
     },
     {
+        "id":             "deepseek",
+        "label":          "DeepSeek  (deepseek-v4-flash, deepseek-v4-pro, deepseek-r1, …)",
+        "endpoint":       "https://api.deepseek.com",
+        "key_env":        "DEEPSEEK_API_KEY",
+        "key_prefix":     "sk-",
+        "default_model":  "deepseek-v4-flash",
+        "default_family": "deepseek-v3",
+        "needs_key":      True,
+    },
+    {
         "id":             "groq",
         "label":          "Groq  (llama-3.3-70b, mixtral-8x7b, …)",
         "endpoint":       "https://api.groq.com/openai/v1",
@@ -214,7 +224,7 @@ ALL_FAMILIES: list[str] = [
     "kimi-k2", "anthropic",
     "openai-gpt4o", "openai-reasoning",
     "stepfun", "minimax",
-    "deepseek-r1", "deepseek-v3",
+    "deepseek-r1", "deepseek-v3", "deepseek-v4",
 ]
 
 # Agents shown in the model-name step. dafny_architect is auto-set to mirror
@@ -461,7 +471,7 @@ def show_welcome_screen() -> None:
 # ---------------------------------------------------------------------------
 
 def _detect_active_keys() -> dict[str, str]:
-    candidates = ["NVIDIA_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "HPEMA_API_KEY"]
+    candidates = ["NVIDIA_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GROQ_API_KEY", "HPEMA_API_KEY"]
     return {
         var: val
         for var in candidates
@@ -723,6 +733,121 @@ def _validate_and_fix_keys(cfg_out: dict[str, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Config picker with side-panel YAML preview
+# ---------------------------------------------------------------------------
+
+def _pick_config_with_preview(configs: list[Path], title: str = "Select configuration") -> int:
+    """Arrow-key config list with a live YAML preview panel on the right.
+
+    Returns 0-based index into configs. Falls back to plain _pick_option if
+    prompt_toolkit is unavailable or the terminal is not a tty.
+    """
+    if not _PT or not sys.stdin.isatty():
+        return _pick_option([p.name for p in configs], title)
+
+    import yaml as _yaml
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import HSplit, VSplit, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+
+    choice = {"idx": 0}
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event):
+        choice["idx"] = (choice["idx"] - 1) % len(configs)
+        event.app.invalidate()
+
+    @kb.add("down")
+    def _down(event):
+        choice["idx"] = (choice["idx"] + 1) % len(configs)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    @kb.add("c-m")
+    def _select(event):
+        event.app.exit(result=choice["idx"])
+
+    @kb.add("c-c")
+    def _cancel(event):
+        event.app.exit(result=None)
+
+    _style = Style.from_dict({
+        "list-title": "bold #89b4fa",
+        "list-item":  "#6c7086",
+        "list-sel":   "bold #a6e3a1",
+        "preview-title": "bold #cba6f7",
+        "preview-body":  "#cdd6f4",
+    })
+
+    def _preview_lines() -> list[tuple[str, str]]:
+        path = configs[choice["idx"]]
+        lines: list[tuple[str, str]] = [("class:preview-title", f" {path.name}\n")]
+        lines.append(("class:preview-body", " " + "─" * 38 + "\n"))
+        try:
+            raw = _yaml.safe_load(path.read_text()) or {}
+            models = raw.get("models", {})
+            for role in ("actor", "checker", "policy", "dafny_architect"):
+                m = models.get(role, {})
+                if m:
+                    lines.append(("class:preview-body", f" [{role}]\n"))
+                    for k in ("endpoint", "model", "family", "api_key_env"):
+                        v = m.get(k, "")
+                        if v:
+                            # Truncate long values
+                            disp = v if len(v) <= 36 else v[:33] + "…"
+                            lines.append(("class:preview-body", f"   {k}: {disp}\n"))
+            verif = raw.get("verification", {})
+            if verif:
+                lines.append(("class:preview-body", " [verification]\n"))
+                for k in ("prover", "binary_path", "timeout_seconds"):
+                    v = verif.get(k, "")
+                    if v:
+                        lines.append(("class:preview-body", f"   {k}: {v}\n"))
+        except Exception as exc:
+            lines.append(("class:preview-body", f" (parse error: {exc})\n"))
+        return lines
+
+    def _list_lines() -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = [("class:list-title", f"\n  {title}\n\n")]
+        for i, p in enumerate(configs):
+            if i == choice["idx"]:
+                out.append(("class:list-sel", f"  ▶  {p.name}\n"))
+            else:
+                out.append(("class:list-item", f"     {p.name}\n"))
+        out.append(("", "\n  [↑↓ navigate  ·  Enter select  ·  Ctrl-C cancel]\n"))
+        return out
+
+    list_window    = Window(
+        content=FormattedTextControl(_list_lines, focusable=True),
+        width=Dimension(min=30, max=50),
+    )
+    preview_window = Window(
+        content=FormattedTextControl(_preview_lines, focusable=False),
+        width=Dimension(min=40),
+    )
+    divider        = Window(width=1, char="│", style="class:list-item")
+
+    layout = Layout(HSplit([
+        VSplit([list_window, divider, preview_window]),
+    ]))
+
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=_style,
+        full_screen=False,
+        mouse_support=False,
+    )
+    result = app.run()
+    if result is None:
+        raise KeyboardInterrupt
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main wizard
 # ---------------------------------------------------------------------------
 
@@ -754,7 +879,11 @@ def run_setup_wizard(edit_path: Path | None = None) -> bool:
             console.print()
             try:
                 action_idx = _pick_option(
-                    ["Edit existing configuration", "Create new configuration"],
+                    [
+                        "Use existing configuration (restart with it)",
+                        "Edit existing configuration",
+                        "Create new configuration",
+                    ],
                     "What would you like to do?",
                 )
             except KeyboardInterrupt:
@@ -762,10 +891,32 @@ def run_setup_wizard(edit_path: Path | None = None) -> bool:
                 return False
 
             if action_idx == 0:
+                # ── Use existing config — pick, set env, offer restart ─────
                 configs = sorted(home.glob("hpema_config*.yaml"))
-                options = [p.name for p in configs]
                 try:
-                    cidx = _pick_option(options, "Select configuration to edit")
+                    cidx = _pick_config_with_preview(configs, "Select configuration to use")
+                except KeyboardInterrupt:
+                    console.print("\n  [yellow]Setup cancelled.[/]\n")
+                    return False
+                chosen = configs[cidx]
+                os.environ["HPEMA_CONFIG"] = str(chosen)
+                _write_env({"HPEMA_CONFIG": str(chosen)})
+                console.print(
+                    f"\n  [green]✓[/] Active config set to [bold]{chosen.name}[/]\n"
+                    f"  [dim]Full path: {chosen}[/]\n"
+                )
+                if _confirm("Restart HPEMA now to apply?", default=True):
+                    _restart(str(chosen))
+                else:
+                    console.print(
+                        "\n  [dim]Config selection saved. Restart HPEMA for changes to fully take effect.[/]\n"
+                    )
+                return True
+
+            if action_idx == 1:
+                configs = sorted(home.glob("hpema_config*.yaml"))
+                try:
+                    cidx = _pick_config_with_preview(configs, "Select configuration to edit")
                 except KeyboardInterrupt:
                     console.print("\n  [yellow]Setup cancelled.[/]\n")
                     return False

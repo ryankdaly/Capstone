@@ -16,7 +16,14 @@ import logging
 import re
 from typing import Any, AsyncGenerator, Type
 
-from openai import AsyncOpenAI, BadRequestError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
 from pydantic import BaseModel, ValidationError
 
 from backend.services.llm.model_registry import ModelRegistry, ResolvedModel
@@ -147,11 +154,12 @@ class LLMClient:
 
         extra_body, extra_params = self._thinking_kwargs(resolved, profile)
 
+        max_tok_key = "max_completion_tokens" if profile.uses_max_completion_tokens else "max_tokens"
         kwargs: dict[str, Any] = {
             "model": resolved.model,
             "messages": self._messages(profile, eff_system, user_prompt),
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            max_tok_key: max_tokens,
             **extra_params,
         }
         if stream:
@@ -193,25 +201,31 @@ class LLMClient:
         All other 400s are re-raised immediately — they indicate a profile
         misconfiguration, not a transient failure.
         """
-        delays = [5, 15]  # seconds between attempt 1→2 and 2→3
-        for attempt, delay in enumerate([-1] + delays):
-            if delay >= 0:
-                logger.warning(
-                    "Transient API error — retrying in %ds (attempt %d/3)...",
-                    delay, attempt + 1,
-                )
-                await asyncio.sleep(delay)
+        # 5 → 10 → 30 → 30 → … up to 8 retries (~3.5 min total back-off ceiling)
+        _delays = [5, 10, 30, 30, 30, 30, 30, 30]
+        max_attempts = len(_delays) + 1
+        for attempt in range(max_attempts):
             try:
                 return await client.chat.completions.create(**kwargs)
-            except (InternalServerError, RateLimitError) as exc:
-                if attempt == len(delays):
+            except (APITimeoutError, APIConnectionError) as exc:
+                if attempt == max_attempts - 1:
                     raise
-                logger.warning("API error (%s): %s", type(exc).__name__, exc)
+                delay = _delays[attempt]
+                print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] {type(exc).__name__}: {exc}", flush=True)
+                await asyncio.sleep(delay)
+            except (InternalServerError, RateLimitError) as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                delay = _delays[attempt]
+                print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] {type(exc).__name__}: {str(exc)[:80]}", flush=True)
+                await asyncio.sleep(delay)
             except BadRequestError as exc:
                 if any(kw in str(exc).lower() for kw in _TRANSIENT_REQUEST_ERRORS):
-                    if attempt == len(delays):
+                    if attempt == max_attempts - 1:
                         raise
-                    logger.warning("Transient 400 (%s): %s", type(exc).__name__, exc)
+                    delay = _delays[attempt]
+                    print(f"  [api retry {attempt+1}/{max_attempts-1} in {delay}s] transient 400: {str(exc)[:80]}", flush=True)
+                    await asyncio.sleep(delay)
                 else:
                     raise
 

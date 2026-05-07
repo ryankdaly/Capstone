@@ -9,9 +9,10 @@
 #   gemma4        google/gemma-4-* (no system role)
 #   deepseek-r1   DeepSeek-R1 reasoning models
 #   deepseek-v3   DeepSeek-V3 non-reasoning
+#   deepseek-v4   DeepSeek-V4 Non-Reasoning/Reasoning
 #   kimi-k2       moonshotai/Kimi-K2
 #   anthropic     claude-* models via Anthropic API
-#   openai        gpt-4.1-* / o-series via OpenAI API
+#   openai        gpt-5.4-mini / o-series via OpenAI API
 #   stepfun       stepfun-ai/step-* models
 #   minimax       minimaxai/* models
 #   generic       any other OpenAI-compatible endpoint
@@ -50,10 +51,10 @@ policies:
 verification:
   prover: "dafny"
   timeout_seconds: 120
-  binary_path: "dafny"   # path to dafny binary; "dafny" assumes it is on PATH
+  binary_path: "dafny" # path to dafny binary; "dafny" assumes it is on PATH
 
 pipeline:
   max_iterations: 3
   require_human_approval: false
   audit_log_dir: "logs/audit"
-  stage: "policy"        # pipeline depth: "actor" | "checker" | "dafny" | "policy"
+  stage: "policy" # pipeline depth: "actor" | "checker" | "dafny" | "policy"
