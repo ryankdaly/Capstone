@@ -1,0 +1,297 @@
+# HPEMA Evaluation Prompt Suite — 20 safety-critical Python prompts
+# Ordered L1 (trivial) → L4 (research-grade).
+# Each entry maps directly to an edge test file: edge_tests/test_{id}.py
+
+- id: is_zero
+  level: L1
+  difficulty: 1
+  standard: DO_178C
+  requirement: |
+    Write me an is_zero function in Python.
+
+- id: in_range
+  level: L1
+  difficulty: 1
+  standard: DO_178C
+  requirement: |
+    Write a function in Python that checks whether an integer value is within a
+    closed interval [lo, hi], returning True if lo <= value <= hi and False
+    otherwise. It must also validate that lo <= hi and raise ValueError if not.
+
+- id: safe_negate
+  level: L1
+  difficulty: 1
+  standard: DO_178C
+  requirement: |
+    Write a Python function safe_negate(x: int) that returns the arithmetic
+    negation of x. It must detect the single value where negation overflows a
+    signed 32-bit integer (INT_MIN = -2147483648) and raise OverflowError in that
+    case rather than returning a wrong result.
+
+- id: clamp
+  level: L1
+  difficulty: 1
+  standard: DO_178C
+  requirement: |
+    Write a Python function clamp(value: int, lo: int, hi: int) -> int that clamps
+    value to the range [lo, hi]. The function must: (1) raise ValueError if lo > hi,
+    (2) return lo when value < lo, (3) return hi when value > hi, (4) return value
+    unchanged when already in range. Cover all four branches in accompanying
+    pytest tests.
+
+- id: safe_divide
+  level: L1
+  difficulty: 1
+  standard: DO_178C
+  requirement: |
+    Write a Python function safe_divide(numerator: int, denominator: int) ->
+    Optional[int] that performs integer (truncating) division. Return None instead
+    of raising on division by zero. Also detect and return None for the case where
+    numerator == INT_MIN and denominator == -1, which overflows in C signed
+    arithmetic and is undefined behaviour in C99. Document why each special case
+    exists.
+
+- id: saturating_add
+  level: L2
+  difficulty: 2
+  standard: DO_178C
+  requirement: |
+    Write a Python function saturating_add(a: int, b: int) -> int that adds two
+    signed 32-bit integers. If the mathematical result would exceed INT_MAX
+    (2147483647), return INT_MAX. If it would be less than INT_MIN (-2147483648),
+    return INT_MIN. Never raise; always return a valid int32 value. Include pytest
+    tests for: normal addition, positive overflow, negative overflow, both
+    boundaries exactly, and adding zero to each boundary.
+
+- id: xor_checksum
+  level: L2
+  difficulty: 2
+  standard: DO_178C
+  requirement: |
+    Write a Python function that computes an XOR checksum over a bytes-like object
+    and a companion verify function that returns True only if the checksum byte
+    appended to a message makes the XOR of all bytes (including the checksum byte)
+    equal to zero. Handle empty input, single-byte input, and non-bytes input with
+    explicit exceptions rather than silent wrong results. Explain in a comment why
+    XOR checksums fail to detect an even number of bit flips in the same position
+    across two bytes.
+
+- id: circular_buffer
+  level: L2
+  difficulty: 2
+  standard: DO_178C
+  requirement: |
+    Write a Python class CircularBuffer with a fixed capacity set at construction
+    time. It must support push(item) and pop() -> Optional. push must silently
+    overwrite the oldest item when full (overrun mode) rather than raising.
+    pop must return None on empty rather than raising. The implementation must use
+    a pre-allocated list (no append/extend after __init__) and track head, tail,
+    and count with integer indices. Include a is_full and is_empty property. Write
+    tests that verify overrun behaviour and that capacity is never exceeded.
+
+- id: int_moving_avg
+  level: L2
+  difficulty: 2
+  standard: DO_178C
+  requirement: |
+    Write a Python class IntMovingAverage that maintains a moving average over a
+    fixed window of N integer samples using only integer arithmetic — no float,
+    no Decimal. It must maintain a running sum and update it incrementally (O(1)
+    per sample, not O(N)). The get() method must return a correctly truncated
+    integer average. Detect and prevent integer overflow of the internal running
+    sum given that each sample is a signed 16-bit integer and the window can be
+    up to 256 samples. Include the worst-case sum magnitude in a comment.
+
+- id: rate_limiter
+  level: L2
+  difficulty: 2
+  standard: DO_178C
+  requirement: |
+    Write a Python function make_rate_limiter(max_delta: int) that returns a
+    callable limiter(new_value: int) -> int. Each call to limiter must clamp the
+    change from the previous output to at most max_delta per call — so if the
+    previous output was 100 and new_value is 200 with max_delta=10, the output
+    is 110. Handle the very first call (no previous value) by returning new_value
+    unchanged. Handle negative max_delta by raising ValueError at construction
+    time. Write tests for: ramp-up, ramp-down, no-change, first-call, and exact
+    boundary step.
+
+- id: crc16_ccitt
+  level: L3
+  difficulty: 3
+  standard: DO_178C
+  requirement: |
+    Write a Python function crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int
+    that computes the CRC-16/CCITT (polynomial 0x1021, no input/output reflection)
+    checksum. Use a precomputed 256-entry lookup table generated once at module
+    load time — not computed per-byte. Validate that initial is a 16-bit unsigned
+    value. Return a 16-bit unsigned integer. Include a known-good test vector:
+    crc16_ccitt(b"123456789") must equal 0x29B1. Explain in a comment what class
+    of errors CRC-16 is guaranteed to detect that XOR checksums cannot.
+
+- id: bitfield_extract
+  level: L3
+  difficulty: 3
+  standard: DO_178C
+  requirement: |
+    Write Python functions extract_unsigned(word: int, msb: int, lsb: int) -> int
+    and extract_signed(word: int, msb: int, lsb: int) -> int that extract a
+    bit-field from a 32-bit register word. msb and lsb are 0-indexed from the
+    LSB. Validate: msb >= lsb, both in [0, 31], and that word fits in 32 unsigned
+    bits. extract_signed must correctly sign-extend the result using two's
+    complement regardless of field width. Test with: a 1-bit field of value 1
+    (should be -1 signed, 1 unsigned), a 16-bit field spanning bits 23:8, and the
+    full 32-bit field. Do not use ctypes or struct.
+
+- id: state_machine
+  level: L3
+  difficulty: 3
+  standard: DO_178C
+  requirement: |
+    Write a Python class SafeStateMachine that is initialised with a set of valid
+    states and a dict mapping each state to the set of states it may legally
+    transition to. Implement transition(new_state) which raises InvalidTransition
+    (a custom exception) if the transition is not in the whitelist or if new_state
+    is not a known state. Implement a read-only current_state property. The
+    initial state must be provided at construction and must be a valid state.
+    Attempting to construct with an initial state not in the state set must raise
+    ValueError. Write tests covering: valid transition chain, illegal direct jump,
+    transition to unknown state, and construction with invalid initial state. This
+    pattern is used in flight-mode management systems.
+
+- id: schedulability
+  level: L3
+  difficulty: 3
+  standard: DO_178C
+  requirement: |
+    Write a Python function is_schedulable(tasks: list[dict]) -> bool that
+    performs Rate Monotonic schedulability analysis on a set of periodic tasks.
+    Each task dict has keys period (int, ms) and wcet (int, ms — worst-case
+    execution time). Apply the Liu & Layland utilisation bound: the task set is
+    schedulable if the sum of (wcet/period) for all tasks is <= n*(2^(1/n) - 1)
+    where n is the number of tasks. Validate that all periods and wcets are
+    positive integers and that wcet <= period for each task. Return False (not
+    raise) for invalid inputs. Include the exact bound value for n=1,2,3 in a
+    comment. This is used to certify that a real-time OS task set will always meet
+    its deadlines under worst-case conditions.
+
+- id: tmr_vote
+  level: L3
+  difficulty: 3
+  standard: DO_178C
+  requirement: |
+    Write a Python function tmr_vote(a: int, b: int, c: int, tolerance: int = 0)
+    -> tuple[int, bool] that implements a 2-of-3 majority voter for redundant
+    sensor channels. Return (agreed_value, True) when at least two channels agree
+    within tolerance of each other (|x - y| <= tolerance). Return (0, False) when
+    no two channels agree — this signals a triple disagreement fault requiring the
+    calling system to enter a safe state. tolerance=0 means exact agreement.
+    Validate that tolerance >= 0. Write tests for: all agree, two agree (all three
+    pair combinations), none agree, agreement at exact tolerance boundary, and
+    agreement exceeding tolerance by one. This pattern is used in flight control
+    computers and nuclear reactor safety systems.
+
+- id: fp_mul_q15
+  level: L4
+  difficulty: 4
+  standard: DO_178C
+  requirement: |
+    Write Python functions to multiply two fixed-point numbers in Q15.16 format
+    (15 integer bits, 16 fractional bits, signed, stored as int32). The function
+    fp_mul(a: int, b: int) -> int must: (1) perform the intermediate product in
+    64-bit space to avoid precision loss, (2) shift the result right by 16 bits
+    to restore the Q15.16 scale, (3) detect overflow (result outside int32 range)
+    and saturate to INT32_MAX or INT32_MIN rather than wrapping. Provide fp_to_float
+    and float_to_fp conversion helpers for testing. Verify with known cases:
+    fp_mul(1.5 as fp, 2.0 as fp) == 3.0 as fp, and the overflow saturation case
+    where multiplying INT32_MAX by 2.0 saturates rather than wraps. Explain why
+    intermediate 64-bit precision is mandatory in a comment.
+
+- id: scalar_kalman
+  level: L4
+  difficulty: 4
+  standard: DO_178C
+  requirement: |
+    Write a Python class ScalarKalman that implements a one-dimensional discrete
+    Kalman filter update step using only integer arithmetic scaled to avoid float.
+    State (x), estimate error covariance (P), process noise (Q), and measurement
+    noise (R) are all stored as integers scaled by a factor of 1000 (i.e., 1.0 is
+    stored as 1000). Implement predict(process_noise_scaled: int) and
+    update(measurement_scaled: int) -> int methods. The Kalman gain K = P / (P + R)
+    must be computed with enough intermediate precision to avoid truncation to zero.
+    Return the current state estimate from update(). Validate that P, Q, R remain
+    non-negative after each step. Write tests comparing output within ±5 (0.005
+    in true scale) of a float-based reference implementation for a step-input
+    sequence of 10 measurements.
+
+- id: arinc429
+  level: L4
+  difficulty: 4
+  standard: DO_178C
+  requirement: |
+    Write Python functions arinc429_pack and arinc429_unpack for the ARINC 429
+    avionics data bus word format. An ARINC 429 word is 32 bits: bits 1-8 = label
+    (octal, transmitted LSB first), bits 9-10 = SDI (source/destination
+    identifier, 0-3), bits 11-29 = data field (19 bits), bits 30-31 = SSM (sign/
+    status matrix, 0-3), bit 32 = parity (odd parity over bits 1-31).
+    arinc429_pack(label: int, sdi: int, data: int, ssm: int) -> int must:
+    validate each field is within its bit width, compute and insert odd parity,
+    reverse the label byte bits (ARINC 429 transmits label LSB first), and return
+    a 32-bit unsigned integer.
+    arinc429_unpack(word: int) -> dict must: verify the odd parity bit, raise
+    ParityError on mismatch, reverse the label bits back, and return a dict with
+    keys label, sdi, data, ssm, parity_ok.
+    Test with the known ARINC 429 label 0o205 (airspeed), data field 0x1234,
+    SDI=1, SSM=3. This is used in every commercial aircraft built after 1977.
+
+- id: event_rate_limiter
+  level: L4
+  difficulty: 4
+  standard: DO_178C
+  requirement: |
+    Write a Python class EventRateLimiter that tracks whether a stream of events
+    exceeds a maximum rate. It is constructed with max_events: int and
+    window_ms: int. The method record_event(timestamp_ms: int) -> bool returns
+    True if the event is within the allowed rate and False if it would exceed it
+    (the event is not recorded when rejected). timestamp_ms is a monotonic
+    millisecond counter that may wrap around at 2^32 (treat as unsigned 32-bit).
+    The implementation must correctly handle wraparound — a timestamp sequence of
+    [2^32 - 5, 2^32 - 1, 3, 10] must be treated as monotonically increasing.
+    Internally store only the timestamps of events in the current window; evict
+    events older than window_ms. Use no floating-point. Write tests covering:
+    normal rate, burst at limit, burst exceeding limit, and the wraparound
+    boundary. This pattern is required in flight data recorder systems that must
+    limit write rate to protect media longevity.
+
+- id: channel_health_monitor
+  level: L4
+  difficulty: 4
+  standard: DO_178C
+  requirement: |
+    Write a Python class ChannelHealthMonitor for monitoring N independent sensor
+    channels in a safety-critical system. Construct with: n_channels: int,
+    sample_window: int (number of recent samples to retain per channel),
+    range_lo: int, range_hi: int (valid range for all channels),
+    max_rate: int (maximum allowed change between consecutive samples),
+    stuck_threshold: int (maximum number of consecutive identical readings before
+    declaring a stuck fault).
+    Implement ingest(channel_id: int, value: int, timestamp_ms: int) -> ChannelStatus
+    where ChannelStatus is an enum with values: OK, OUT_OF_RANGE, RATE_VIOLATION,
+    STUCK, INTERMITTENT, DATA_LOSS.
+    Rules:
+    - OUT_OF_RANGE: value outside [range_lo, range_hi].
+    - RATE_VIOLATION: |value - previous| > max_rate (skip on first sample per channel).
+    - STUCK: last stuck_threshold samples are identical.
+    - INTERMITTENT: channel had a fault in the last window but not on every sample
+      (i.e., recovered at least once but faulted at least once within sample_window).
+    - DATA_LOSS: gap between timestamp_ms values for this channel exceeds 2 x the
+      median inter-sample interval computed from the channel's history. First two
+      samples cannot trigger DATA_LOSS.
+    - OK: none of the above.
+    - Faults are prioritised in the order listed above (OUT_OF_RANGE checked first).
+    Implement get_channel_report(channel_id: int) -> dict returning: current_status,
+    fault_count_in_window, last_good_value, last_good_timestamp_ms.
+    Validate channel_id is in [0, n_channels). Raise on invalid construction
+    parameters (negative window, range_lo > range_hi, negative thresholds).
+    Write pytest tests covering every fault type, the priority ordering between
+    fault types, the DATA_LOSS median calculation, and the INTERMITTENT transition.

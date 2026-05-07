@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Data / persistence (generated at runtime)
 data/audit.db
@@ -19,10 +20,16 @@ my_key.txt
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # Misc
 local/
 CLAUDE.md
 dafny/
 envs/
+data/harness/outputs/
 hpema_config.local.yaml
+
+# macOS
+.DS_Store
+**/.DS_Store

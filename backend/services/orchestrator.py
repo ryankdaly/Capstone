@@ -26,6 +26,7 @@ from backend.api.schemas.pipeline import (
     PipelineStage,
     PipelineState,
     PipelineStatus,
+    SkipSignal,
     StreamEvent,
     StreamEventType,
     stage_enabled,
@@ -89,13 +90,22 @@ class PipelineOrchestrator:
         self.last_state: PipelineState | None = None
 
     async def run(
-        self, request: PipelineRequest
+        self,
+        request: PipelineRequest,
+        skip_signal: SkipSignal | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Execute the pipeline, yielding SSE events as it progresses.
 
         Respects `request.stage` — the pipeline stops after the configured stage.
         Stages: ACTOR → CHECKER → POLICY. If stage=ACTOR, only code generation
         runs and the result is treated as successful (no checker/dafny/policy).
+
+        ``skip_signal`` is an optional coordinator the CLI uses to wire Ctrl+S
+        "skip current agent" key presses. The Actor is never skippable; for the
+        Dafny/Checker/Policy phases the orchestrator polls the signal at safe
+        checkpoints and inside the per-token streaming loops. A skip during
+        Policy short-circuits the entire pipeline and falls back to the best
+        iteration's code.
         """
         max_stage = request.stage
         state = PipelineState(
@@ -143,6 +153,17 @@ class PipelineOrchestrator:
         best_iteration: int = 0
         # Stash verified Dafny spec to skip architect on next iteration.
         _cached_dafny_spec: str | None = None
+        # Set when the user presses Ctrl+S during the Policy phase — short-
+        # circuits the iteration loop and surfaces the best-rated code so far.
+        _policy_skip_abort: bool = False
+
+        def _skip_pending() -> bool:
+            """Atomic check-and-clear — True iff user pressed Ctrl+S."""
+            return skip_signal is not None and skip_signal.consume()
+
+        def _skip_peek() -> bool:
+            """Peek without clearing — for breaking streaming inner loops."""
+            return skip_signal is not None and skip_signal.is_set
 
         # Actor-only has no feedback loop. Checker+ can loop on Dafny/Checker feedback.
         effective_max_iterations = (
@@ -277,6 +298,19 @@ class PipelineOrchestrator:
 
                     _dafny_cycles = range(1, _DAFNY_MAX_CYCLES + 1) if not _used_cached_spec else range(0)
                     for _cycle in _dafny_cycles:
+                        # User pressed Ctrl+S during a previous phase: bail before
+                        # we even start the LLM call.
+                        if _skip_pending():
+                            dafny_arch_skipped = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "dafny_architect",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Dafny phase skipped by user."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="dafny_architect",
+                                            data={"reason": "user_skip"})
+                            break
+
                         # ── Dafny Architect LLM ──────────────────────────────────────
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_architect")
                         self._audit.log(run_id, "agent_start", agent="dafny_architect",
@@ -294,6 +328,11 @@ class PipelineOrchestrator:
                                                       "dafny_architect", {"token": _item})
                                 else:
                                     dafny_result = _item
+                                # Early-exit token stream on Ctrl+S — closing the
+                                # async generator propagates GeneratorExit and tears
+                                # down the upstream HTTP stream cleanly.
+                                if _skip_peek():
+                                    break
                         except Exception as _arch_exc:
                             _dafny_retry_hint = str(_arch_exc)
                             logger.warning(
@@ -317,6 +356,20 @@ class PipelineOrchestrator:
                             # LLM failure: carry the hint; don't touch prior_dafny_verification
                             continue
 
+                        # Architect run completed (or stream broken by Ctrl+S).
+                        # Honor user's skip even if a partial result arrived: the
+                        # whole Dafny phase is treated as skipped for consistency.
+                        if _skip_pending():
+                            dafny_arch_skipped = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "dafny_architect",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Dafny phase skipped by user."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="dafny_architect",
+                                            data={"reason": "user_skip"})
+                            break
+
                         # Architect succeeded — publish output immediately.
                         code_candidate.dafny_spec = dafny_result.dafny_source
                         has_dafny_spec = bool(code_candidate.dafny_spec.strip())
@@ -332,6 +385,17 @@ class PipelineOrchestrator:
                                         data={**dafny_result.model_dump(), "cycle": _cycle})
 
                         # ── Dafny Verifier ────────────────────────────────────────────
+                        if _skip_pending():
+                            # User pressed Ctrl+S after the architect finished —
+                            # skip verification, accept the unverified spec, exit phase.
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "dafny_verifier",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Dafny verification skipped by user."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="dafny_verifier",
+                                            data={"reason": "user_skip"})
+                            break
                         yield self._event(run_id, StreamEventType.AGENT_START, "dafny_verifier")
                         _cycle_verification = await self._dafny.verify(code_candidate.dafny_spec)
                         verification_result = _cycle_verification
@@ -399,6 +463,16 @@ class PipelineOrchestrator:
                     is_python = request.target_language.value == "Python"
 
                     for _fix_round in range(1, _TEST_FIX_MAX + 2):  # 1 normal + 2 fix rounds
+                        if _skip_pending():
+                            _checker_skipped = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "checker",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Checker skipped by user."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="checker",
+                                            data={"reason": "user_skip"})
+                            break
                         # ── Checker LLM (with parse-failure retries) ──────────────
                         for _attempt in range(1, _CHECKER_MAX_RETRIES + 1):
                             yield self._event(run_id, StreamEventType.AGENT_START, "checker")
@@ -421,6 +495,8 @@ class PipelineOrchestrator:
                                                           "checker", {"token": _item})
                                     else:
                                         checker_report = _item
+                                    if _skip_peek():
+                                        break
                                 break  # LLM parse success
                             except Exception as _checker_exc:
                                 _checker_retry_hint = str(_checker_exc)
@@ -441,6 +517,18 @@ class PipelineOrchestrator:
                                     self._audit.log(run_id, "agent_skipped", agent="checker",
                                                     data={"error": str(_checker_exc)})
 
+                        # Honor skip even if a partial/full result arrived.
+                        if _skip_pending():
+                            _checker_skipped = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "checker",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Checker skipped by user."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="checker",
+                                            data={"reason": "user_skip"})
+                            break
+
                         if not _checker_skipped:
                             yield self._event(
                                 run_id, StreamEventType.AGENT_OUTPUT, "checker",
@@ -456,6 +544,15 @@ class PipelineOrchestrator:
                                             data=checker_report.model_dump())
 
                         # ── Test runner ───────────────────────────────────────────
+                        if _skip_pending():
+                            # Skip pressed between checker and test runner — drop tests.
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "test_runner",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Test runner skipped by user."},
+                            )
+                            break
+
                         if (
                             request.run_tests
                             and is_python
@@ -519,46 +616,74 @@ class PipelineOrchestrator:
                 policy_verdict = None
 
                 if stage_enabled(PipelineStage.POLICY, max_stage):
-                    yield self._event(run_id, StreamEventType.AGENT_START, "policy")
+                    if _skip_pending():
+                        # Policy skipped before it even started — abort pipeline
+                        # and surface the best-rated iteration's code.
+                        _policy_skip_abort = True
+                        yield self._event(
+                            run_id, StreamEventType.AGENT_ERROR, "policy",
+                            {"error": "skipped", "skipped": True,
+                             "message": "Policy skipped — surfacing best iteration so far."},
+                        )
+                        self._audit.log(run_id, "agent_skipped", agent="policy",
+                                        data={"reason": "user_skip"})
+                    else:
+                        yield self._event(run_id, StreamEventType.AGENT_START, "policy")
 
-                    try:
-                        policy_context = await self._retriever.retrieve(
-                            query=f"{request.requirement_text} {request.safety_standard.value}",
+                        try:
+                            policy_context = await self._retriever.retrieve(
+                                query=f"{request.requirement_text} {request.safety_standard.value}",
+                                standard=request.safety_standard.value,
+                            )
+                        except Exception as _rag_exc:
+                            logger.warning(
+                                "RAG retrieval failed (non-fatal) — proceeding without policy context: %s",
+                                _rag_exc,
+                            )
+                            policy_context = ""
+
+                        policy_verdict = None
+                        async for _item in self._policy.run_streaming(
+                            source_code=code_candidate.source_code,
+                            dafny_spec=code_candidate.dafny_spec,
                             standard=request.safety_standard.value,
-                        )
-                    except Exception as _rag_exc:
-                        logger.warning(
-                            "RAG retrieval failed (non-fatal) — proceeding without policy context: %s",
-                            _rag_exc,
-                        )
-                        policy_context = ""
+                            checker_report=checker_report,
+                            verification_result=verification_result,
+                            policy_context=policy_context,
+                        ):
+                            if isinstance(_item, str):
+                                yield self._event(run_id, StreamEventType.AGENT_TOKEN, "policy", {"token": _item})
+                            else:
+                                policy_verdict = _item
+                            if _skip_peek():
+                                break
 
-                    policy_verdict = None
-                    async for _item in self._policy.run_streaming(
-                        source_code=code_candidate.source_code,
-                        dafny_spec=code_candidate.dafny_spec,
-                        standard=request.safety_standard.value,
-                        checker_report=checker_report,
-                        verification_result=verification_result,
-                        policy_context=policy_context,
-                    ):
-                        if isinstance(_item, str):
-                            yield self._event(run_id, StreamEventType.AGENT_TOKEN, "policy", {"token": _item})
-                        else:
-                            policy_verdict = _item
-                    iteration.policy_verdict = policy_verdict
+                        if _skip_pending():
+                            # Mid-stream skip on Policy — abort pipeline regardless
+                            # of whether the verdict arrived. Best-rated iteration
+                            # surfaces below.
+                            _policy_skip_abort = True
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_ERROR, "policy",
+                                {"error": "skipped", "skipped": True,
+                                 "message": "Policy skipped — surfacing best iteration so far."},
+                            )
+                            self._audit.log(run_id, "agent_skipped", agent="policy",
+                                            data={"reason": "user_skip"})
+                        elif policy_verdict is not None:
+                            iteration.policy_verdict = policy_verdict
 
-                    yield self._event(
-                        run_id, StreamEventType.AGENT_OUTPUT, "policy",
-                        {
-                            "compliant": policy_verdict.compliant,
-                            "risk_level": policy_verdict.risk_level.value,
-                            "violations": [v.model_dump() for v in policy_verdict.violations],
-                            "recommendations": policy_verdict.recommendations,
-                            "reasoning_trace": policy_verdict.reasoning_trace,
-                        },
-                    )
-                    self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
+                            yield self._event(
+                                run_id, StreamEventType.AGENT_OUTPUT, "policy",
+                                {
+                                    "compliant": policy_verdict.compliant,
+                                    "risk_level": policy_verdict.risk_level.value,
+                                    "violations": [v.model_dump() for v in policy_verdict.violations],
+                                    "recommendations": policy_verdict.recommendations,
+                                    "reasoning_trace": policy_verdict.reasoning_trace,
+                                },
+                            )
+                            self._audit.log(run_id, "agent_output", agent="policy", data=policy_verdict.model_dump())
 
                 # --- CONVERGENCE CHECK ---
                 # Dafny is best-effort: tracked and fed back, but does NOT gate convergence.
@@ -648,6 +773,21 @@ class PipelineOrchestrator:
                     state.status = PipelineStatus.AWAITING_APPROVAL
                     state.final_code = code_candidate.source_code
                     state.final_proof = code_candidate.dafny_spec
+                    break
+
+                # User Ctrl+S during Policy short-circuits the entire pipeline.
+                # Surface the best-rated iteration's code so the operator gets
+                # something usable instead of an empty result.
+                if _policy_skip_abort:
+                    state.status = PipelineStatus.AWAITING_APPROVAL
+                    if best_iteration > 0 and best_iteration <= len(state.iterations):
+                        best_iter = state.iterations[best_iteration - 1]
+                        if best_iter.code_candidate is not None:
+                            state.final_code = best_iter.code_candidate.source_code
+                            state.final_proof = best_iter.code_candidate.dafny_spec
+                    if not state.final_code and code_candidate is not None:
+                        state.final_code = code_candidate.source_code
+                        state.final_proof = code_candidate.dafny_spec
                     break
             else:
                 state.status = PipelineStatus.FAILED

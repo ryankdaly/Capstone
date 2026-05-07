@@ -228,9 +228,13 @@ class BaseAgent(ABC):
             # Any other stream error (HTTP error, timeout, JSON decode, etc.)
             # was silently swallowing the failure without writing to the agent log.
             partial = "".join(chunks)
+            _transient = ("Timeout", "timeout", "ConnectionError", "ReadTimeout",
+                          "ConnectTimeout", "RemoteProtocolError", "ReadError")
+            is_transient = any(t in type(exc).__name__ or t in str(exc) for t in _transient)
             logger.error(
                 "Agent [%s] stream error after %d chunks: %s",
-                self.role, len(chunks), exc, exc_info=True,
+                self.role, len(chunks), exc,
+                exc_info=not is_transient,
             )
             _write_agent_log(
                 self.role, self._system_prompt, user_prompt,

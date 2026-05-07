@@ -6,6 +6,9 @@ color-coded verdicts, and a final summary panel.
 
 from __future__ import annotations
 
+import os
+import select
+import sys
 import threading
 import time
 from typing import Any
@@ -20,7 +23,140 @@ from rich.text import Text
 
 from backend.api.schemas.pipeline import PipelineStage, StreamEvent, StreamEventType, stage_enabled
 
+# termios is POSIX-only; Ctrl+S listener silently disables itself on Windows.
+try:
+    import termios  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover  - Windows fallback
+    termios = None  # type: ignore[assignment]
+
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Skip controller — handles Ctrl+S "skip current agent" key presses
+# ---------------------------------------------------------------------------
+
+# Agents the user is permitted to skip. Actor is excluded (no code to fall back
+# on). Dafny architect/verifier, Checker (and its checker_dafny streaming alias),
+# the test runner, and Policy are all skippable.
+_SKIPPABLE_AGENTS: frozenset[str] = frozenset({
+    "dafny_architect", "dafny_verifier", "checker", "checker_dafny",
+    "test_runner", "policy",
+})
+
+
+def _agent_is_skippable(agent: str) -> bool:
+    return agent in _SKIPPABLE_AGENTS
+
+
+class SkipController:
+    """Coordinates Ctrl+S "skip current agent" requests with the orchestrator.
+
+    Lifecycle:
+      - DisplayManager calls ``arm(agent)`` when starting a spinner for a
+        skippable agent — this spawns a daemon thread that puts stdin in raw
+        mode and listens for Ctrl+S.
+      - DisplayManager calls ``disarm()`` when the spinner stops; the listener
+        thread exits and stdin is restored.
+      - The orchestrator polls ``consume()`` at safe checkpoints. ``consume``
+        is atomic: it reports True at most once per skip request, then resets.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._listener_stop = threading.Event()
+        self._listener_thread: threading.Thread | None = None
+        self._armed_agent: str | None = None
+        self._lock = threading.Lock()
+
+    # -- Public API used by the orchestrator -------------------------------
+
+    @property
+    def is_set(self) -> bool:
+        """Peek without clearing."""
+        return self._event.is_set()
+
+    def consume(self) -> bool:
+        """Atomic check-and-clear. Returns True iff a skip was pending."""
+        with self._lock:
+            if self._event.is_set():
+                self._event.clear()
+                return True
+            return False
+
+    def request_skip(self) -> None:
+        """Set the skip flag (called from the listener thread)."""
+        self._event.set()
+
+    # -- Public API used by DisplayManager ---------------------------------
+
+    @property
+    def armed_agent(self) -> str | None:
+        return self._armed_agent
+
+    def arm(self, agent: str) -> None:
+        """Begin listening for Ctrl+S if *agent* is skippable. Idempotent."""
+        if not _agent_is_skippable(agent):
+            self.disarm()
+            return
+        if self._armed_agent == agent:
+            return
+        self.disarm()  # clean up any previous listener
+        self._armed_agent = agent
+        self._event.clear()
+        if termios is None or not sys.stdin.isatty():
+            return  # silently disabled on Windows / non-tty stdin
+        self._listener_stop = threading.Event()
+        self._listener_thread = threading.Thread(
+            target=self._listen, name="SkipController", daemon=True,
+        )
+        self._listener_thread.start()
+
+    def disarm(self) -> None:
+        """Stop the listener and clear armed state. Always safe to call."""
+        if self._listener_thread is not None:
+            self._listener_stop.set()
+            self._listener_thread.join(timeout=0.3)
+            self._listener_thread = None
+        self._armed_agent = None
+
+    # -- Internal listener -------------------------------------------------
+
+    def _listen(self) -> None:
+        if termios is None:
+            return
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            return
+        try:
+            old_attrs = termios.tcgetattr(fd)
+        except Exception:
+            return
+        new_attrs = list(old_attrs)
+        # Disable XON/XOFF so Ctrl+S reaches us instead of pausing terminal output
+        new_attrs[0] = new_attrs[0] & ~termios.IXON
+        # Disable canonical mode + echo so we read individual key presses
+        new_attrs[3] = new_attrs[3] & ~(termios.ICANON | termios.ECHO)
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+            while not self._listener_stop.is_set():
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if r:
+                    try:
+                        ch = os.read(fd, 1)
+                    except OSError:
+                        break
+                    if ch == b"\x13":  # Ctrl+S
+                        self.request_skip()
+                        break
+        except Exception:
+            pass  # never let the listener crash the main flow
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # HPEMA logo — ANSI Shadow block-letter style, blue top-to-bottom gradient
@@ -161,21 +297,48 @@ class _StreamingPanel:
 
     Token chunks are appended via ``add_token()`` from the event handler; the
     Rich refresh thread calls ``__rich__()`` at 12 fps to pick up changes.
+
+    For skippable agents the bottom border carries a balanced hint pair:
+    ``Ctrl+C interrupt`` on the left and ``Ctrl+S skip`` on the right. For
+    non-skippable agents (e.g. Actor) only the interrupt hint is shown.
     """
 
     _DOT_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _VERB_INTERVAL = 5.0
 
-    def __init__(self, agent: str) -> None:
+    # Hint colors that pop on dark backgrounds without competing with the
+    # agent's own border color.
+    _HINT_INTERRUPT_STYLE = "dim #f38ba8"   # soft red — interrupt
+    _HINT_SKIP_STYLE      = "dim #89dceb"   # soft cyan — skip
+
+    def __init__(self, agent: str, skippable: bool = False) -> None:
         name, color = AGENT_STYLE.get(agent, (agent.replace("_", " ").title(), "white"))
         self._name = name
         self._color = color
         self._verbs = _AGENT_VERBS.get(agent, ["working"])
         self._start = time.monotonic()
         self._chunks: list[str] = []  # GIL-safe for CPython append + read
+        self._skippable = skippable
 
     def add_token(self, token: str) -> None:
         self._chunks.append(token)
+
+    def _build_subtitle(self) -> Text | None:
+        """Bottom-border hints. Skippable: Ctrl+C left, Ctrl+S right. Else: only Ctrl+C."""
+        interrupt = Text("Ctrl+C interrupt", style=self._HINT_INTERRUPT_STYLE)
+        if not self._skippable:
+            return interrupt
+        skip = Text("Ctrl+S skip", style=self._HINT_SKIP_STYLE)
+        # Compute spacing so the two hints land at opposite ends of the
+        # available subtitle width. The Panel border consumes 2 cols and the
+        # surrounding " ─ " padding around the subtitle takes another ~4.
+        inner_w = max(40, console.width - 6)
+        gap = max(inner_w - interrupt.cell_len - skip.cell_len, 4)
+        bar = Text()
+        bar.append(interrupt)
+        bar.append(" " * gap)
+        bar.append(skip)
+        return bar
 
     def __rich__(self) -> Panel:
         elapsed = time.monotonic() - self._start
@@ -204,6 +367,8 @@ class _StreamingPanel:
         return Panel(
             body,
             title=title,
+            subtitle=self._build_subtitle(),
+            subtitle_align="center",
             border_style=self._color,
             padding=(0, 1),
         )
@@ -273,15 +438,24 @@ class DisplayManager:
         # Live panel — active between AGENT_START and AGENT_OUTPUT
         self._live: Live | None = None
         self._streaming_panel: _StreamingPanel | None = None
+        # Ctrl+S skip-current-agent coordinator. Shared with the orchestrator
+        # via cli.runner so it can poll consume() at safe checkpoints.
+        self.skip_controller: SkipController = SkipController()
 
     # ------------------------------------------------------------------
     # Live panel helpers
     # ------------------------------------------------------------------
 
     def _start_spinner(self, agent: str) -> None:
-        """Start a live streaming panel for the given agent."""
+        """Start a live streaming panel for the given agent.
+
+        Also arms the Ctrl+S listener for skippable agents so the user can
+        cut a long-running phase short. Non-skippable agents (Actor) get the
+        listener disarmed so a stray Ctrl+S can't be misinterpreted later.
+        """
         self._stop_spinner()
-        self._streaming_panel = _StreamingPanel(agent)
+        skippable = _agent_is_skippable(agent)
+        self._streaming_panel = _StreamingPanel(agent, skippable=skippable)
         self._live = Live(
             self._streaming_panel,
             refresh_per_second=12,
@@ -289,6 +463,8 @@ class DisplayManager:
             console=console,
         )
         self._live.start()
+        # arm() handles both directions: skippable → listen, otherwise → disarm.
+        self.skip_controller.arm(agent)
 
     def _stop_spinner(self) -> None:
         """Stop and erase the current live panel. No-op if none running."""
@@ -296,10 +472,13 @@ class DisplayManager:
             self._live.stop()
             self._live = None
         self._streaming_panel = None
+        # Always disarm so stdin returns to canonical mode before any prompt.
+        self.skip_controller.disarm()
 
     def cleanup(self) -> None:
         """Force-stop any running live panel. Call from exception handlers."""
         self._stop_spinner()
+        self.skip_controller.disarm()
 
     def handle_event(self, event: StreamEvent) -> None:
         """Route a stream event to the appropriate display method."""

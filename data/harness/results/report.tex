@@ -1,0 +1,93 @@
+\documentclass{article}
+\usepackage{booktabs}
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{HPEMA vs Solo: Main Safety Metrics (N=5 reps, all prompts averaged)}
+\label{tab:main_results}
+\begin{tabular}{lllllll}
+\toprule
+\textbf{Model} & \textbf{Condition} & \textbf{FV} & \textbf{VS} & \textbf{PA} & \textbf{EC} & \textbf{CSS} \\
+\midrule
+Qwen3-Coder-480B & Solo & 0.000 & 0.663 & 0.983 & 0.737 & 0.518 \\
+Qwen3-Coder-480B & HPEMA & 0.564 & 0.916 & 0.985 & 0.802 & 0.799 \\
+\midrule
+DeepSeek-V4-Pro & Solo & 0.471 & 0.625 & 0.991 & 0.748 & 0.675 \\
+DeepSeek-V4-Pro & HPEMA & 0.765 & 0.701 & 0.990 & 0.725 & 0.798 \\
+\midrule
+DeepSeek-V4-Flash & Solo & 0.456 & 0.776 & 0.990 & 0.805 & 0.720 \\
+DeepSeek-V4-Flash & HPEMA & 0.807 & 0.730 & 0.991 & 0.764 & 0.826 \\
+\midrule
+GPT-5.4-mini & Solo & 0.385 & 0.798 & 0.989 & 0.832 & 0.705 \\
+GPT-5.4-mini & HPEMA & 0.900 & 0.805 & 0.990 & 0.800 & 0.884 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{$\Delta$CSS by Difficulty Tier (HPEMA $-$ Solo)}
+\label{tab:delta_tier}
+\begin{tabular}{llllll}
+\toprule
+\textbf{Model} & \textbf{ΔCSS L1} & \textbf{ΔCSS L2} & \textbf{ΔCSS L3} & \textbf{ΔCSS L4} & \textbf{ΔCSS All} \\
+\midrule
+Mistral-Large-3 & — & — & — & — & — \\
+\midrule
+Qwen3-Coder-480B & +0.438 & +0.204 & +0.145 & — & +0.280 \\
+\midrule
+Gemma-3-27B & — & — & — & — & — \\
+\midrule
+DeepSeek-V4-Pro & +0.100 & +0.068 & +0.142 & +0.273 & +0.123 \\
+\midrule
+DeepSeek-V4-Flash & +0.059 & +0.084 & +0.138 & +0.147 & +0.105 \\
+\midrule
+GPT-5.4-mini & -0.003 & +0.023 & +0.186 & +0.113 & +0.120 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Wilcoxon Signed-Rank Test: 20-prompt $\Delta$CSS per Model}
+\label{tab:wilcoxon}
+\begin{tabular}{llllllll}
+\toprule
+\textbf{Model} & \textbf{N} & \textbf{Mean ΔCSS} & \textbf{W+} & \textbf{p} & \textbf{r} & \textbf{Significant} & \textbf{Effect} \\
+\midrule
+DeepSeek-V4-Flash & 19 & +0.105 & 99.0 & 0.8721 & 0.0369 & no & small \\
+\midrule
+DeepSeek-V4-Pro & 17 & +0.123 & 98.0 & 0.3088 & 0.2468 & no & small \\
+\midrule
+GPT-5.4-mini & 10 & +0.120 & 33.0 & 0.5751 & 0.1773 & no & small \\
+\midrule
+Qwen3-Coder-480B & 13 & +0.280 & 91.0 & 0.0015 & 0.8819 & yes & large \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Business Metrics: Token Efficiency and Marginal Cost}
+\label{tab:business}
+\begin{tabular}{llllll}
+\toprule
+\textbf{Model} & \textbf{CSS/1k tok Solo} & \textbf{CSS/1k tok HPEMA} & \textbf{Token Overhead} & \textbf{Incr. Cost/prompt} & \textbf{ΔCSS per $} \\
+\midrule
+Mistral-Large-3 & — & — & — & $0 (free) & ∞ (free) \\
+\midrule
+Qwen3-Coder-480B & 0.8912 & 0.0330 & 58.65× & $0 (free) & ∞ (free) \\
+\midrule
+Gemma-3-27B & — & — & — & $0 (free) & ∞ (free) \\
+\midrule
+DeepSeek-V4-Pro & 0.3937 & 0.0258 & 24.44× & $0.02744 & 5.683 \\
+\midrule
+DeepSeek-V4-Flash & 0.6187 & 0.0271 & 29.64× & $0.00878 & 12.551 \\
+\midrule
+GPT-5.4-mini & 1.6794 & 0.0263 & 84.12× & $0.10727 & 0.950 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

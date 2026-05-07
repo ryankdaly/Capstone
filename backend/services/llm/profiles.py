@@ -36,6 +36,9 @@ class ModelFamilyProfile:
     """True → response_format=json_schema (constrained decoding) is used.
     False → prompt-only JSON enforcement via _json_prompt_suffix()."""
 
+    uses_max_completion_tokens: bool = False
+    """True → send max_completion_tokens instead of max_tokens (required by GPT-5+ models)."""
+
     # ── Thinking / reasoning ─────────────────────────────────────────────────
     thinking_mode: ThinkingMode = "none"
 
@@ -133,9 +136,10 @@ PROFILES: dict[str, ModelFamilyProfile] = {
     # Model IDs: gpt-4o  gpt-4o-mini  gpt-4.1  gpt-4-turbo
     "openai-gpt4o": ModelFamilyProfile(
         supports_system_role=True,
-        supports_json_schema=True,
+        supports_json_schema=False,
+        uses_max_completion_tokens=True,
         thinking_mode="none",
-        notes="GPT-4o, GPT-4.1. Full json_schema constrained decoding.",
+        notes="GPT-4o, GPT-4.1, GPT-5.x. Prompt-only JSON (json_schema causes stalls on complex prompts). Requires max_completion_tokens.",
     ),
 
     # ── OpenAI o-series (native reasoners) ──────────────────────────────────
@@ -256,20 +260,41 @@ PROFILES: dict[str, ModelFamilyProfile] = {
         ),
     ),
 
-    # ── DeepSeek V3 / V3.2 / V4 ────────────────────────────────────────────
+    # ── DeepSeek V3 / V3.2 / V4-flash ──────────────────────────────────────
     # Does not think. System role supported.
     # json_schema NOT supported — json_object only (needs "json" in prompt).
     # Our prompt-only fallback includes "JSON" in the injected suffix, satisfying
     # V3's requirement automatically.
-    # Model IDs: deepseek-ai/deepseek-v3.2  deepseek-ai/deepseek-v4-pro
+    # Model IDs: deepseek-ai/deepseek-v3  deepseek-ai/deepseek-v3.2
+    #            deepseek-v4-flash (non-reasoning fast variant)
     "deepseek-v3": ModelFamilyProfile(
         supports_system_role=True,
         supports_json_schema=False,
         thinking_mode="none",
         notes=(
-            "DeepSeek V3/V3.2/V4. No thinking. No json_schema — prompt-only "
-            "JSON enforcement is sufficient (our suffix includes 'JSON' text). "
+            "DeepSeek V3/V3.2 and V4-flash (non-reasoning). No thinking. "
+            "No json_schema — prompt-only JSON enforcement is sufficient. "
             "json_object mode requires 'json' in the prompt."
+        ),
+    ),
+
+    # ── DeepSeek V4-pro (reasoning variant) ─────────────────────────────────
+    # V4-pro supports optional thinking via reasoning_effort (top-level param)
+    # + extra_body={"thinking": {"type": "enabled"}}.
+    # No json_schema — prompt-only JSON enforcement.
+    # When enable_thinking=True: both reasoning_effort="high" and thinking body
+    # are sent. When False: neither is sent, model runs non-reasoning mode.
+    # Model IDs: deepseek-v4-pro (via api.deepseek.com)
+    "deepseek-v4": ModelFamilyProfile(
+        supports_system_role=True,
+        supports_json_schema=False,
+        thinking_mode="toggle-off",
+        thinking_on_extra_params={"reasoning_effort": "high"},
+        thinking_on_extra_body={"thinking": {"type": "enabled"}},
+        notes=(
+            "DeepSeek V4-pro reasoning variant. Thinking toggled by "
+            "reasoning_effort (top-level) + extra_body.thinking.type. "
+            "No json_schema — use prompt-only JSON enforcement."
         ),
     ),
 

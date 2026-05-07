@@ -49,8 +49,11 @@ async def _run_async(
     display: DisplayManager,
 ) -> PipelineState | None:
     orchestrator = _build_orchestrator()
+    # display.skip_controller satisfies the SkipSignal Protocol the orchestrator
+    # depends on. Passing it lets Ctrl+S short-circuit the current agent.
+    skip_signal = getattr(display, "skip_controller", None)
     try:
-        async for event in orchestrator.run(request):
+        async for event in orchestrator.run(request, skip_signal=skip_signal):
             display.handle_event(event)
         return orchestrator.last_state
     finally:
