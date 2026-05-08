@@ -157,7 +157,7 @@ class TestDafnyArchitectPromptBuilding:
         assert "Solver output" not in prompt
 
     def test_max_tokens_is_1000(self):
-        assert DafnyArchitectAgent.max_tokens == 1000
+        assert DafnyArchitectAgent.max_tokens == 8192
 
 
 # ---------------------------------------------------------------------------

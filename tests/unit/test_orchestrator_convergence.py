@@ -245,10 +245,16 @@ class TestRegressionDetection:
         )
         # Iteration 1: dafny passes (score = 0 + 1 + 0.5 + 0.25 = 1.75)
         # Iteration 2: dafny fails (score = 0 + 1 + 0 + 0.25 = 1.25) → regression
+        # Orchestrator now: iter-1 runs 1 cycle (verified→break), then caches the spec.
+        # Iter-2: cache-check (1 call, fails) + up to 3 fresh cycles (all fail) = 4 calls.
+        # Total minimum: 5 side_effects to let both iterations complete before
+        # a possible iter-3 error (which still writes last_state with ≥ 2 iterations).
         orch._dafny.verify = _AsyncMock(side_effect=[
-            VerificationResult(verified=True),
-            VerificationResult(verified=False, failing_assertions=["postcondition failed"]),
-            VerificationResult(verified=False),
+            VerificationResult(verified=True),                                          # iter 1, cycle 1 → passes, caches spec
+            VerificationResult(verified=False),                                         # iter 2, cache check → fails, run fresh
+            VerificationResult(verified=False, failing_assertions=["postcondition failed"]),  # iter 2, cycle 1
+            VerificationResult(verified=False),                                         # iter 2, cycle 2
+            VerificationResult(verified=False),                                         # iter 2, cycle 3
         ])
         await _collect(orch, _req(max_iterations=3))
         state = orch.last_state
