@@ -135,7 +135,7 @@ async def _llm_classify(text: str) -> Intent:
         }
         return _MAP.get(raw, Intent.GENERATE)
 
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         return Intent.GENERATE
 
 
@@ -194,7 +194,7 @@ def classify(text: str, has_history: bool) -> ClassifiedIntent:
     # ── LLM classify: short/ambiguous input that doesn't mention an agent ──
     try:
         intent = asyncio.run(_llm_classify(text))
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         intent = Intent.GENERATE
 
     return ClassifiedIntent(intent=intent)

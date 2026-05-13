@@ -424,7 +424,7 @@ class LLMClient:
                     role,
                 )
                 raise  # propagate up through run_streaming → orchestrator retry
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 logger.warning(
                     "Streaming interrupted for %s (%s: %s) — falling back.",
                     role, type(exc).__name__, exc,

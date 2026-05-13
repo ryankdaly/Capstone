@@ -1483,7 +1483,13 @@ def start_repl() -> None:
         # --- Build mode: classify intent, then dispatch ---
         from cli.intent import Intent, classify as _classify
 
-        classified = _classify(line, has_history=bool(session.history))
+        try:
+            classified = _classify(line, has_history=bool(session.history))
+        except BaseException:
+            # CancelledError (and any other BaseException) from the LLM classifier
+            # must not crash the REPL — treat ambiguous input as GENERATE.
+            _do_full_pipeline(line, session, _pt_session if _PT_AVAILABLE else None)
+            continue
 
         if classified.intent == Intent.CONVERSE:
             # Off-topic or ambiguous — answer inline without switching modes
