@@ -77,6 +77,15 @@ _CHECKER_AGAIN  = re.compile(r"checker.{0,20}again|again.{0,20}checker", re.IGNO
 _DAFNY_AGAIN    = re.compile(r"dafny.{0,20}again|again.{0,20}dafny",     re.IGNORECASE)
 _POLICY_AGAIN   = re.compile(r"policy.{0,20}again|again.{0,20}policy",   re.IGNORECASE)
 
+# Inputs starting with a question word → might be CONVERSE; route to LLM classifier.
+# Everything else → almost certainly a GENERATE requirement.
+_QUESTION_START_RE = re.compile(
+    r"^\s*(what|how|why|when|where|who|which|can\b|could\b|would\b|should\b"
+    r"|is\b|are\b|do\b|does\b|did\b|will\b|has\b|have\b"
+    r"|explain|tell me|describe|help me|i have a question|i want to know)",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # LLM classifier prompt (very small — 20 tokens output max)
@@ -187,11 +196,16 @@ def classify(text: str, has_history: bool) -> ClassifiedIntent:
     if _POLICY_VERBS.search(text) or _POLICY_AGAIN.search(text):
         return ClassifiedIntent(intent=Intent.RERUN_POLICY)
 
-    # ── Fast path E: longer input, no agent keywords → GENERATE ───────────
-    if n > 8:
+    # ── Fast path E: non-question input with no agent keywords → GENERATE ────
+    # Any input that doesn't start with a question word is almost certainly a
+    # requirement to generate code, not a conversational query. Avoids an
+    # ~1s LLM call for the common case: "write me an X function", "implement Y".
+    # Inputs starting with question words ("what", "how", "why", "can you", …)
+    # fall through to the LLM so genuine questions get a chat response.
+    if not _QUESTION_START_RE.match(text):
         return ClassifiedIntent(intent=Intent.GENERATE)
 
-    # ── LLM classify: short/ambiguous input that doesn't mention an agent ──
+    # ── LLM classify: question-like input that heuristics can't resolve ──────
     try:
         intent = asyncio.run(_llm_classify(text))
     except (Exception, asyncio.CancelledError):
