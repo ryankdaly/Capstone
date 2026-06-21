@@ -47,8 +47,9 @@ class CheckerAgent(BaseAgent):
                 "meant — and use them to write more targeted, boundary-aware test cases.",
             ]
             if dafny_solver_output and dafny_solver_output.strip():
+                truncated = dafny_solver_output[:800] + ("…" if len(dafny_solver_output) > 800 else "")
                 hint_lines.append(
-                    f"### Verification failure (Dafny output)\n```\n{dafny_solver_output[:800]}\n```"
+                    f"### Verification failure (Dafny output)\n```\n{truncated}\n```"
                 )
             hint_lines.append(f"### Unverified spec\n```dafny\n{dafny_unverified_spec}\n```")
             parts.append("\n".join(hint_lines))

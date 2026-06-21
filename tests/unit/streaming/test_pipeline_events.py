@@ -413,3 +413,134 @@ class TestAgentTokenPayload:
 
         received = [e.data["token"] for e in _token_events_for(events, "actor")]
         assert received == special_tokens
+
+
+# ---------------------------------------------------------------------------
+# Multi-iteration: ITERATION_COMPLETE fires, tokens appear in each iteration
+# ---------------------------------------------------------------------------
+
+def _make_orchestrator_multi_iteration(
+    checker_results: list[Any],
+    actor_tokens: list[str] = ("tok_a",),
+) -> PipelineOrchestrator:
+    """Orchestrator whose checker returns successive results across iterations."""
+    from backend.api.schemas.agents import TestRunResult
+
+    orch = PipelineOrchestrator.__new__(PipelineOrchestrator)
+    orch._audit = MagicMock()
+    orch._retriever = MagicMock()
+    orch._retriever.retrieve.return_value = "policy context"
+    orch.last_state = None
+
+    # Actor always passes
+    actor_result = CodeCandidate(source_code="def f(): pass", language="Python")
+    orch._actor = _make_streaming_agent_mock(list(actor_tokens), actor_result)
+
+    # DafnyArchitect always passes
+    dafny_arch_result = DafnySpec(dafny_source="method F() {}")
+    orch._dafny_architect = _make_streaming_agent_mock(["d"], dafny_arch_result)
+
+    # Checker: yields successive results from the list (last entry repeated if exhausted)
+    call_idx = [0]
+
+    async def _checker_streaming(**kwargs: Any) -> AsyncGenerator:
+        idx = call_idx[0]
+        call_idx[0] += 1
+        result = checker_results[min(idx, len(checker_results) - 1)]
+        yield "ck_tok"
+        yield result
+
+    checker_mock = MagicMock()
+    checker_mock.run_streaming = _checker_streaming
+    orch._checker = checker_mock
+
+    # Policy always passes
+    policy_result = PolicyVerdict(compliant=True, risk_level=RiskLevel.LOW)
+    orch._policy = _make_streaming_agent_mock(["p"], policy_result)
+
+    # Dafny runner: always verified
+    dafny_runner = MagicMock()
+    dafny_runner.verify = AsyncMock(return_value=VerificationResult(verified=True))
+    orch._dafny = dafny_runner
+
+    # Test runner: not executed
+    test_runner = MagicMock()
+    test_runner.run = AsyncMock(return_value=TestRunResult(executed=False, total=0))
+    orch._test_runner = test_runner
+
+    orch._llm = MagicMock()
+    orch._llm.aclose = AsyncMock()
+
+    return orch
+
+
+class TestMultiIterationEvents:
+    def _request(self, max_iterations: int = 3) -> PipelineRequest:
+        return PipelineRequest(
+            requirement_text="test requirement",
+            safety_standard="DO_178C",
+            target_language="Python",
+            max_iterations=max_iterations,
+            stage=PipelineStage.POLICY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_iteration_complete_fires_between_iterations(self):
+        """ITERATION_COMPLETE must appear once for a 2-iteration run."""
+        from backend.api.schemas.agents import Issue, Severity
+
+        fail_report = CheckerReport(
+            verdict=CheckerVerdict.FAIL,
+            issues=[Issue(description="bug", severity=Severity.CRITICAL)],
+        )
+        pass_report = CheckerReport(verdict=CheckerVerdict.PASS)
+
+        orch = _make_orchestrator_multi_iteration([fail_report, pass_report])
+        events = await _collect_events(orch, self._request())
+
+        iteration_complete = _events_of_type(events, StreamEventType.ITERATION_COMPLETE)
+        assert len(iteration_complete) >= 1, (
+            "ITERATION_COMPLETE event must fire after the failing iteration"
+        )
+
+    @pytest.mark.asyncio
+    async def test_actor_tokens_appear_in_each_iteration(self):
+        """Actor tokens must be emitted on every iteration, not just the first."""
+        from backend.api.schemas.agents import Issue, Severity
+
+        fail_report = CheckerReport(
+            verdict=CheckerVerdict.FAIL,
+            issues=[Issue(description="bug", severity=Severity.CRITICAL)],
+        )
+        pass_report = CheckerReport(verdict=CheckerVerdict.PASS)
+
+        orch = _make_orchestrator_multi_iteration(
+            [fail_report, pass_report], actor_tokens=["a1"]
+        )
+        events = await _collect_events(orch, self._request())
+
+        actor_tokens = _token_events_for(events, "actor")
+        # 2 iterations × 1 token each
+        assert len(actor_tokens) == 2, (
+            f"Expected 2 actor token events (one per iteration), got {len(actor_tokens)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_converges_on_second_iteration(self):
+        """Pipeline must reach AWAITING_APPROVAL (not FAILED) when iteration 2 passes."""
+        from backend.api.schemas.agents import Issue, Severity
+        from backend.api.schemas.pipeline import PipelineStatus
+
+        fail_report = CheckerReport(
+            verdict=CheckerVerdict.FAIL,
+            issues=[Issue(description="bug", severity=Severity.CRITICAL)],
+        )
+        pass_report = CheckerReport(verdict=CheckerVerdict.PASS)
+
+        orch = _make_orchestrator_multi_iteration([fail_report, pass_report])
+        await _collect_events(orch, self._request())
+
+        assert orch.last_state is not None
+        assert orch.last_state.status == PipelineStatus.AWAITING_APPROVAL, (
+            f"Expected AWAITING_APPROVAL, got {orch.last_state.status}"
+        )

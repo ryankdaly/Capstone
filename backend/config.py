@@ -173,7 +173,12 @@ def find_config_path() -> Path | None:
         p = Path(env_val)
         if p.is_absolute() and p.exists():
             return p
-        # relative or missing → fall through (don't silently fail an explicit override)
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "HPEMA_CONFIG=%r does not resolve to an existing absolute path — "
+            "falling back to ~/.hpema discovery.",
+            env_val,
+        )
 
     # 2 + 3. HPEMA home dir — always
     home = hpema_home()
@@ -194,7 +199,9 @@ def load_config(path: Path | None = None) -> HpemaConfig:
         return HpemaConfig(**raw)
 
     if path is not None:
-        return _load(path) if path.exists() else HpemaConfig()
+        if not path.exists():
+            raise FileNotFoundError(f"HPEMA config not found: {path}")
+        return _load(path)
 
     discovered = find_config_path()
     if discovered:

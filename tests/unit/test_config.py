@@ -13,8 +13,9 @@ class TestConfig:
         assert config.verification.prover == "dafny"
 
     def test_load_missing_file(self, tmp_path):
-        config = load_config(tmp_path / "nonexistent.yaml")
-        assert config.models.actor.endpoint == "https://llm-api.arc.vt.edu/api/v1"
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            load_config(tmp_path / "nonexistent.yaml")
 
     def test_load_from_yaml(self, tmp_path):
         yaml_content = """
